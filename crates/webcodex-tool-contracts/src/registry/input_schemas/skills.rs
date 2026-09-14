@@ -88,7 +88,7 @@ pub fn skill_read_file_input_schema() -> Value {
         "properties": {
             "project": {"type": "string", "minLength": 1, "description": "Required authorized runtime Project id."},
             "skill_id": {"type": "string", "pattern": "^wc_skill_[0-9a-f]{32}$", "description": "Opaque Skill identity returned by skills.catalog or skill_list; it selects one exact source/package without exposing native Runner paths."},
-            "path": {"type": "string", "minLength": 1, "maxLength": MAX_SKILL_RESOURCE_PATH_CHARS, "description": "Skill-package-relative UTF-8 text resource path. Defaults to SKILL.md; absolute paths and traversal are forbidden."},
+            "path": {"type": "string", "minLength": 1, "maxLength": MAX_SKILL_RESOURCE_PATH_CHARS, "description": "UTF-8 text resource path. Relative paths resolve against the Skill package (parent traversal allowed); absolute paths resolve on the Runner. The resolved file must sit inside the Skill package or an operator-configured skills.resource_roots entry; sensitive paths are rejected."},
             "start_line": {"type": "integer", "minimum": 1},
             "limit": {"type": "integer", "minimum": 1, "maximum": MAX_SKILL_READ_LINES},
             "expected_definition_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Optional SKILL.md content digest guard. A mismatch fails with skill_definition_changed and does not return resource text."},

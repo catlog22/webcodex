@@ -10,7 +10,6 @@ use crate::skill_store::{
     valid_lower_sha256, valid_package_revision, valid_skill_key, MAX_SKILL_STORE_VERSIONS_LIMIT,
 };
 use serde::{Deserialize, Serialize};
-use std::path::{Component, Path};
 
 pub const RUNNER_SKILL_REQUEST_KIND: &str = "skill";
 pub const RUNNER_SKILL_RESPONSE_FORMAT: &str = "webcodex.runner_skill.v1";
@@ -372,30 +371,19 @@ pub fn valid_runner_skill_id(value: &str) -> bool {
 
 pub fn normalize_runner_skill_resource_path(path: &str) -> Result<String, &'static str> {
     let trimmed = path.trim();
-    #[cfg(windows)]
-    if trimmed.contains(':') {
-        return Err("invalid Runner Skill resource path");
-    }
     if trimmed.is_empty()
         || trimmed.chars().count() > MAX_SKILL_RESOURCE_PATH_CHARS
         || trimmed.chars().any(char::is_control)
-        || trimmed.starts_with('/')
-        || trimmed.starts_with('\\')
-        || trimmed.as_bytes().get(1) == Some(&b':')
     {
         return Err("invalid Runner Skill resource path");
     }
-    let normalized = trimmed.replace('\\', "/");
-    if normalized
-        .split('/')
-        .any(|component| component.is_empty() || component == "." || component == "..")
-        || Path::new(&normalized)
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err("invalid Runner Skill resource path");
-    }
-    Ok(normalized)
+    // Syntactic check only. Absolute paths and parent traversal are accepted on
+    // the wire so Skills can reference documents outside their package; the
+    // Runner confines the resolved file to the Skill package or an
+    // operator-configured `skills.resource_roots` entry, and still applies the
+    // sensitive-path blacklist, per-component symlink rejection, and the file
+    // type/size limits at read time.
+    Ok(trimmed.replace('\\', "/"))
 }
 
 fn valid_diagnostic_reason(value: &str) -> bool {
@@ -562,16 +550,36 @@ mod tests {
     }
 
     #[test]
-    fn resource_paths_are_relative_and_normalized() {
+    fn resource_paths_are_normalized_and_only_syntactically_validated() {
         assert_eq!(
             normalize_runner_skill_resource_path("references\\guide.md").unwrap(),
             "references/guide.md"
         );
+        // Whitelist adaptation: traversal and absolute paths are accepted on
+        // the wire; the Runner confines resolution to the Skill package or an
+        // operator-configured resource root.
+        assert_eq!(
+            normalize_runner_skill_resource_path("../secret").unwrap(),
+            "../secret"
+        );
+        assert_eq!(
+            normalize_runner_skill_resource_path("references/../secret").unwrap(),
+            "references/../secret"
+        );
+        assert_eq!(
+            normalize_runner_skill_resource_path("/etc/passwd").unwrap(),
+            "/etc/passwd"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            normalize_runner_skill_resource_path("C:\\secret").unwrap(),
+            "C:/secret"
+        );
         for invalid in [
-            "../secret",
-            "references/../secret",
-            "/etc/passwd",
-            "C:\\secret",
+            "",
+            "   ",
+            "references/\u{1}secret",
+            &"x".repeat(MAX_SKILL_RESOURCE_PATH_CHARS + 1),
         ] {
             assert!(normalize_runner_skill_resource_path(invalid).is_err());
         }

@@ -347,7 +347,6 @@ fn load_live_skill(
     stats.definitions_attempted = stats.definitions_attempted.saturating_add(1);
     let definition = resolve_regular_package_file(
         &package_root,
-        canonical_root,
         SKILL_DEFINITION_FILE,
         "missing_skill_definition",
         "invalid_skill_package",
@@ -395,24 +394,34 @@ pub(super) fn read_resource(
     {
         return Err("skill_definition_changed".to_string());
     }
-    let canonical_root = skill
-        .package_root
-        .parent()
-        .ok_or_else(|| "skill_resource_path_invalid".to_string())?;
-    let target = resolve_regular_package_file(
-        &skill.package_root,
-        canonical_root,
-        &path,
-        "skill_resource_not_found",
-        "skill_resource_path_invalid",
-    )
-    .map_err(str::to_string)?;
-    let relative = target
-        .strip_prefix(&skill.package_root)
-        .map_err(|_| "skill_resource_path_invalid".to_string())?
-        .to_string_lossy();
-    if webcodex_core::sensitive_paths::is_secret_path(relative.as_ref()) {
-        return Err("skill_sensitive_path".to_string());
+    // Package-relative paths may traverse; absolute paths read directly. Every
+    // resolution stays symlink-free per component, and the final target must
+    // land inside the Skill package or an operator-configured resource root.
+    let requested = std::path::Path::new(&path);
+    let target = if requested.is_absolute() {
+        resolve_open_regular_file(
+            requested,
+            "skill_resource_not_found",
+            "skill_resource_path_invalid",
+        )
+        .map_err(str::to_string)?
+    } else {
+        resolve_regular_package_file(
+            &skill.package_root,
+            &path,
+            "skill_resource_not_found",
+            "skill_resource_path_invalid",
+        )
+        .map_err(str::to_string)?
+    };
+    let within_package = crate::runner_config::paths::path_is_within(&target, &skill.package_root);
+    let within_resource_root = config.resource_roots.iter().any(|root| {
+        root.canonicalize()
+            .map(|root| crate::runner_config::paths::path_is_within(&target, &root))
+            .unwrap_or(false)
+    });
+    if !within_package && !within_resource_root {
+        return Err("skill_resource_not_allowed".to_string());
     }
     let max_file_bytes = if path == SKILL_DEFINITION_FILE {
         MAX_SKILL_DEFINITION_BYTES
@@ -442,7 +451,6 @@ pub(super) fn read_resource(
     })?;
     let definition_after = resolve_regular_package_file(
         &skill.package_root,
-        canonical_root,
         SKILL_DEFINITION_FILE,
         "skill_definition_changed",
         "skill_definition_changed",
@@ -481,11 +489,12 @@ pub(super) fn read_resource(
 
 fn resolve_regular_package_file(
     package_root: &Path,
-    canonical_root: &Path,
     relative: &str,
     missing_code: &'static str,
     invalid_code: &'static str,
 ) -> Result<PathBuf, &'static str> {
+    // `relative` may traverse with `..`; callers enforce the authority boundary
+    // (Skill package or configured resource root) on the canonicalized target.
     let mut current = package_root.to_path_buf();
     let components = relative.split('/').collect::<Vec<_>>();
     for (index, component) in components.iter().enumerate() {
@@ -505,13 +514,36 @@ fn resolve_regular_package_file(
             return Err(invalid_code);
         }
     }
-    let target = current.canonicalize().map_err(|_| invalid_code)?;
-    if !crate::runner_config::paths::path_is_within(&target, package_root)
-        || !crate::runner_config::paths::path_is_within(&target, canonical_root)
-    {
-        return Err(invalid_code);
+    current.canonicalize().map_err(|_| invalid_code)
+}
+
+fn resolve_open_regular_file(
+    path: &Path,
+    missing_code: &'static str,
+    invalid_code: &'static str,
+) -> Result<PathBuf, &'static str> {
+    // Symlink-free component walk for absolute paths; callers enforce the
+    // authority boundary on the canonicalized target.
+    let mut current = PathBuf::new();
+    let count = path.components().count();
+    for (index, component) in path.components().enumerate() {
+        current.push(component.as_os_str());
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                missing_code
+            } else {
+                invalid_code
+            }
+        })?;
+        let last = index + 1 == count;
+        if metadata_is_link_like(&metadata)
+            || (last && !metadata.is_file())
+            || (!last && !metadata.is_dir())
+        {
+            return Err(invalid_code);
+        }
     }
-    Ok(target)
+    current.canonicalize().map_err(|_| invalid_code)
 }
 
 fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {

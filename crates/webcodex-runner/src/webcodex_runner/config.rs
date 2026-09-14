@@ -47,6 +47,12 @@ pub(crate) const MAX_CONFIGURED_SKILL_ROOT_PATH_BYTES: usize = 4096;
 pub(crate) struct SkillsConfig {
     #[serde(default)]
     pub(crate) roots: Vec<PathBuf>,
+    /// Operator whitelist of additional directories whose files Skills may
+    /// read via `skill_read_file` beyond their own package. Read authority
+    /// still requires the caller's Skill/Project grants; the sensitive-path
+    /// blacklist and symlink rejection still apply.
+    #[serde(default)]
+    pub(crate) resource_roots: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -943,6 +949,10 @@ fn reload_error_diagnostic(error: &str) -> (Option<&'static str>, Option<&'stati
     const OUT_OF_RANGE_FIELDS: &[(&str, &str)] = &[
         ("skills.roots may contain at most ", "skills.roots"),
         (
+            "skills.resource_roots may contain at most ",
+            "skills.resource_roots",
+        ),
+        (
             "skills.roots entries must be non-empty paths of at most ",
             "skills.roots",
         ),
@@ -976,6 +986,12 @@ fn reload_error_diagnostic(error: &str) -> (Option<&'static str>, Option<&'stati
         || error.starts_with("skills.roots contains duplicate path identities")
     {
         return (Some("skills.roots"), Some("invalid_path"));
+    }
+    if error.starts_with("skills.resource_roots entries must be absolute paths")
+        || error.starts_with("skills.resource_roots contains an unsupported Windows path namespace")
+        || error.starts_with("skills.resource_roots contains duplicate path identities")
+    {
+        return (Some("skills.resource_roots"), Some("invalid_path"));
     }
     OUT_OF_RANGE_FIELDS
         .iter()
@@ -1571,33 +1587,46 @@ fn validate_skills_config(config: &SkillsConfig) -> Result<(), String> {
             "skills.roots may contain at most {MAX_CONFIGURED_SKILL_ROOTS} entries"
         ));
     }
-    let mut identities = HashSet::with_capacity(config.roots.len());
-    for root in &config.roots {
-        let text = root.to_string_lossy();
-        if text.is_empty()
-            || text.len() > MAX_CONFIGURED_SKILL_ROOT_PATH_BYTES
-            || text.contains('\0')
-        {
-            return Err(format!(
-                "skills.roots entries must be non-empty paths of at most {MAX_CONFIGURED_SKILL_ROOT_PATH_BYTES} bytes"
-            ));
-        }
-        if !root.is_absolute()
-            || crate::runner_config::paths::project_path_has_parent_traversal(root)
-        {
-            return Err(
-                "skills.roots entries must be absolute paths without parent traversal".to_string(),
-            );
-        }
-        #[cfg(windows)]
-        if crate::runner_config::paths::windows_project_path_kind(root)
-            == Some(crate::runner_config::paths::WindowsProjectPathKind::UnsupportedNamespace)
-        {
-            return Err("skills.roots contains an unsupported Windows path namespace".to_string());
-        }
-        let identity = configured_skill_root_identity(root);
-        if !identities.insert(identity) {
-            return Err("skills.roots contains duplicate path identities".to_string());
+    if config.resource_roots.len() > MAX_CONFIGURED_SKILL_ROOTS {
+        return Err(format!(
+            "skills.resource_roots may contain at most {MAX_CONFIGURED_SKILL_ROOTS} entries"
+        ));
+    }
+    let mut identities = HashSet::with_capacity(config.roots.len() + config.resource_roots.len());
+    for (field, roots) in [
+        ("skills.roots", &config.roots),
+        ("skills.resource_roots", &config.resource_roots),
+    ] {
+        let mut field_identities = HashSet::with_capacity(roots.len());
+        for root in roots {
+            let text = root.to_string_lossy();
+            if text.is_empty()
+                || text.len() > MAX_CONFIGURED_SKILL_ROOT_PATH_BYTES
+                || text.contains('\0')
+            {
+                return Err(format!(
+                    "{field} entries must be non-empty paths of at most {MAX_CONFIGURED_SKILL_ROOT_PATH_BYTES} bytes"
+                ));
+            }
+            if !root.is_absolute()
+                || crate::runner_config::paths::project_path_has_parent_traversal(root)
+            {
+                return Err(format!(
+                    "{field} entries must be absolute paths without parent traversal"
+                ));
+            }
+            #[cfg(windows)]
+            if crate::runner_config::paths::windows_project_path_kind(root)
+                == Some(crate::runner_config::paths::WindowsProjectPathKind::UnsupportedNamespace)
+            {
+                return Err(format!(
+                    "{field} contains an unsupported Windows path namespace"
+                ));
+            }
+            let identity = configured_skill_root_identity(root);
+            if !field_identities.insert(identity.clone()) || !identities.insert(identity) {
+                return Err(format!("{field} contains duplicate path identities"));
+            }
         }
     }
     Ok(())
@@ -2018,6 +2047,63 @@ mod plugin_config_tests {
         )
         .unwrap_err()
         .contains("at most 1024 bytes"));
+    }
+}
+
+#[cfg(test)]
+mod skills_config_tests {
+    use super::*;
+
+    fn root(text: &str) -> std::path::PathBuf {
+        let path = if cfg!(windows) {
+            format!("C:/webcodex-skill-test/{text}")
+        } else {
+            format!("/webcodex-skill-test/{text}")
+        };
+        std::path::PathBuf::from(path)
+    }
+
+    #[test]
+    fn resource_roots_must_be_absolute_unique_and_disjoint_from_roots() {
+        let valid = SkillsConfig {
+            roots: vec![root("skills")],
+            resource_roots: vec![root("docs")],
+        };
+        validate_skills_config(&valid).expect("valid config");
+
+        let relative = SkillsConfig {
+            resource_roots: vec![std::path::PathBuf::from("relative/docs")],
+            ..valid.clone()
+        };
+        assert!(validate_skills_config(&relative)
+            .unwrap_err()
+            .contains("skills.resource_roots entries must be absolute paths"));
+
+        let duplicate = SkillsConfig {
+            resource_roots: vec![root("docs"), root("docs")],
+            ..valid.clone()
+        };
+        assert!(validate_skills_config(&duplicate)
+            .unwrap_err()
+            .contains("skills.resource_roots contains duplicate path identities"));
+
+        let overlapping = SkillsConfig {
+            resource_roots: vec![root("skills")],
+            ..valid.clone()
+        };
+        assert!(validate_skills_config(&overlapping)
+            .unwrap_err()
+            .contains("duplicate path identities"));
+
+        let too_many = SkillsConfig {
+            resource_roots: (0..=MAX_CONFIGURED_SKILL_ROOTS)
+                .map(|index| root(&format!("docs-{index}")))
+                .collect(),
+            ..valid
+        };
+        assert!(validate_skills_config(&too_many)
+            .unwrap_err()
+            .contains("skills.resource_roots may contain at most"));
     }
 }
 

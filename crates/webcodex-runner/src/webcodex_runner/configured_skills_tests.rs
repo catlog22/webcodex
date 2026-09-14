@@ -42,6 +42,7 @@ fn exact_resolution_scans_identities_but_reads_only_target_definition() {
     .unwrap();
     let config = SkillsConfig {
         roots: vec![temp.path().to_path_buf()],
+        ..Default::default()
     };
     let target_id = configured_skill_id(temp.path(), "skill-23");
 
@@ -94,6 +95,7 @@ fn live_discovery_and_resource_read_observe_changes() {
     write_skill(temp.path(), "demo", "demo", "version one");
     let config = SkillsConfig {
         roots: vec![temp.path().to_path_buf()],
+        ..Default::default()
     };
     let first = discover(&config).unwrap();
     assert_eq!(first.skills.len(), 1);
@@ -137,6 +139,7 @@ fn missing_root_is_a_bounded_path_free_diagnostic_not_an_empty_fallback() {
     let missing = temp.path().join("missing-live-skills");
     let discovery = discover(&SkillsConfig {
         roots: vec![missing.clone()],
+        ..Default::default()
     })
     .unwrap();
     assert!(discovery.skills.is_empty());
@@ -157,6 +160,7 @@ fn same_package_in_two_roots_has_distinct_opaque_identity() {
     write_skill(second.path(), "same", "same", "second");
     let discovery = discover(&SkillsConfig {
         roots: vec![first.path().to_path_buf(), second.path().to_path_buf()],
+        ..Default::default()
     })
     .unwrap();
     assert_eq!(discovery.skills.len(), 2);
@@ -199,33 +203,45 @@ fn configured_root_symlink_is_rejected() {
 fn traversal_and_symlink_escape_are_rejected() {
     let temp = tempfile::tempdir().unwrap();
     write_skill(temp.path(), "demo", "demo", "body");
+    fs::create_dir_all(temp.path().join("demo/references")).unwrap();
     let config = SkillsConfig {
         roots: vec![temp.path().to_path_buf()],
+        ..Default::default()
     };
     let skill = discover(&config).unwrap().skills.remove(0);
+    // Outside the package without an operator-configured resource root, an
+    // existing external file is refused even though it resolves cleanly.
+    fs::write(temp.path().join("shared.md"), "shared doc\n").unwrap();
     assert_eq!(
         read_resource(
             &config,
             skill.descriptor.skill_id(),
-            "../secret",
+            "../shared.md",
             1,
             20,
             None
         )
         .unwrap_err(),
-        "skill_resource_path_invalid"
+        "skill_resource_not_allowed"
     );
+    let absolute = temp.path().join("shared.md");
+    let absolute = absolute.to_string_lossy().replace('\\', "/");
+    assert_eq!(
+        read_resource(&config, skill.descriptor.skill_id(), &absolute, 1, 20, None).unwrap_err(),
+        "skill_resource_not_allowed"
+    );
+    // A missing external file fails as not-found before the authority check.
     assert_eq!(
         read_resource(
             &config,
             skill.descriptor.skill_id(),
-            "/etc/passwd",
+            "../missing.md",
             1,
             20,
             None
         )
         .unwrap_err(),
-        "skill_resource_path_invalid"
+        "skill_resource_not_found"
     );
 
     #[cfg(unix)]
@@ -254,11 +270,84 @@ fn traversal_and_symlink_escape_are_rejected() {
 }
 
 #[test]
+fn resource_roots_whitelist_permits_external_reads() {
+    let temp = tempfile::tempdir().unwrap();
+    write_skill(temp.path(), "demo", "demo", "body");
+    fs::create_dir_all(temp.path().join("docs")).unwrap();
+    fs::write(temp.path().join("docs/guide.md"), "external guide\n").unwrap();
+    let nested = temp.path().join("docs/nested");
+    fs::create_dir_all(&nested).unwrap();
+    fs::write(nested.join("deep.md"), "deep\n").unwrap();
+    let config = SkillsConfig {
+        roots: vec![temp.path().to_path_buf()],
+        resource_roots: vec![temp.path().join("docs")],
+    };
+    let skill = discover(&config).unwrap().skills.remove(0);
+
+    // Traversal from the package into a whitelisted directory reads fine.
+    let traversed = read_resource(
+        &config,
+        skill.descriptor.skill_id(),
+        "../docs/guide.md",
+        1,
+        20,
+        None,
+    )
+    .unwrap();
+    assert_eq!(traversed.text, "external guide");
+
+    // Absolute paths inside a whitelisted root read fine too.
+    let absolute = nested.join("deep.md");
+    let absolute = absolute.to_string_lossy().replace('\\', "/");
+    let absolute_read =
+        read_resource(&config, skill.descriptor.skill_id(), &absolute, 1, 20, None).unwrap();
+    assert_eq!(absolute_read.text, "deep");
+
+    // Files outside both the package and every resource root stay refused,
+    // and a root directory itself is never traversable via symlink tricks:
+    // the per-component symlink rejection still applies.
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("other.md"), "other\n").unwrap();
+    let outside_absolute = outside.path().join("other.md");
+    let outside_absolute = outside_absolute.to_string_lossy().replace('\\', "/");
+    assert_eq!(
+        read_resource(
+            &config,
+            skill.descriptor.skill_id(),
+            &outside_absolute,
+            1,
+            20,
+            None
+        )
+        .unwrap_err(),
+        "skill_resource_not_allowed"
+    );
+}
+
+#[test]
+fn sensitive_paths_stay_blocked_inside_resource_roots() {
+    let temp = tempfile::tempdir().unwrap();
+    write_skill(temp.path(), "demo", "demo", "body");
+    fs::write(temp.path().join(".env"), "TOKEN=secret\n").unwrap();
+    let config = SkillsConfig {
+        roots: vec![temp.path().to_path_buf()],
+        resource_roots: vec![temp.path().to_path_buf()],
+    };
+    let skill = discover(&config).unwrap().skills.remove(0);
+    // The whitelist never overrides the sensitive-path blacklist.
+    assert_eq!(
+        read_resource(&config, skill.descriptor.skill_id(), "../.env", 1, 20, None).unwrap_err(),
+        "skill_sensitive_path"
+    );
+}
+
+#[test]
 fn sensitive_package_names_are_not_discovered() {
     let temp = tempfile::tempdir().unwrap();
     write_skill(temp.path(), ".git", "hidden", "must stay hidden");
     let discovery = discover(&SkillsConfig {
         roots: vec![temp.path().to_path_buf()],
+        ..Default::default()
     })
     .unwrap();
     assert!(discovery.skills.is_empty());
@@ -282,6 +371,7 @@ fn malformed_and_oversized_definitions_are_bounded_diagnostics() {
     .unwrap();
     let discovery = discover(&SkillsConfig {
         roots: vec![temp.path().to_path_buf()],
+        ..Default::default()
     })
     .unwrap();
     assert_eq!(discovery.invalid_count, 2);
@@ -298,6 +388,7 @@ fn resource_reads_enforce_actual_byte_bound_and_preserve_range_metadata() {
     write_skill(temp.path(), "demo", "demo", "body");
     let config = SkillsConfig {
         roots: vec![temp.path().to_path_buf()],
+        ..Default::default()
     };
     let skill = discover(&config).unwrap().skills.remove(0);
     let resource = temp.path().join("demo/references/guide.md");

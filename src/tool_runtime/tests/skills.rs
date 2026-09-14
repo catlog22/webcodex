@@ -1545,7 +1545,25 @@ async fn skill_read_file_is_bounded_project_scoped_and_revision_guarded() {
     );
     assert!(definition_stale.output.get("text").is_none());
 
-    for path in ["../outside.txt", "/etc/passwd", "references/../guide.md"] {
+    // Traversal and absolute-looking paths are syntactically valid now. The
+    // project-source read rides the legacy file-protocol Runner, which keeps
+    // package confinement runner-side: these resolve as not-found on the
+    // local shim (a strict Runner answers path-invalid for the empty
+    // component instead). Only true syntax violations fail before the Runner.
+    for (path, kind, reaches_runner) in [
+        ("../outside.txt", "skill_resource_not_found", true),
+        (
+            "/definitely/missing/webcodex-skill.txt",
+            "skill_resource_not_found",
+            true,
+        ),
+        ("references/../guide.md", "skill_resource_not_found", true),
+        (
+            "references/\u{1}guide.md",
+            "skill_resource_path_invalid",
+            false,
+        ),
+    ] {
         let (rejected, kinds) = call_kernel_with_local_agent(
             &runtime,
             "skill-read-a",
@@ -1555,10 +1573,11 @@ async fn skill_read_file_is_bounded_project_scoped_and_revision_guarded() {
         )
         .await;
         assert!(!rejected.success, "{path}");
-        assert_eq!(rejected.output["error_kind"], "skill_resource_path_invalid");
-        assert!(
+        assert_eq!(rejected.output["error_kind"], kind, "{path}");
+        assert_eq!(
             kinds.is_empty(),
-            "lexically invalid path must fail before Runner"
+            !reaches_runner,
+            "unexpected Runner contact for {path}: {kinds:?}"
         );
     }
 

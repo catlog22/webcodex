@@ -14,7 +14,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use std::path::Component;
 use std::time::{Duration, Instant};
 use webcodex_core::runner_skill::{
     RunnerSkillDescriptor, RunnerSkillListResponse, RunnerSkillReadResponse, RunnerSkillRequest,
@@ -2028,6 +2027,7 @@ fn stable_runner_skill_read_error(error: Option<&str>) -> &'static str {
         "skill_definition_changed" => "skill_definition_changed",
         "skill_sensitive_path" => "skill_sensitive_path",
         "skill_resource_path_invalid" => "skill_resource_path_invalid",
+        "skill_resource_not_allowed" => "skill_resource_not_allowed",
         "skill_resource_not_found" => "skill_resource_not_found",
         "skill_resource_too_large" => "skill_resource_too_large",
         "skill_resource_unsupported_encoding" => "skill_resource_unsupported_encoding",
@@ -2077,27 +2077,11 @@ fn validate_query(query: Option<String>) -> Result<Option<String>, &'static str>
 }
 
 fn validate_resource_path(path: &str) -> Result<String, &'static str> {
-    let path = path.trim();
-    if path.is_empty()
-        || path.chars().count() > MAX_SKILL_RESOURCE_PATH_CHARS
-        || path.chars().any(char::is_control)
-        || path.starts_with('/')
-        || path.starts_with('\\')
-        || path.as_bytes().get(1) == Some(&b':')
-    {
-        return Err("skill_resource_path_invalid");
-    }
-    let normalized = path.replace('\\', "/");
-    if normalized
-        .split('/')
-        .any(|component| component.is_empty() || component == "." || component == "..")
-        || std::path::Path::new(&normalized)
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err("skill_resource_path_invalid");
-    }
-    Ok(normalized)
+    // Syntactic validation only; the Runner confines resolution to the Skill
+    // package or an operator-configured resource root and applies the
+    // sensitive-path blacklist there.
+    webcodex_core::runner_skill::normalize_runner_skill_resource_path(path)
+        .map_err(|_| "skill_resource_path_invalid")
 }
 
 fn valid_package_name(name: &str) -> bool {
@@ -2375,20 +2359,32 @@ mod tests {
     }
 
     #[test]
-    fn resource_paths_are_package_relative_and_cross_platform_safe() {
+    fn resource_paths_are_normalized_and_only_syntactically_validated() {
         assert_eq!(
             validate_resource_path("references/foo.md").unwrap(),
             "references/foo.md"
         );
-        for refused in [
+        // Whitelist adaptation: traversal and absolute paths reach the Runner,
+        // which confines resolution to the Skill package or a configured
+        // resource root.
+        for accepted in [
             "../x",
             "references/../x",
             "/tmp/x",
+            #[cfg(windows)]
             "C:\\tmp\\x",
             "a\\..\\x",
             ".env/../x",
             "a//b",
             "./x",
+        ] {
+            assert!(validate_resource_path(accepted).is_ok(), "{accepted}");
+        }
+        for refused in [
+            "",
+            "   ",
+            "a/\u{1}b",
+            &"x".repeat(MAX_SKILL_RESOURCE_PATH_CHARS + 1),
         ] {
             assert!(validate_resource_path(refused).is_err(), "{refused}");
         }
