@@ -240,6 +240,8 @@ mod result_app;
 mod runtime_tools;
 #[path = "mcp_tests/ssh_resource.rs"]
 mod ssh_resource;
+#[path = "mcp_tests/tool_exposure.rs"]
+mod tool_exposure;
 #[path = "mcp_tests/tools.rs"]
 mod tools;
 #[path = "mcp_tests/work_result_app.rs"]

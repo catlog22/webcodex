@@ -43,6 +43,7 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "goto_definition",
             "find_references",
             "call_hierarchy",
+            "lsp",
             "lsp_status",
             "list_project_files",
             "show_changes",
@@ -95,6 +96,7 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
     ToolDiscoveryGroup {
         name: TOOL_DISCOVERY_GROUP_GOAL,
         tools: &[
+            "goal",
             "create_goal",
             "get_goal",
             "present_goal_plan",
@@ -169,6 +171,7 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
     ToolDiscoveryGroup {
         name: TOOL_DISCOVERY_GROUP_VALIDATION,
         tools: &[
+            "validate",
             "cargo_fmt",
             "cargo_check",
             "cargo_test",
@@ -250,6 +253,10 @@ pub const TOOL_DISCOVERY_GROUPS: &[ToolDiscoveryGroup] = &[
             "work_on_project",
             "finish_coding_task",
             "session_summary",
+            "session",
+            "todo",
+            #[cfg(feature = "workspace-checkpoints")]
+            "checkpoint",
             "update_session_context",
             "close_session",
             "post_session_message",

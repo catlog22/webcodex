@@ -2,6 +2,7 @@
 
 mod support;
 
+mod action_tools;
 mod agent_tasks;
 mod apply_text_edits;
 mod assignment_fence;
@@ -37,6 +38,7 @@ mod schema;
 mod script;
 mod search_project_texts;
 mod session_shells;
+mod session_tools;
 mod sessions;
 mod sessions_git;
 mod sessions_guards;
@@ -48,6 +50,7 @@ mod startup_brief;
 mod startup_catalog;
 mod sync_timeout;
 mod targeted_inventory;
+mod tool_exposure;
 mod trusted_smoke;
 mod unified_diff;
 mod validation_events;

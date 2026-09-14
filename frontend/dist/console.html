@@ -140,6 +140,17 @@
                 <span class="chip" id="workflow-session-running">—</span>
               </div>
               <p class="muted small" id="workflow-session-updated">—</p>
+              <div class="workflow-session-projects" aria-label="Workspace projects">
+                <div class="workflow-session-projects-head">
+                  <span class="muted small">Workspaces</span>
+                  <span id="workflow-session-projects-error" class="token-error small" hidden></span>
+                </div>
+                <div id="workflow-session-projects" class="workflow-session-projects-chips"></div>
+                <form id="workflow-session-project-add" class="workflow-session-project-add" hidden>
+                  <select id="workflow-session-project-add-select" aria-label="Registered project"></select>
+                  <button type="submit">Attach</button>
+                </form>
+              </div>
               <div class="workflow-session-overview" aria-label="Workflow session overview">
                 <div class="workflow-session-overview-card workflow-session-overview-runtime">
                   <div class="workflow-session-overview-label">Work</div>

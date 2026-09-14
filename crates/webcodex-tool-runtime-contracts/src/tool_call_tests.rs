@@ -1602,3 +1602,84 @@ fn agent_continuation_bind_parses_required_view_fence_and_omits_it_from_audit() 
     args.as_object_mut().unwrap().remove("binding_id");
     assert!(ToolCall::from_tool_name("agent_continuation_bind", args).is_err());
 }
+
+#[test]
+fn consolidated_action_tools_roundtrip_tool_params() {
+    let session = ToolCall::from_tool_name(
+        "session",
+        json!({"action": "start", "projects": ["agent:oe:a", "agent:oe:b"], "title": "t"}),
+    )
+    .unwrap();
+    assert_eq!(session.tool_name(), "session");
+    assert_eq!(
+        session.project(),
+        Some("agent:oe:a"),
+        "canonical project is the first projects entry at the runtime layer"
+    );
+
+    let todo = ToolCall::from_tool_name(
+        "todo",
+        json!({"action": "claim", "session_id": "wc_sess_x", "todo_id": "wc_todo_1", "assignee": "agent-7", "expected_revision": 3}),
+    )
+    .unwrap();
+    assert_eq!(todo.tool_name(), "todo");
+    assert_eq!(todo.session_id(), Some("wc_sess_x"));
+}
+
+#[test]
+fn consolidated_lsp_validate_goal_tools_roundtrip_tool_params() {
+    let lsp = ToolCall::from_tool_name(
+        "lsp",
+        json!({"action": "call_hierarchy", "project": "agent:oe:a", "path": "src/lib.rs", "line": 3, "column": 9}),
+    )
+    .unwrap();
+    assert_eq!(lsp.tool_name(), "lsp");
+    assert_eq!(lsp.project(), Some("agent:oe:a"));
+    let legacy = match lsp {
+        ToolCall::Lsp(call) => call.into_legacy_tool_call(),
+        other => panic!("expected consolidated lsp call, got {other:?}"),
+    };
+    assert!(matches!(legacy, ToolCall::CallHierarchy { .. }));
+
+    let validate = ToolCall::from_tool_name(
+        "validate",
+        json!({"action": "summary", "project": "agent:oe:a", "session_id": "wc_sess_y"}),
+    )
+    .unwrap();
+    assert_eq!(validate.tool_name(), "validate");
+    assert_eq!(validate.session_id(), Some("wc_sess_y"));
+    let legacy = match validate {
+        ToolCall::Validate(call) => call.into_legacy_tool_call(),
+        other => panic!("expected consolidated validate call, got {other:?}"),
+    };
+    assert!(matches!(legacy, ToolCall::ValidationSummary { .. }));
+
+    let goal = ToolCall::from_tool_name(
+        "goal",
+        json!({"action": "create", "title": "Ship consolidation", "objective": "Merge the narrow tool clusters.", "idempotency_key": "goal-retry-1"}),
+    )
+    .unwrap();
+    assert_eq!(goal.tool_name(), "goal");
+    assert_eq!(
+        goal.project(),
+        None,
+        "goal control is global, not project-scoped"
+    );
+    let legacy = match goal {
+        ToolCall::Goal(call) => call.into_legacy_tool_call(),
+        other => panic!("expected consolidated goal call, got {other:?}"),
+    };
+    assert!(matches!(legacy, ToolCall::CreateGoal { .. }));
+}
+
+#[cfg(feature = "workspace-checkpoints")]
+#[test]
+fn consolidated_checkpoint_tool_roundtrip_tool_params() {
+    let checkpoint = ToolCall::from_tool_name(
+        "checkpoint",
+        json!({"action": "restore", "project": "agent:oe:a", "checkpoint_id": "wc_ckpt_1", "confirm": true}),
+    )
+    .unwrap();
+    assert_eq!(checkpoint.tool_name(), "checkpoint");
+    assert_eq!(checkpoint.project(), Some("agent:oe:a"));
+}

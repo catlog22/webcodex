@@ -356,6 +356,7 @@ mod tests {
         "observe_jobs",
         "list_jobs",
         "cargo_check",
+        "validate",
         "cargo_test",
         "git_review_summary",
         "git_diff_hunks",

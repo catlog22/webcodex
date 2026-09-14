@@ -147,6 +147,20 @@ pub struct WorkflowSessionConsoleDetail {
     pub activity_total: usize,
     pub activity_returned: usize,
     pub activity_truncated: bool,
+    /// Workspace projects visible to this console, canonical first. Populated
+    /// by the runtime from the session workspace projection; the crate-side
+    /// default is empty for sessions without a recorded projection.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<WorkflowSessionConsoleProject>,
+    /// Revision of the workspace projection; console mutations pass it back
+    /// as the CAS fence for attach/detach.
+    pub projects_revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowSessionConsoleProject {
+    pub project: String,
+    pub canonical: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -320,6 +334,8 @@ pub(super) fn build_detail(
         activity_total,
         activity_returned,
         activity_truncated: activity_total > activity_returned,
+        projects: Vec::new(),
+        projects_revision: 0,
     }
 }
 

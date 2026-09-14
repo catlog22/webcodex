@@ -254,6 +254,7 @@ async function copySources(sourceDirectory) {
     "app.ts",
     "review_state.ts",
     "workflow_session_state.ts",
+    "workflow_session_projects_state.ts",
     "styles.css",
     "console.html",
     "runtime.ts",

@@ -4,7 +4,9 @@ use super::checkpoint;
 use super::observations::RuntimeObservations;
 use super::permissions::PermissionEvaluator;
 use super::runtime_info::RuntimeInfo;
+use super::session_projects;
 use super::sessions;
+use super::todo;
 use super::SessionShellRegistry;
 use crate::runner_http::RunnerRegistry;
 use sha2::{Digest, Sha256};
@@ -111,8 +113,11 @@ pub struct ToolRuntime {
     pub(crate) coding_agent_runs: Arc<super::coding_agent::CodingAgentServerState>,
     pub runtime_info: Arc<RuntimeInfo>,
     runtime_exposure: crate::model_surface::RuntimeExposure,
+    tool_exposure: super::tool_exposure::ToolExposure,
     #[cfg(feature = "workspace-checkpoints")]
     pub(crate) checkpoint_store: checkpoint::CheckpointStore,
+    pub(crate) session_projects: session_projects::SessionProjectsStore,
+    pub(crate) todo_store: todo::TodoStore,
     pub(crate) sessions: sessions::SessionStore,
     pub(crate) session_shells: SessionShellRegistry,
     pub(crate) semantic_navigation_probe_timeout: Duration,
@@ -194,6 +199,8 @@ impl ToolRuntime {
             #[cfg(feature = "workspace-checkpoints")]
             checkpoint_store: checkpoint::CheckpointStore::default(),
             sessions: sessions::SessionStore::default(),
+            session_projects: session_projects::SessionProjectsStore::default(),
+            todo_store: todo::TodoStore::default(),
             session_shells: SessionShellRegistry::default(),
             semantic_navigation_probe_timeout:
                 super::semantic_navigation::DEFAULT_SEMANTIC_NAVIGATION_PROBE_TIMEOUT,
@@ -221,6 +228,7 @@ impl ToolRuntime {
             memory_db: None,
             communication_db: None,
             agent_continuations: None,
+            tool_exposure: super::tool_exposure::ToolExposure::default(),
         }
     }
 
@@ -244,6 +252,17 @@ impl ToolRuntime {
 
     pub(crate) fn runtime_exposure(&self) -> crate::model_surface::RuntimeExposure {
         self.runtime_exposure
+    }
+
+    /// Operator-controlled model-facing tool exposure. Defaults to
+    /// unrestricted; production wiring installs the validated env config.
+    pub fn with_tool_exposure(mut self, tool_exposure: super::tool_exposure::ToolExposure) -> Self {
+        self.tool_exposure = tool_exposure;
+        self
+    }
+
+    pub fn tool_exposure(&self) -> &super::tool_exposure::ToolExposure {
+        &self.tool_exposure
     }
 
     pub(crate) fn model_surface(&self) -> Option<crate::model_surface::ModelSurface> {
@@ -314,12 +333,36 @@ impl ToolRuntime {
         session_id: &str,
         limit: Option<usize>,
     ) -> Option<sessions::WorkflowSessionConsoleDetail> {
-        self.sessions.console_detail_for_project(
+        let mut detail = self.sessions.console_detail_for_project(
             project,
             session_id,
             limit,
             sessions::console_validation_hooks(),
-        )
+        )?;
+        if let Ok(record) = self.session_projects.load(session_id) {
+            let canonical = self.sessions.session_project(session_id).unwrap_or(None);
+            let mut projects: Vec<sessions::WorkflowSessionConsoleProject> =
+                Vec::with_capacity(record.attached.len() + 1);
+            if let Some(canonical) = canonical.as_deref() {
+                projects.push(sessions::WorkflowSessionConsoleProject {
+                    project: canonical.to_string(),
+                    canonical: true,
+                });
+            }
+            projects.extend(
+                record
+                    .attached
+                    .iter()
+                    .filter(|attached| Some(attached.project.as_str()) != canonical.as_deref())
+                    .map(|attached| sessions::WorkflowSessionConsoleProject {
+                        project: attached.project.clone(),
+                        canonical: false,
+                    }),
+            );
+            detail.projects = projects;
+            detail.projects_revision = record.revision;
+        }
+        Some(detail)
     }
 
     #[cfg(test)]

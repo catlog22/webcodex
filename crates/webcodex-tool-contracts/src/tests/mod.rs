@@ -57,6 +57,7 @@ fn required_fields(spec: &ToolSpec) -> Vec<String> {
         .unwrap_or_default()
 }
 
+mod action_tools;
 mod artifact_schemas;
 mod catalog_discovery;
 mod computer_schemas;
@@ -69,3 +70,4 @@ mod migration_contracts;
 mod output_schemas;
 mod policy_contracts;
 mod registry_specs;
+mod session_tools;

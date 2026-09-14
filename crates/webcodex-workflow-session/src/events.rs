@@ -271,6 +271,7 @@ pub fn tool_supports_model_facing_result_expectation(tool_name: &str) -> bool {
             | "cargo_check"
             | "cargo_test"
             | "go_test"
+            | "validate"
     )
 }
 
@@ -291,7 +292,20 @@ pub fn validate_model_facing_result_expectation(
             "invalid arguments for tool '{tool_name}': result expectation is not supported by this tool"
         ));
     }
-    if tool_name == "cargo_fmt"
+    let consolidated_validate_action = if tool_name == "validate" {
+        object.get("action").and_then(Value::as_str)
+    } else {
+        None
+    };
+    if consolidated_validate_action == Some("summary") {
+        return Err(
+            "invalid arguments for tool 'validate': result expectation is supported only by the cargo/go actions, not summary"
+                .to_string(),
+        );
+    }
+    let is_cargo_fmt = tool_name == "cargo_fmt"
+        || (tool_name == "validate" && consolidated_validate_action == Some("cargo_fmt"));
+    if is_cargo_fmt
         && result_expectation.is_some()
         && object.get("check").and_then(Value::as_bool) != Some(true)
     {

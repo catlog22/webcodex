@@ -432,3 +432,36 @@ fn operator_extension_families_are_definition_owned_and_registry_derived() {
     assert_eq!(runtime_tool_operator_extension_family("run_shell"), None);
     assert_eq!(runtime_tool_operator_extension_family("unknown_tool"), None);
 }
+
+#[test]
+fn consolidated_session_tools_are_registered_and_visible() {
+    let names: &[&str] = if cfg!(feature = "workspace-checkpoints") {
+        &["session", "todo", "checkpoint"]
+    } else {
+        &["session", "todo"]
+    };
+    for name in names {
+        let definition =
+            lookup_tool_definition(name).unwrap_or_else(|| panic!("definition '{name}' missing"));
+        assert!(
+            definition.visibility.is_model_visible(),
+            "{name} must be model visible"
+        );
+        assert!(
+            definition.model_spec.is_some(),
+            "{name} must carry a model spec"
+        );
+        let specs = registered_tool_specs();
+        let spec = spec_named(&specs, name);
+        assert!(
+            spec.input_schema["properties"]["action"]["enum"].is_array(),
+            "{name} input schema must expose an action enum"
+        );
+        assert!(
+            output_schema_for_tool(name)["properties"]
+                .get("success")
+                .is_some(),
+            "{name} must have an envelope output schema"
+        );
+    }
+}

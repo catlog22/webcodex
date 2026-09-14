@@ -18,6 +18,7 @@ fn supports_model_facing_result_expectation(tool_name: &str) -> bool {
             | "cargo_check"
             | "cargo_test"
             | "go_test"
+            | "validate"
     )
 }
 

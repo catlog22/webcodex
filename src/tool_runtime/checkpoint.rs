@@ -9,7 +9,7 @@ use super::tool_inputs::{
     is_checkpoint_kind, is_checkpoint_validation_status, CheckpointValidationInput,
 };
 use super::tool_result::ToolResult;
-use super::{ToolCall, ToolRuntime};
+use super::{CheckpointToolCall, ToolCall, ToolRuntime};
 use crate::action_audit_sessions::secret_like_value;
 use crate::projects::ProjectConfig;
 
@@ -90,7 +90,7 @@ impl CheckpointStore {
         Ok(path)
     }
 
-    fn load(
+    pub(crate) fn load(
         &self,
         resolved_project: &str,
         checkpoint_id: &str,
@@ -906,4 +906,62 @@ fn validate_checkpoint_id(checkpoint_id: &str) -> Result<(), String> {
         return Err("checkpoint_id contains invalid characters".to_string());
     }
     Ok(())
+}
+
+impl ToolRuntime {
+    /// Dispatcher for the consolidated `checkpoint` tool surface. Each action
+    /// delegates to the canonical workspace_checkpoint_* implementation; this
+    /// wrapper only maps action payloads and keeps one envelope shape.
+    pub(crate) async fn dispatch_checkpoint_action(
+        &self,
+        call: CheckpointToolCall,
+        _auth: Option<&crate::auth::AuthContext>,
+    ) -> ToolResult {
+        match call {
+            CheckpointToolCall::Create {
+                project,
+                title,
+                note,
+                labels,
+                validation,
+            } => {
+                self.workspace_checkpoint_create(
+                    project,
+                    title,
+                    note,
+                    None,
+                    None,
+                    labels.unwrap_or_default(),
+                    validation,
+                )
+                .await
+            }
+            CheckpointToolCall::List { project, limit } => {
+                self.workspace_checkpoint_list(project, limit).await
+            }
+            CheckpointToolCall::Show {
+                project,
+                checkpoint_id,
+            } => {
+                self.workspace_checkpoint_show(project, checkpoint_id, None)
+                    .await
+            }
+            CheckpointToolCall::Restore {
+                project,
+                checkpoint_id,
+                confirm,
+            } => {
+                self.workspace_checkpoint_restore(project, checkpoint_id, confirm)
+                    .await
+            }
+            CheckpointToolCall::Delete {
+                project,
+                checkpoint_id,
+                confirm,
+            } => {
+                self.workspace_checkpoint_delete(project, checkpoint_id, confirm)
+                    .await
+            }
+        }
+    }
 }

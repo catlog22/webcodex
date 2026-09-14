@@ -1,3 +1,4 @@
+mod action_tools;
 mod agent_tasks;
 mod artifacts;
 #[cfg(feature = "workspace-checkpoints")]
@@ -21,12 +22,16 @@ mod patches;
 mod plugins;
 mod projects;
 mod runner_config;
+mod session_tools;
 mod sessions;
 mod skills;
 mod ssh_resources;
 mod text_edits;
 mod validation;
 
+pub use action_tools::{
+    goal_action_input_schema, lsp_action_input_schema, validate_action_input_schema,
+};
 pub use agent_tasks::{
     assign_agent_task_input_schema, complete_agent_task_attempt_input_schema,
     create_agent_task_input_schema, heartbeat_agent_task_attempt_input_schema,
@@ -125,6 +130,9 @@ pub use projects::{
     create_project_input_schema, register_project_input_schema, unregister_project_input_schema,
 };
 pub use runner_config::{runner_config_check_input_schema, runner_config_reload_input_schema};
+pub use session_tools::{
+    checkpoint_action_input_schema, session_action_input_schema, todo_action_input_schema,
+};
 pub use sessions::work_result_input_schema;
 pub use sessions::{
     close_session_input_schema, complete_session_message_input_schema,

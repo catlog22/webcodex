@@ -127,6 +127,8 @@ pub(crate) enum RouteId {
     HostConsoleActivity,
     HostConsoleWorkflowSessions,
     HostConsoleWorkflowSession,
+    HostConsoleWorkflowSessionProjects,
+    HostConsoleProjects,
     HostConsoleTaskReview,
     HostConsoleTaskCancel,
     HostConsoleTaskGuide,
@@ -453,7 +455,7 @@ mod tests {
             AdminWebStylesCss as usize + 1,
             "canonical iteration must cover every RouteId exactly once",
         );
-        assert_eq!(iter_routes().count(), 136, "canonical route closure");
+        assert_eq!(iter_routes().count(), 138, "canonical route closure");
         assert_eq!(lookup("GET", "/mcp").unwrap().id, McpGet);
         assert_eq!(lookup("POST", "/mcp").unwrap().id, McpPost);
     }
@@ -581,7 +583,7 @@ mod tests {
             );
             references += 1;
         }
-        assert_eq!(references, 136, "A2 production leaf RouteId closure");
+        assert_eq!(references, 138, "A2 production leaf RouteId closure");
     }
 
     #[test]

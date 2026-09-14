@@ -1,8 +1,11 @@
 //! Audit-safe argument summaries for runtime tool calls.
 
+#[cfg(feature = "workspace-checkpoints")]
+use super::tool_call::CheckpointToolCall;
 #[cfg(test)]
 use super::tool_call::ComputerSnapshotRegion;
-use super::tool_call::ToolCall;
+use super::tool_call::ValidateToolCall;
+use super::tool_call::{GoalToolCall, LspToolCall, SessionToolCall, TodoToolCall, ToolCall};
 #[cfg(feature = "workspace-checkpoints")]
 use super::tool_inputs::{is_checkpoint_kind, is_checkpoint_validation_status};
 use serde_json::Value;
@@ -3044,6 +3047,100 @@ mod computer_privacy_tests {
     }
 }
 
+fn session_tool_action_name(call: &SessionToolCall) -> &'static str {
+    match call {
+        SessionToolCall::Start { .. } => "start",
+        SessionToolCall::Get { .. } => "get",
+        SessionToolCall::List { .. } => "list",
+        SessionToolCall::AttachProject { .. } => "attach_project",
+        SessionToolCall::DetachProject { .. } => "detach_project",
+        SessionToolCall::UpdateContext { .. } => "update_context",
+        SessionToolCall::Compact { .. } => "compact",
+        SessionToolCall::Restore { .. } => "restore",
+        SessionToolCall::Summary { .. } => "summary",
+        SessionToolCall::Close { .. } => "close",
+    }
+}
+
+fn todo_tool_action_name(call: &TodoToolCall) -> &'static str {
+    match call {
+        TodoToolCall::Create { .. } => "create",
+        TodoToolCall::List { .. } => "list",
+        TodoToolCall::Get { .. } => "get",
+        TodoToolCall::Claim { .. } => "claim",
+        TodoToolCall::Release { .. } => "release",
+        TodoToolCall::Advance { .. } => "advance",
+        TodoToolCall::Complete { .. } => "complete",
+    }
+}
+
+fn lsp_tool_action_name(call: &LspToolCall) -> &'static str {
+    match call {
+        LspToolCall::Status { .. } => "status",
+        LspToolCall::DocumentSymbols { .. } => "document_symbols",
+        LspToolCall::DocumentDiagnostics { .. } => "document_diagnostics",
+        LspToolCall::Hover { .. } => "hover",
+        LspToolCall::WorkspaceSymbols { .. } => "workspace_symbols",
+        LspToolCall::GotoDefinition { .. } => "goto_definition",
+        LspToolCall::FindReferences { .. } => "find_references",
+        LspToolCall::CallHierarchy { .. } => "call_hierarchy",
+    }
+}
+
+fn validate_tool_action_name(call: &ValidateToolCall) -> &'static str {
+    match call {
+        ValidateToolCall::CargoFmt { .. } => "cargo_fmt",
+        ValidateToolCall::CargoCheck { .. } => "cargo_check",
+        ValidateToolCall::CargoTest { .. } => "cargo_test",
+        ValidateToolCall::GoTest { .. } => "go_test",
+        ValidateToolCall::Summary { .. } => "summary",
+    }
+}
+
+fn goal_tool_action_name(call: &GoalToolCall) -> &'static str {
+    match call {
+        GoalToolCall::Create { .. } => "create",
+        GoalToolCall::Get { .. } => "get",
+        GoalToolCall::PresentPlan { .. } => "present_plan",
+        GoalToolCall::List { .. } => "list",
+        GoalToolCall::Update { .. } => "update",
+        GoalToolCall::AssociateAgentTask { .. } => "associate_agent_task",
+        GoalToolCall::AssociateWorkflowSession { .. } => "associate_workflow_session",
+    }
+}
+
+#[cfg(feature = "workspace-checkpoints")]
+fn checkpoint_tool_action_name(call: &CheckpointToolCall) -> &'static str {
+    match call {
+        CheckpointToolCall::Create { .. } => "create",
+        CheckpointToolCall::List { .. } => "list",
+        CheckpointToolCall::Show { .. } => "show",
+        CheckpointToolCall::Restore { .. } => "restore",
+        CheckpointToolCall::Delete { .. } => "delete",
+    }
+}
+
+#[cfg(feature = "workspace-checkpoints")]
+fn checkpoint_tool_project(call: &CheckpointToolCall) -> &str {
+    match call {
+        CheckpointToolCall::Create { project, .. }
+        | CheckpointToolCall::List { project, .. }
+        | CheckpointToolCall::Show { project, .. }
+        | CheckpointToolCall::Restore { project, .. }
+        | CheckpointToolCall::Delete { project, .. } => project.as_str(),
+    }
+}
+
+#[cfg(feature = "workspace-checkpoints")]
+fn checkpoint_tool_checkpoint_id(call: &CheckpointToolCall) -> Option<&str> {
+    match call {
+        CheckpointToolCall::Create { .. } | CheckpointToolCall::List { .. } => None,
+        CheckpointToolCall::Show { checkpoint_id, .. }
+        | CheckpointToolCall::Restore { checkpoint_id, .. }
+        | CheckpointToolCall::Delete { checkpoint_id, .. } => Some(checkpoint_id.as_str()),
+    }
+}
+
 impl ToolCall {
     pub fn session_log_arguments(&self) -> Value {
         match self {
@@ -5096,6 +5193,32 @@ impl ToolCall {
                 "project": project,
                 "max_findings": max_findings,
                 "include_tracked": include_tracked,
+            }),
+            Self::Session(call) => serde_json::json!({
+                "action": session_tool_action_name(call),
+                "session_id": call.session_id(),
+            }),
+            Self::Todo(call) => serde_json::json!({
+                "action": todo_tool_action_name(call),
+                "session_id": call.session_id(),
+            }),
+            Self::Lsp(call) => serde_json::json!({
+                "action": lsp_tool_action_name(call),
+                "project": call.project(),
+            }),
+            Self::Validate(call) => serde_json::json!({
+                "action": validate_tool_action_name(call),
+                "project": call.project(),
+            }),
+            Self::Goal(call) => serde_json::json!({
+                "action": goal_tool_action_name(call),
+                "goal_id_present": call.goal_id().is_some(),
+            }),
+            #[cfg(feature = "workspace-checkpoints")]
+            Self::Checkpoint(call) => serde_json::json!({
+                "action": checkpoint_tool_action_name(call),
+                "project": checkpoint_tool_project(call),
+                "checkpoint_id_present": checkpoint_tool_checkpoint_id(call).is_some(),
             }),
         }
     }

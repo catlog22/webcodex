@@ -1,5 +1,6 @@
 use serde_json::Value;
 
+mod action_tools;
 mod agent_tasks;
 mod artifacts;
 #[cfg(feature = "workspace-checkpoints")]
@@ -20,6 +21,7 @@ mod lsp;
 mod memory;
 mod projects;
 mod runner_config;
+mod session_tools;
 mod sessions;
 mod skills;
 mod ssh_resources;
@@ -69,6 +71,12 @@ pub fn output_schema_for_tool(name: &str) -> Value {
         return schema;
     }
     if let Some(schema) = edits::output_schema_for_tool(name) {
+        return schema;
+    }
+    if let Some(schema) = session_tools::output_schema_for_tool(name) {
+        return schema;
+    }
+    if let Some(schema) = action_tools::output_schema_for_tool(name) {
         return schema;
     }
     if let Some(schema) = sessions::output_schema_for_tool(name) {

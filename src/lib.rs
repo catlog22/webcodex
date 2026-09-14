@@ -277,9 +277,11 @@ only for local/trusted-network demos."
         &config, &quic_cfg,
     ));
     let runtime_state_dir = config.runtime_state_dir();
+    let tool_exposure = tool_runtime::ToolExposure::from_env().map_err(std::io::Error::other)?;
     let mut tool_runtime_builder =
         tool_runtime::ToolRuntime::new(runner_registry.clone(), runtime_info.clone())
             .with_runtime_exposure(runtime_exposure)
+            .with_tool_exposure(tool_exposure)
             .with_window_activity_database(db.clone())
             .with_memory_database(db.clone())
             .with_communication_database(db.clone())

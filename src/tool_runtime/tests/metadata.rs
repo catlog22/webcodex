@@ -2084,6 +2084,7 @@ async fn tool_manifest_keeps_list_compact_and_exact_contract_bounded() {
                         | "cargo_check"
                         | "cargo_test"
                         | "go_test"
+                        | "validate"
                 ),
                 "accepted_exit_codes" => tool_name == "run_process",
                 _ => false,

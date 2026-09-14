@@ -74,6 +74,7 @@ pub(crate) use window_activity::{
     ToolCallCorrelation, WindowActivityGuard, WindowLoopTransition, WorkflowSessionCorrelation,
     WorkflowSessionCorrelationRelation,
 };
+mod session_projects;
 mod session_shell;
 mod session_tools;
 pub(crate) mod sessions;
@@ -84,7 +85,9 @@ pub(crate) mod specialized;
 pub(crate) mod startup_brief;
 mod structured_execution;
 mod surface;
+mod todo;
 mod tool_audit;
+mod tool_exposure;
 pub(crate) use tool_audit::session_log_result_for_tool as audit_safe_result_for_tool;
 mod tool_call;
 mod tool_catalog;
@@ -123,9 +126,12 @@ pub use runtime_info::RuntimeInfo;
 pub(crate) use session_context::workflow_session_authority_fingerprint;
 #[cfg(test)]
 pub(crate) use sessions::{SessionCreateOptions, SessionGuards, SessionSummary};
+#[cfg(feature = "workspace-checkpoints")]
+pub use tool_call::CheckpointToolCall;
 pub use tool_call::{
-    ObserveJobsItem, PluginToolCall, ReadFilesItem, SearchPatternMode, SearchProjectTextsQuery,
-    SearchResultMode, SshResourceToolCall, ToolCall,
+    GoalToolCall, LspToolCall, ObserveJobsItem, PluginToolCall, ReadFilesItem, SearchPatternMode,
+    SearchProjectTextsQuery, SearchResultMode, SessionToolCall, SshResourceToolCall, TodoToolCall,
+    ToolCall, ValidateToolCall,
 };
 pub(crate) use tool_call::{
     TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD, TOOL_CALL_WRAPPER_FIELDS,
@@ -137,6 +143,7 @@ pub(crate) use tool_definition::{
     known_tool_names, model_hidden_tool_names, runtime_tool_category as tool_manifest_category,
     RunnerCapabilityRequirement,
 };
+pub use tool_exposure::ToolExposure;
 #[cfg(test)]
 pub use tool_inputs::ApplyFileChangeInput;
 #[cfg(all(test, feature = "workspace-checkpoints"))]

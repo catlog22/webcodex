@@ -162,6 +162,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::Shell,
         ),
         (
+            "validate",
+            ToolRisk::JobRun,
+            RunnerCapabilityRequirement::Shell,
+        ),
+        (
             "cargo_check",
             ToolRisk::JobRun,
             RunnerCapabilityRequirement::Shell,
@@ -180,6 +185,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
             "read_files",
             ToolRisk::Read,
             RunnerCapabilityRequirement::FileRead,
+        ),
+        (
+            "lsp",
+            ToolRisk::Read,
+            RunnerCapabilityRequirement::LspReadOnlyNavigation,
         ),
         (
             "lsp_status",

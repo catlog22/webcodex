@@ -23,6 +23,11 @@ pub(crate) fn routes() -> Router {
         .push(
             Router::with_path(api_path(RouteId::HostConsoleWorkflowSession)).post(workflow_session),
         )
+        .push(
+            Router::with_path(api_path(RouteId::HostConsoleWorkflowSessionProjects))
+                .post(workflow_session_projects),
+        )
+        .push(Router::with_path(api_path(RouteId::HostConsoleProjects)).post(projects))
         .push(Router::with_path(api_path(RouteId::HostConsoleTaskReview)).post(task_review))
         .push(Router::with_path(api_path(RouteId::HostConsoleTaskCancel)).post(task_cancel))
         .push(Router::with_path(api_path(RouteId::HostConsoleTaskGuide)).post(task_guide))
@@ -201,6 +206,49 @@ async fn workflow_session(req: &mut Request, depot: &mut Depot, res: &mut Respon
             ),
         ),
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowSessionProjectsInput {
+    session_id: String,
+    action: String,
+    project: String,
+    expected_revision: u64,
+}
+
+#[handler]
+async fn workflow_session_projects(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (runtime, auth) = prepare!(req, depot, res);
+    let input = parse!(WorkflowSessionProjectsInput, req, res);
+    if validate_opaque_id(&input.session_id, "wc_sess_", "session_id").is_err() {
+        return invalid(res, "invalid workflow session input");
+    }
+    if !matches!(input.action.as_str(), "attach" | "detach") {
+        return invalid(res, "action must be attach or detach");
+    }
+    let result = runtime
+        .workflow_session_projects_console_mutation(
+            &auth,
+            &input.session_id,
+            &input.action,
+            &input.project,
+            input.expected_revision,
+        )
+        .await;
+    res.render(Json(serde_json::to_value(&result).unwrap_or_else(|_| {
+        json!({
+            "success": false,
+            "error": "failed to serialize tool result"
+        })
+    })));
+}
+
+#[handler]
+async fn projects(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    let (runtime, auth) = prepare!(req, depot, res);
+    let entries = runtime.console_projects_list(&auth).await;
+    res.render(Json(json!({ "projects": entries })));
 }
 
 #[handler]
@@ -793,5 +841,225 @@ mod tests {
                 "unexpected error body: {body}"
             );
         }
+    }
+
+    async fn register_console_projects(
+        fixture: &crate::connector_runtime::execution_tests::ConsoleFixture,
+        client_id: &str,
+        instance_id: &str,
+        project_ids: &[&str],
+    ) -> String {
+        use crate::runner_protocol::RunnerProjectSummary;
+        // Inventory snapshots replace the client's project list wholesale, so
+        // every project for one client must land in a single call.
+        let summaries = project_ids
+            .iter()
+            .map(|project_id| RunnerProjectSummary {
+                id: project_id.to_string(),
+                name: Some(project_id.to_string()),
+                path: format!("/tmp/{project_id}"),
+                allow_patch: true,
+                kind: Some("repo".to_string()),
+                registration_source: None,
+                description: None,
+                hooks: Vec::new(),
+                disabled: false,
+                revision: None,
+                root_fingerprint: None,
+                lineage: None,
+                git_branch: None,
+                git_head: None,
+                git_dirty: None,
+                updated_at: 1,
+                shell_profile: None,
+            })
+            .collect();
+        crate::test_support::apply_project_inventory_snapshot(
+            &fixture.runtime.tool_runtime_for_test().runner_registry,
+            client_id,
+            instance_id,
+            summaries,
+        )
+        .await;
+        crate::tool_runtime::runner_project_runtime_id(client_id, project_ids[0])
+    }
+
+    #[tokio::test]
+    async fn workflow_session_console_detail_lists_attached_projects_with_revision() {
+        let fixture = crate::connector_runtime::execution_tests::console_fixture().await;
+        let auth = crate::connector_runtime::tests::auth("u1");
+        let project = fixture.runtime.context().project_id.clone();
+        let sessions = &fixture.runtime.tool_runtime_for_test().sessions;
+        let visible = sessions.start_session(Some(project.clone()), Some("multi".to_string()));
+        fixture
+            .runtime
+            .tool_runtime_for_test()
+            .session_projects
+            .initialize(&visible.session_id, vec!["agent:other:repo".to_string()])
+            .expect("initialize projection");
+
+        let service = service(fixture.runtime.clone(), auth);
+        let mut response = TestClient::post("http://127.0.0.1/console/workflow-session")
+            .add_header("host", "127.0.0.1", true)
+            .add_header("origin", "http://127.0.0.1", true)
+            .add_header("content-type", "application/json", true)
+            .json(&serde_json::json!({"session_id": visible.session_id}))
+            .send(&service)
+            .await;
+        let detail: serde_json::Value = response.take_json().await.unwrap();
+        let entries = detail["projects"].as_array().expect("projects array");
+        assert_eq!(entries.len(), 2, "{detail}");
+        assert_eq!(entries[0]["project"], project, "{detail}");
+        assert_eq!(entries[0]["canonical"], true, "{detail}");
+        assert_eq!(entries[1]["project"], "agent:other:repo", "{detail}");
+        assert_eq!(entries[1]["canonical"], false, "{detail}");
+        assert_eq!(detail["projects_revision"], 1, "{detail}");
+    }
+
+    #[tokio::test]
+    async fn workflow_session_console_projects_attach_detach_roundtrip_with_cas() {
+        let fixture = crate::connector_runtime::execution_tests::console_fixture().await;
+        let auth = crate::connector_runtime::tests::auth("u1");
+        let project = fixture.runtime.context().project_id.clone();
+        let sessions = &fixture.runtime.tool_runtime_for_test().sessions;
+        let visible = sessions.start_session(Some(project.clone()), Some("roundtrip".to_string()));
+        fixture
+            .runtime
+            .tool_runtime_for_test()
+            .session_projects
+            .initialize(&visible.session_id, Vec::new())
+            .expect("initialize projection");
+        register_console_projects(
+            &fixture,
+            "hosted",
+            "instance-a",
+            &["console-repo", "console-second"],
+        )
+        .await;
+        async fn post(
+            fixture: &crate::connector_runtime::execution_tests::ConsoleFixture,
+            auth: &AuthContext,
+            body: serde_json::Value,
+        ) -> (Option<u16>, serde_json::Value) {
+            let svc = service(fixture.runtime.clone(), auth.clone());
+            let mut response =
+                TestClient::post("http://127.0.0.1/console/workflow-session/projects")
+                    .add_header("host", "127.0.0.1", true)
+                    .add_header("origin", "http://127.0.0.1", true)
+                    .add_header("content-type", "application/json", true)
+                    .json(&body)
+                    .send(&svc)
+                    .await;
+            let status = response.status_code.map(|status| status.as_u16());
+            let body: serde_json::Value = response.take_json().await.unwrap();
+            (status, body)
+        }
+
+        // Attach uses the revision reported by the console detail.
+        let (status, attached) = post(
+            &fixture,
+            &auth,
+            serde_json::json!({
+                "session_id": visible.session_id,
+                "action": "attach",
+                "project": "agent:hosted:console-repo",
+                "expected_revision": 1
+            }),
+        )
+        .await;
+        assert_eq!(status, Some(200), "{attached}");
+        assert_eq!(attached["success"], true, "{attached}");
+        assert_eq!(attached["output"]["revision"], 2, "{attached}");
+
+        // A stale revision is rejected without mutating state.
+        let (_, stale) = post(
+            &fixture,
+            &auth,
+            serde_json::json!({
+                "session_id": visible.session_id,
+                "action": "attach",
+                "project": "agent:hosted:console-second",
+                "expected_revision": 1
+            }),
+        )
+        .await;
+        assert_eq!(stale["success"], false, "{stale}");
+        assert_eq!(
+            stale["output"]["error_kind"], "session_projects_revision_conflict",
+            "{stale}"
+        );
+
+        // Detach with the current revision round-trips.
+        let (_, detached) = post(
+            &fixture,
+            &auth,
+            serde_json::json!({
+                "session_id": visible.session_id,
+                "action": "detach",
+                "project": "agent:hosted:console-repo",
+                "expected_revision": 2
+            }),
+        )
+        .await;
+        assert_eq!(detached["success"], true, "{detached}");
+        assert_eq!(detached["output"]["revision"], 3, "{detached}");
+
+        // Unknown actions and unknown sessions fail closed.
+        let (status, _) = post(
+            &fixture,
+            &auth,
+            serde_json::json!({
+                "session_id": visible.session_id,
+                "action": "rename",
+                "project": "agent:hosted:console-repo",
+                "expected_revision": 3
+            }),
+        )
+        .await;
+        assert_eq!(status, Some(400));
+        let (status, unknown) = post(
+            &fixture,
+            &auth,
+            serde_json::json!({
+                "session_id": "wc_sess_unknown000000000000000000000000",
+                "action": "attach",
+                "project": "agent:hosted:console-repo",
+                "expected_revision": 1
+            }),
+        )
+        .await;
+        assert_eq!(status, Some(200), "{unknown}");
+        assert_eq!(unknown["success"], false, "{unknown}");
+        assert_eq!(
+            unknown["output"]["error_kind"], "unknown_session_id",
+            "{unknown}"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_projects_lists_registered_projects() {
+        let fixture = crate::connector_runtime::execution_tests::console_fixture().await;
+        let auth = crate::connector_runtime::tests::auth("u1");
+        let project =
+            register_console_projects(&fixture, "hosted", "instance-a", &["listed-repo"]).await;
+        let service = service(fixture.runtime.clone(), auth);
+        let mut response = TestClient::post("http://127.0.0.1/console/projects")
+            .add_header("host", "127.0.0.1", true)
+            .add_header("origin", "http://127.0.0.1", true)
+            .add_header("content-type", "application/json", true)
+            .json(&serde_json::json!({}))
+            .send(&service)
+            .await;
+        assert_eq!(
+            response.status_code.map(|status| status.as_u16()),
+            Some(200)
+        );
+        let body: serde_json::Value = response.take_json().await.unwrap();
+        let entries = body["projects"].as_array().expect("projects array");
+        let ids: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| entry["id"].as_str())
+            .collect();
+        assert!(ids.contains(&project.as_str()), "{body}");
     }
 }

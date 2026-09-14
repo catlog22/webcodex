@@ -5,6 +5,7 @@
 //! and Runner capability requirements. Non-runtime route metadata fallbacks remain in `metadata.rs`
 //! while the registry migration proceeds in small steps.
 
+mod action_tools;
 mod agent_tasks;
 mod artifacts;
 #[cfg(feature = "workspace-checkpoints")]
@@ -25,6 +26,7 @@ mod memory;
 mod patches;
 mod plugins;
 mod runner_config;
+mod session_tools;
 mod sessions;
 mod skills;
 mod ssh_resources;
@@ -1145,6 +1147,10 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     diagnostics::DEFINITIONS,
     discovery::DEFINITIONS,
     runner_config::DEFINITIONS,
+    action_tools::DEFINITIONS,
+    session_tools::DEFINITIONS,
+    #[cfg(feature = "workspace-checkpoints")]
+    session_tools::CHECKPOINT_DEFINITIONS,
     ssh_resources::DEFINITIONS,
     plugins::DEFINITIONS,
     jobs::EXECUTION_DEFINITIONS,

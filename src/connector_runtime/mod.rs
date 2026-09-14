@@ -218,6 +218,54 @@ impl ConnectorRuntime {
             .workflow_session_console_detail(&self.context.project_id, session_id, limit)
     }
 
+    /// Host-console workspace mutation for one exact session. Authorization
+    /// and CAS semantics are identical to the consolidated `session`
+    /// attach/detach_project tool surface.
+    pub(crate) async fn workflow_session_projects_console_mutation(
+        &self,
+        auth: &AuthContext,
+        session_id: &str,
+        action: &str,
+        project: &str,
+        expected_revision: u64,
+    ) -> crate::tool_runtime::ToolResult {
+        match action {
+            "attach" => {
+                self.tools
+                    .consolidated_session_attach(session_id, project, expected_revision, Some(auth))
+                    .await
+            }
+            "detach" => {
+                self.tools
+                    .consolidated_session_detach(session_id, project, expected_revision, Some(auth))
+                    .await
+            }
+            _ => {
+                crate::tool_runtime::ToolResult::err("action must be attach or detach".to_string())
+            }
+        }
+    }
+
+    /// Registered projects visible to the console caller, trimmed to the
+    /// identity fields the workspace picker needs.
+    pub(crate) async fn console_projects_list(&self, auth: &AuthContext) -> Vec<serde_json::Value> {
+        let result = self.tools.list_projects(Some(auth)).await;
+        result.output["projects"]
+            .as_array()
+            .map(|projects| {
+                projects
+                    .iter()
+                    .map(|project| {
+                        serde_json::json!({
+                            "id": project.get("id"),
+                            "client_id": project.get("client_id"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[cfg(test)]
     pub(crate) fn tool_runtime_for_test(&self) -> &ToolRuntime {
         self.tools.as_ref()

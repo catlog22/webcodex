@@ -894,6 +894,21 @@ pub(super) fn mcp_runtime_tool_result(
     }
 }
 
+/// Drop tools the operator exposure config disabled from an MCP tools/list
+/// payload. Runs after every extension append so the filter is uniform.
+fn filter_payload_tools_for_exposure(runtime: &ToolRuntime, result: &mut Value) {
+    if !runtime.tool_exposure().is_restricted() {
+        return;
+    }
+    if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .is_some_and(|name| runtime.tool_exposure().allows(name))
+        });
+    }
+}
+
 pub(super) async fn handle_list(
     runtime: &ToolRuntime,
     id: Option<Value>,
@@ -927,6 +942,7 @@ pub(super) async fn handle_list(
             if stateless_2026 {
                 add_stateless_workflow_recorder_metadata(&mut result, model_surface);
             }
+            filter_payload_tools_for_exposure(runtime, &mut result);
             if crate::mcp_gateway::authorized(auth) {
                 if let Some(tools) = result.get_mut("tools").and_then(Value::as_array_mut) {
                     tools.push(crate::mcp_gateway::tool_spec());

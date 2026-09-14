@@ -69,6 +69,36 @@ pub(in crate::tool_runtime::tests) fn sample_tool_args_for_spec(spec: &ToolSpec)
             args.insert("action".to_string(), json!("list"));
             args.insert("runner".to_string(), json!("runner-a"));
         }
+        "session" => {
+            args.insert("action".to_string(), json!("summary"));
+            args.insert(
+                "session_id".to_string(),
+                json!(format!("wc_sess_{}", "1".repeat(32))),
+            );
+        }
+        "todo" => {
+            args.insert("action".to_string(), json!("list"));
+            args.insert(
+                "session_id".to_string(),
+                json!(format!("wc_sess_{}", "1".repeat(32))),
+            );
+        }
+        "lsp" => {
+            args.insert("action".to_string(), json!("status"));
+            args.insert("project".to_string(), json!(SAMPLE_PROJECT));
+        }
+        "validate" => {
+            args.insert("action".to_string(), json!("cargo_check"));
+            args.insert("project".to_string(), json!(SAMPLE_PROJECT));
+        }
+        "goal" => {
+            args.insert("action".to_string(), json!("list"));
+        }
+        #[cfg(feature = "workspace-checkpoints")]
+        "checkpoint" => {
+            args.insert("action".to_string(), json!("list"));
+            args.insert("project".to_string(), json!(SAMPLE_PROJECT));
+        }
         _ => {}
     }
     Value::Object(args)

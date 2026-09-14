@@ -38,6 +38,12 @@ import {
   workflowSessionListOverviewFacts,
   workflowSessionOverviewPresentation,
 } from "./workflow_session_state";
+import {
+  workflowSessionProjectEntries,
+  workflowSessionProjectsRevision as readWorkflowSessionProjectsRevision,
+  attachableWorkflowSessionProjects,
+  summarizeSessionProjectsMutation,
+} from "./workflow_session_projects_state";
 
 const CONSOLE_BASE = "/api/console/";
 const REFRESH_MS = 8000;
@@ -53,6 +59,10 @@ let timer = 0;
 let reviewLoop: any = null;
 let projectName = "";
 let workflowSessionDetailAbort: AbortController | null = null;
+let workflowSessionProjectsCasRevision = 0;
+let workflowSessionRegisteredProjects: any[] = [];
+let workflowSessionRegisteredProjectsLoaded = false;
+let workflowSessionProjectsBusy = false;
 
 // Connector Task review and Workflow Session observability remain separate
 // state machines. Neither identity is inferred from the other.
@@ -520,6 +530,7 @@ function renderWorkflowSessionDetail(detail: any) {
   setText("workflow-session-running", detail.running_call ? "running call" : "no running call");
   setText("workflow-session-updated", updatedLabel(detail.updated_at));
   renderWorkflowSessionOverview(detail.overview);
+  renderWorkflowSessionProjects(detail);
   const activities = Array.isArray(detail.activity) ? detail.activity : [];
   const node = el("workflow-session-timeline");
   const previousScrollTop = node ? node.scrollTop : 0;
@@ -581,6 +592,134 @@ function renderWorkflowSessionDetail(detail: any) {
     node.scrollHeight
   );
   syncWorkflowSessionFollowUi();
+}
+
+function renderWorkflowSessionProjects(detail: any) {
+  const entries = workflowSessionProjectEntries(detail);
+  workflowSessionProjectsCasRevision = readWorkflowSessionProjectsRevision(detail);
+  const chips = el("workflow-session-projects");
+  if (chips) {
+    clearNode(chips);
+    for (const entry of entries) {
+      const chip = document.createElement("span");
+      chip.className = "chip";
+      chip.textContent = entry.canonical
+        ? entry.project + " (canonical)"
+        : entry.project;
+      chips.appendChild(chip);
+      if (!entry.canonical) {
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "workflow-session-project-detach";
+        remove.textContent = "×";
+        remove.title = "Detach " + entry.project;
+        remove.addEventListener("click", () => {
+          void mutateWorkflowSessionProjects("detach", entry.project);
+        });
+        chip.appendChild(remove);
+      }
+    }
+  }
+  // The detach affordance only makes sense when more than the canonical
+  // workspace would remain; the canonical workspace itself is never detachable.
+  const addForm = el("workflow-session-project-add");
+  if (addForm && !(addForm as any).dataset.wired) {
+    (addForm as any).dataset.wired = "true";
+    addForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const select = el("workflow-session-project-add-select") as HTMLSelectElement | null;
+      const project = select ? select.value : "";
+      if (project) {
+        void mutateWorkflowSessionProjects("attach", project);
+      }
+    });
+  }
+  void refreshWorkflowSessionProjectPicker(entries);
+}
+
+async function refreshWorkflowSessionProjectPicker(entries: any[]) {
+  if (!workflowSessionRegisteredProjectsLoaded) {
+    const res = await api("projects", {});
+    workflowSessionRegisteredProjectsLoaded = true;
+    workflowSessionRegisteredProjects =
+      res && res.ok && res.data && Array.isArray(res.data.projects)
+        ? res.data.projects
+        : [];
+  }
+  const select = el("workflow-session-project-add-select") as HTMLSelectElement | null;
+  const addForm = el("workflow-session-project-add");
+  if (!select || !addForm) {
+    return;
+  }
+  const previous = select.value;
+  clearNode(select);
+  const attachable = attachableWorkflowSessionProjects(
+    workflowSessionRegisteredProjects,
+    entries
+  );
+  for (const project of attachable) {
+    const option = document.createElement("option");
+    option.value = project.id;
+    option.textContent = project.label;
+    select.appendChild(option);
+  }
+  if (attachable.some((project: any) => project.id === previous)) {
+    select.value = previous;
+  }
+  (addForm as any).hidden = attachable.length === 0;
+}
+
+function showWorkflowSessionProjectsError(message: string) {
+  const node = el("workflow-session-projects-error");
+  if (!node) {
+    return;
+  }
+  node.textContent = message;
+  (node as any).hidden = !message;
+}
+
+async function mutateWorkflowSessionProjects(action: string, project: string) {
+  if (workflowSessionProjectsBusy) {
+    return;
+  }
+  workflowSessionProjectsBusy = true;
+  try {
+    const res = await api("workflow-session/projects", {
+      session_id: workflowSessionState.selectedSessionId,
+      action,
+      project,
+      expected_revision: workflowSessionProjectsCasRevision,
+    });
+    if (!res) {
+      return;
+    }
+    if (res.status === 401) {
+      lock("Credential rejected. Re-enter it.");
+      return;
+    }
+    const summary = summarizeSessionProjectsMutation(res.data);
+    if (!summary.ok) {
+      showWorkflowSessionProjectsError(summary.error);
+      // A revision conflict means the projection moved underneath us; resync
+      // from the authority before the next attempt.
+      if (summary.error.indexOf("revision conflict") !== -1) {
+        await refreshWorkflowSessionDetailNow();
+      }
+      return;
+    }
+    workflowSessionProjectsCasRevision = summary.revision;
+    showWorkflowSessionProjectsError("");
+    await refreshWorkflowSessionDetailNow();
+  } finally {
+    workflowSessionProjectsBusy = false;
+  }
+}
+
+async function refreshWorkflowSessionDetailNow() {
+  const request = refreshWorkflowSessionDetail(workflowSessionState);
+  if (request) {
+    await fetchWorkflowSessionDetail(request);
+  }
 }
 
 function durationLabel(durationMs: number): string {

@@ -502,6 +502,70 @@ function shouldFollowWorkflowSessionLatest(state) {
     return state.followLatest !== false;
 }
 
+// DOM-free workspace projection state for Workflow Session console detail:
+// attached project normalization, attachable registered-project filtering, and
+// mutation result summarizing. Revision values feed the CAS fence the console
+// backend enforces on every attach/detach.
+function workflowSessionProjectEntries(detail) {
+    if (!detail || !Array.isArray(detail.projects)) {
+        return [];
+    }
+    const seen = new Set();
+    const entries = [];
+    for (const raw of detail.projects) {
+        const project = raw && typeof raw.project === "string" ? raw.project : "";
+        if (!project || seen.has(project)) {
+            continue;
+        }
+        seen.add(project);
+        entries.push({ project, canonical: !!(raw && raw.canonical) });
+    }
+    // Canonical workspace renders first regardless of payload ordering.
+    entries.sort((a, b) => Number(b.canonical) - Number(a.canonical));
+    return entries;
+}
+function workflowSessionProjectsRevision(detail) {
+    const revision = detail && detail.projects_revision;
+    return typeof revision === "number" && Number.isFinite(revision) && revision >= 0
+        ? Math.floor(revision)
+        : 0;
+}
+function attachableWorkflowSessionProjects(registered, entries) {
+    const attached = new Set(entries.map((entry) => entry.project));
+    const seen = new Set();
+    const attachable = [];
+    for (const raw of registered) {
+        const id = raw && typeof raw.id === "string" ? raw.id : "";
+        if (!id || attached.has(id) || seen.has(id)) {
+            continue;
+        }
+        seen.add(id);
+        const clientId = raw && typeof raw.client_id === "string" ? raw.client_id : "";
+        attachable.push({ id, clientId, label: clientId ? id + " (" + clientId + ")" : id });
+    }
+    attachable.sort((a, b) => a.label.localeCompare(b.label));
+    return attachable;
+}
+// The console endpoint renders the ToolResult JSON: top-level `success`, the
+// human message in `error`, and the typed payload (including the new revision)
+// under `output`.
+function summarizeSessionProjectsMutation(result) {
+    const ok = !!(result && result.success);
+    const output = (result && result.output) || {};
+    const revision = output.revision;
+    const error = !ok
+        ? String((result && result.error) ||
+            output.message ||
+            output.error_kind ||
+            "workspace update failed")
+        : "";
+    return {
+        ok,
+        revision: typeof revision === "number" && Number.isFinite(revision) ? Math.floor(revision) : 0,
+        error,
+    };
+}
+
 // WebCodex host-local review console.
 //
 // The page lets the same-host human review, accept, reject, and cancel
@@ -527,6 +591,10 @@ let timer = 0;
 let reviewLoop = null;
 let projectName = "";
 let workflowSessionDetailAbort = null;
+let workflowSessionProjectsCasRevision = 0;
+let workflowSessionRegisteredProjects = [];
+let workflowSessionRegisteredProjectsLoaded = false;
+let workflowSessionProjectsBusy = false;
 // Connector Task review and Workflow Session observability remain separate
 // state machines. Neither identity is inferred from the other.
 const state = initialState();
@@ -950,6 +1018,7 @@ function renderWorkflowSessionDetail(detail) {
     setText("workflow-session-running", detail.running_call ? "running call" : "no running call");
     setText("workflow-session-updated", updatedLabel(detail.updated_at));
     renderWorkflowSessionOverview(detail.overview);
+    renderWorkflowSessionProjects(detail);
     const activities = Array.isArray(detail.activity) ? detail.activity : [];
     const node = el("workflow-session-timeline");
     const previousScrollTop = node ? node.scrollTop : 0;
@@ -1009,6 +1078,127 @@ function renderWorkflowSessionDetail(detail) {
     }
     node.scrollTop = workflowSessionScrollTopAfterRender(workflowSessionState, previousScrollTop, node.clientHeight, node.scrollHeight);
     syncWorkflowSessionFollowUi();
+}
+function renderWorkflowSessionProjects(detail) {
+    const entries = workflowSessionProjectEntries(detail);
+    workflowSessionProjectsCasRevision = readWorkflowSessionProjectsRevision(detail);
+    const chips = el("workflow-session-projects");
+    if (chips) {
+        clearNode(chips);
+        for (const entry of entries) {
+            const chip = document.createElement("span");
+            chip.className = "chip";
+            chip.textContent = entry.canonical
+                ? entry.project + " (canonical)"
+                : entry.project;
+            chips.appendChild(chip);
+            if (!entry.canonical) {
+                const remove = document.createElement("button");
+                remove.type = "button";
+                remove.className = "workflow-session-project-detach";
+                remove.textContent = "×";
+                remove.title = "Detach " + entry.project;
+                remove.addEventListener("click", () => {
+                    void mutateWorkflowSessionProjects("detach", entry.project);
+                });
+                chip.appendChild(remove);
+            }
+        }
+    }
+    // The detach affordance only makes sense when more than the canonical
+    // workspace would remain; the canonical workspace itself is never detachable.
+    const addForm = el("workflow-session-project-add");
+    if (addForm && !addForm.dataset.wired) {
+        addForm.dataset.wired = "true";
+        addForm.addEventListener("submit", (event) => {
+            event.preventDefault();
+            const select = el("workflow-session-project-add-select");
+            const project = select ? select.value : "";
+            if (project) {
+                void mutateWorkflowSessionProjects("attach", project);
+            }
+        });
+    }
+    void refreshWorkflowSessionProjectPicker(entries);
+}
+async function refreshWorkflowSessionProjectPicker(entries) {
+    if (!workflowSessionRegisteredProjectsLoaded) {
+        const res = await api("projects", {});
+        workflowSessionRegisteredProjectsLoaded = true;
+        workflowSessionRegisteredProjects =
+            res && res.ok && res.data && Array.isArray(res.data.projects)
+                ? res.data.projects
+                : [];
+    }
+    const select = el("workflow-session-project-add-select");
+    const addForm = el("workflow-session-project-add");
+    if (!select || !addForm) {
+        return;
+    }
+    const previous = select.value;
+    clearNode(select);
+    const attachable = attachableWorkflowSessionProjects(workflowSessionRegisteredProjects, entries);
+    for (const project of attachable) {
+        const option = document.createElement("option");
+        option.value = project.id;
+        option.textContent = project.label;
+        select.appendChild(option);
+    }
+    if (attachable.some((project) => project.id === previous)) {
+        select.value = previous;
+    }
+    addForm.hidden = attachable.length === 0;
+}
+function showWorkflowSessionProjectsError(message) {
+    const node = el("workflow-session-projects-error");
+    if (!node) {
+        return;
+    }
+    node.textContent = message;
+    node.hidden = !message;
+}
+async function mutateWorkflowSessionProjects(action, project) {
+    if (workflowSessionProjectsBusy) {
+        return;
+    }
+    workflowSessionProjectsBusy = true;
+    try {
+        const res = await api("workflow-session/projects", {
+            session_id: workflowSessionState.selectedSessionId,
+            action,
+            project,
+            expected_revision: workflowSessionProjectsCasRevision,
+        });
+        if (!res) {
+            return;
+        }
+        if (res.status === 401) {
+            lock("Credential rejected. Re-enter it.");
+            return;
+        }
+        const summary = summarizeSessionProjectsMutation(res.data);
+        if (!summary.ok) {
+            showWorkflowSessionProjectsError(summary.error);
+            // A revision conflict means the projection moved underneath us; resync
+            // from the authority before the next attempt.
+            if (summary.error.indexOf("revision conflict") !== -1) {
+                await refreshWorkflowSessionDetailNow();
+            }
+            return;
+        }
+        workflowSessionProjectsCasRevision = summary.revision;
+        showWorkflowSessionProjectsError("");
+        await refreshWorkflowSessionDetailNow();
+    }
+    finally {
+        workflowSessionProjectsBusy = false;
+    }
+}
+async function refreshWorkflowSessionDetailNow() {
+    const request = refreshWorkflowSessionDetail(workflowSessionState);
+    if (request) {
+        await fetchWorkflowSessionDetail(request);
+    }
 }
 function durationLabel(durationMs) {
     if (durationMs < 1000) {

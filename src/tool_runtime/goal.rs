@@ -1,4 +1,4 @@
-use super::{RecoveryKind, ToolResult, ToolRuntime};
+use super::{GoalToolCall, RecoveryKind, ToolResult, ToolRuntime};
 use crate::auth::{AuthContext, SCOPE_RUNTIME_READ};
 use crate::db::{
     GoalCorrelationKind, GoalDetail, GoalLifecycle, GoalPatch, GoalStoreError, NewGoal,
@@ -215,6 +215,61 @@ fn request_visibility_budget_available(
 }
 
 impl ToolRuntime {
+    /// Unified dispatch for the consolidated `goal` action tool. Each action
+    /// delegates to the same handler as its legacy flat counterpart, so
+    /// authorization, idempotency, and CAS semantics stay identical.
+    pub(crate) async fn dispatch_goal_action(
+        &self,
+        call: GoalToolCall,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        match call {
+            GoalToolCall::Create {
+                title,
+                objective,
+                idempotency_key,
+            } => self.create_goal(auth, title, objective, idempotency_key),
+            GoalToolCall::Get { goal_id } => self.get_goal(auth, goal_id),
+            GoalToolCall::PresentPlan { goal_id } => self.present_goal_plan(auth, goal_id).await,
+            GoalToolCall::List {
+                lifecycle,
+                offset,
+                limit,
+            } => self.list_goals(auth, lifecycle, offset, limit),
+            GoalToolCall::Update {
+                goal_id,
+                expected_revision,
+                title,
+                objective,
+                lifecycle,
+                terminal_reason,
+                idempotency_key,
+            } => self.update_goal(
+                auth,
+                goal_id,
+                expected_revision,
+                title,
+                objective,
+                lifecycle,
+                terminal_reason,
+                idempotency_key,
+            ),
+            GoalToolCall::AssociateAgentTask {
+                goal_id,
+                task_id,
+                idempotency_key,
+            } => self.associate_goal_agent_task(auth, goal_id, task_id, idempotency_key),
+            GoalToolCall::AssociateWorkflowSession {
+                goal_id,
+                session_id,
+                idempotency_key,
+            } => {
+                self.associate_goal_workflow_session(auth, goal_id, session_id, idempotency_key)
+                    .await
+            }
+        }
+    }
+
     pub(crate) fn create_goal(
         &self,
         auth: Option<&AuthContext>,

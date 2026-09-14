@@ -42,6 +42,7 @@ export const RUNTIME_INLINE_MODULES = Object.freeze([
 const watchedSources = new Set([
   "app.ts",
   "review_state.ts",
+  "workflow_session_projects_state.ts",
   ...RUNTIME_INLINE_MODULES,
   "styles.css",
   "console.html",
@@ -359,6 +360,12 @@ export function createOutputs(
     transpileTypeScript(sourceDirectory, "workflow_session_state.ts")
   );
   const workflowSessionStateClassic = stripModuleExports(workflowSessionStateModule);
+  const workflowSessionProjectsStateModule = buildJs(
+    transpileTypeScript(sourceDirectory, "workflow_session_projects_state.ts")
+  );
+  const workflowSessionProjectsStateClassic = stripModuleExports(
+    workflowSessionProjectsStateModule
+  );
   const runtimeCollaborationStateModule = buildJs(
     transpileTypeScript(sourceDirectory, "runtime_collaboration_state.ts")
   );
@@ -402,9 +409,19 @@ export function createOutputs(
         /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/workflow_session_state(?:\.js)?["'];?\s*\n/m,
         ""
       )
+      .replace(
+        /^import\s*\{[\s\S]*?\}\s*from\s*["']\.\/workflow_session_projects_state(?:\.js)?["'];?\s*\n/m,
+        ""
+      )
   );
   const appInlined = buildJs(
-    reviewStateClassic + "\n" + workflowSessionStateClassic + "\n" + appScript
+    reviewStateClassic +
+      "\n" +
+      workflowSessionStateClassic +
+      "\n" +
+      workflowSessionProjectsStateClassic +
+      "\n" +
+      appScript
   );
   assertClassicScript(resolve(outputDirectory, "app.js"), appInlined);
   const runtimeI18nModule = buildJs(
@@ -698,6 +715,7 @@ export function createOutputs(
   return new Map([
     ["review_state.js", reviewStateModule],
     ["workflow_session_state.js", workflowSessionStateModule],
+    ["workflow_session_projects_state.js", workflowSessionProjectsStateModule],
     ["runtime_collaboration_state.js", runtimeCollaborationStateModule],
     ["runtime_communication_state.js", runtimeCommunicationStateModule],
     ["runtime_context_state.js", runtimeContextStateModule],

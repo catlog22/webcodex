@@ -125,7 +125,7 @@ impl ToolRuntime {
     pub(crate) const LIST_TOOLS_MAX_LIMIT: usize = 256;
 
     pub(crate) fn list_tools_payload(&self, options: ListToolsOptions) -> Value {
-        let specs = registered_tool_specs();
+        let specs = self.tool_exposure().filter_specs(registered_tool_specs());
         let total_count = specs.len();
         let filtered_indexes = list_tools_filtered_indexes(&specs, &options);
         let filtered_count = filtered_indexes.len();
@@ -222,6 +222,10 @@ impl ToolRuntime {
         if let Some(tool_name) = tool_name {
             if category.is_some() || intent.is_some() {
                 return tool_manifest_exact_filter_conflict_result();
+            }
+            // A disabled tool is existence-hidden, exactly like an unknown one.
+            if !self.tool_exposure().allows(&tool_name) {
+                return unknown_tool_manifest_tool_result(&tool_name);
             }
             return match self.tool_manifest_exact_payload(
                 &tool_name,
@@ -387,7 +391,9 @@ impl ToolRuntime {
             )
         })?;
 
-        let specs = tool_manifest_specs(protocol_capabilities, model_surface);
+        let specs = self
+            .tool_exposure()
+            .filter_specs(tool_manifest_specs(protocol_capabilities, model_surface));
         let tool_count = specs.len();
         let categories_requested = normalize_tool_manifest_categories(categories);
         let category = categories_requested

@@ -516,7 +516,13 @@ fn tool_definitions_drive_session_and_permission_policy() {
         .collect::<Vec<_>>();
     assert_eq!(
         validation_output_tools,
-        vec!["cargo_fmt", "cargo_check", "cargo_test", "go_test"]
+        vec![
+            "validate",
+            "cargo_fmt",
+            "cargo_check",
+            "cargo_test",
+            "go_test"
+        ]
     );
 
     let explicit_business_session_tools = tool_definitions()
@@ -812,6 +818,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
             RunnerCapabilityRequirement::Shell,
         ),
         (
+            "validate",
+            ToolRisk::JobRun,
+            RunnerCapabilityRequirement::Shell,
+        ),
+        (
             "cargo_check",
             ToolRisk::JobRun,
             RunnerCapabilityRequirement::Shell,
@@ -830,6 +841,11 @@ fn required_runner_capability_matches_metadata_risk_table() {
             "read_files",
             ToolRisk::Read,
             RunnerCapabilityRequirement::FileRead,
+        ),
+        (
+            "lsp",
+            ToolRisk::Read,
+            RunnerCapabilityRequirement::LspReadOnlyNavigation,
         ),
         (
             "lsp_status",

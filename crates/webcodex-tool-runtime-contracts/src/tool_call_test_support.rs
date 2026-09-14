@@ -51,6 +51,48 @@ fn sample_tool_args_for_spec(spec: &ToolSpec) -> Value {
             args.insert("action".to_string(), json!("list"));
             args.insert("runner".to_string(), json!("runner-a"));
         }
+        "session" => {
+            args.insert("action".to_string(), json!("summary"));
+            args.insert(
+                "session_id".to_string(),
+                json!(format!("wc_sess_{}", "1".repeat(32))),
+            );
+        }
+        "todo" => {
+            args.insert("action".to_string(), json!("list"));
+            args.insert(
+                "session_id".to_string(),
+                json!(format!("wc_sess_{}", "1".repeat(32))),
+            );
+        }
+        "lsp" => {
+            args.insert("action".to_string(), json!("status"));
+            args.insert("project".to_string(), json!(SAMPLE_PROJECT));
+        }
+        "validate" => {
+            args.insert("action".to_string(), json!("summary"));
+            args.insert("project".to_string(), json!(SAMPLE_PROJECT));
+            args.insert(
+                "session_id".to_string(),
+                json!(format!("wc_sess_{}", "1".repeat(32))),
+            );
+        }
+        "goal" => {
+            // Use the action that actually carries the optional session_id so
+            // the generic session_id accessor coverage stays meaningful.
+            args.insert("action".to_string(), json!("associate_workflow_session"));
+            args.insert("goal_id".to_string(), json!("wc_goal_accessor"));
+            args.insert(
+                "session_id".to_string(),
+                json!(format!("wc_sess_{}", "1".repeat(32))),
+            );
+            args.insert("idempotency_key".to_string(), json!("sample-goal-key"));
+        }
+        #[cfg(feature = "workspace-checkpoints")]
+        "checkpoint" => {
+            args.insert("action".to_string(), json!("list"));
+            args.insert("project".to_string(), json!(SAMPLE_PROJECT));
+        }
         _ => {}
     }
     Value::Object(args)

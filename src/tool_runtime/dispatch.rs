@@ -5,7 +5,9 @@ use super::session_context::{
     add_session_hint, session_guard_denied_result, session_lifecycle_denied_result,
     session_project_mismatch_result, SessionProjectMismatch,
 };
-use super::{permissions, session_context, sessions, ToolCall, ToolResult, ToolRuntime};
+use super::{
+    permissions, session_context, sessions, ToolCall, ToolResult, ToolRuntime, ValidateToolCall,
+};
 use crate::auth::AuthContext;
 use crate::tool_runtime::project_resolution::{ProjectResolverError, ResolvedProject};
 use serde_json::{json, Value};
@@ -882,6 +884,19 @@ impl ToolRuntime {
         super::window_activity::ToolCallCorrelation,
     ) {
         let mut result_projection = ModelFacingProjectionPlan::capture(&call);
+        // Operator tool exposure fails closed before any handler runs: a
+        // disabled tool behaves exactly like an unknown tool at the boundary.
+        if !self.tool_exposure().allows(call.tool_name()) {
+            let result = ToolResult::err(format!(
+                "unknown tool '{}' (disabled by operator tool exposure config)",
+                call.tool_name()
+            ));
+            return (
+                result,
+                result_projection,
+                super::window_activity::ToolCallCorrelation::default(),
+            );
+        }
         let mut correlation = super::window_activity::ToolCallCorrelation::default();
         // Edit usage telemetry retains only fixed safe classifications. For
         // apply_patch it captures the requested matching enum before the call is
@@ -1543,6 +1558,32 @@ impl ToolRuntime {
             | ToolCall::SessionDiscussionSummary { .. }) => {
                 self.dispatch_session_tool(call, auth, transport).await
             }
+
+            ToolCall::Session(call) => self.consolidated_session_tool(call, auth, transport).await,
+
+            ToolCall::Todo(call) => self.consolidated_todo_tool(call, auth).await,
+
+            #[cfg(feature = "workspace-checkpoints")]
+            ToolCall::Checkpoint(call) => self.dispatch_checkpoint_action(call, auth).await,
+
+            ToolCall::Lsp(call) => self.dispatch_lsp_tool(call.into_legacy_tool_call()).await,
+
+            ToolCall::Validate(call) => match call {
+                ValidateToolCall::Summary {
+                    project,
+                    session_id,
+                    limit,
+                } => {
+                    self.validation_summary_tool(project, session_id, limit, auth)
+                        .await
+                }
+                other => {
+                    self.dispatch_cargo_tool(other.into_legacy_tool_call(), ssh_resource, auth)
+                        .await
+                }
+            },
+
+            ToolCall::Goal(call) => self.dispatch_goal_action(call, auth).await,
 
             call @ (ToolCall::WorkOnProject { .. } | ToolCall::FinishCodingTask { .. }) => {
                 // Startup/closeout aggregation retains relatively large typed workflow state.

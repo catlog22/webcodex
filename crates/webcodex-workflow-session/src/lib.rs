@@ -35,7 +35,7 @@ pub use closeout::closeout_work_projection;
 pub use console::{
     aggregate_console_list, ConsoleValidationHooks, WorkflowSessionConsoleAggregate,
     WorkflowSessionConsoleAttentionOverview, WorkflowSessionConsoleDetail,
-    WorkflowSessionConsoleList, WorkflowSessionConsoleListItem,
+    WorkflowSessionConsoleList, WorkflowSessionConsoleListItem, WorkflowSessionConsoleProject,
 };
 pub use continuation::{
     continuation_feedback_value, not_applicable_continuation_feedback_value,

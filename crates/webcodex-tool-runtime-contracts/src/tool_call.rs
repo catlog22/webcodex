@@ -2366,6 +2366,790 @@ pub enum ToolCall {
         #[serde(default = "default_true")]
         include_risk_summary: bool,
     },
+
+    /// Unified Workflow Session lifecycle control (consolidated `session` tool).
+    /// Action dispatch mirrors the pi-gateway session surface: multi-workspace
+    /// start/attach/detach, context replacement, compaction into Memory, and
+    /// checkpoint restore.
+    Session(SessionToolCall),
+
+    /// Session-scoped todo records with revision CAS (consolidated `todo` tool).
+    Todo(TodoToolCall),
+
+    /// Unified read-only LSP navigation (consolidated `lsp` tool).
+    Lsp(LspToolCall),
+
+    /// Unified structured validation with same-execution Job handoff
+    /// (consolidated `validate` tool).
+    Validate(ValidateToolCall),
+
+    /// Unified durable Goal control (consolidated `goal` tool).
+    Goal(GoalToolCall),
+
+    /// Unified workspace checkpoint control (consolidated `checkpoint` tool).
+    #[cfg(feature = "workspace-checkpoints")]
+    Checkpoint(CheckpointToolCall),
+}
+
+/// Action payload for the consolidated `session` tool. Per-action required
+/// fields are validated by the runtime after explicit project/session
+/// resolution, matching the flat input schema contract.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum SessionToolCall {
+    Start {
+        #[serde(default)]
+        project: Option<String>,
+        /// Ordered multi-workspace project inputs (1..8); first entry is the
+        /// canonical Session project. Mutually exclusive with `project`.
+        #[serde(default)]
+        projects: Option<Vec<String>>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default, rename = "session_mode")]
+        mode: Option<SessionMode>,
+        #[serde(default)]
+        execution_context: Option<SessionExecutionContext>,
+    },
+    Get {
+        session_id: String,
+    },
+    List {
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    AttachProject {
+        session_id: String,
+        project: String,
+        expected_revision: u64,
+    },
+    DetachProject {
+        session_id: String,
+        project: String,
+        expected_revision: u64,
+    },
+    UpdateContext {
+        project: String,
+        session_id: String,
+        execution_context: SessionExecutionContext,
+    },
+    Compact {
+        session_id: String,
+        #[serde(default)]
+        note: Option<String>,
+    },
+    Restore {
+        session_id: String,
+        #[serde(default)]
+        project: Option<String>,
+        checkpoint_id: String,
+        confirm: bool,
+    },
+    Summary {
+        session_id: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    Close {
+        session_id: String,
+    },
+}
+
+/// Action payload for the consolidated `lsp` tool. All actions are pure
+/// reads scoped to one project; per-action required fields are validated by
+/// the runtime after explicit resolution, matching the flat schema contract.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum LspToolCall {
+    Status {
+        project: String,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    DocumentSymbols {
+        project: String,
+        path: String,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    DocumentDiagnostics {
+        project: String,
+        path: String,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    Hover {
+        project: String,
+        path: String,
+        line: usize,
+        column: usize,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    WorkspaceSymbols {
+        project: String,
+        query: String,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    GotoDefinition {
+        project: String,
+        path: String,
+        line: usize,
+        column: usize,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    FindReferences {
+        project: String,
+        path: String,
+        line: usize,
+        column: usize,
+        #[serde(default = "default_true")]
+        include_declaration: bool,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+    CallHierarchy {
+        project: String,
+        path: String,
+        line: usize,
+        column: usize,
+        #[serde(default)]
+        direction: Option<CallHierarchyDirection>,
+        #[serde(default)]
+        depth: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        session_id: Option<String>,
+    },
+}
+
+impl LspToolCall {
+    pub fn project(&self) -> &str {
+        match self {
+            Self::Status { project, .. }
+            | Self::DocumentSymbols { project, .. }
+            | Self::DocumentDiagnostics { project, .. }
+            | Self::Hover { project, .. }
+            | Self::WorkspaceSymbols { project, .. }
+            | Self::GotoDefinition { project, .. }
+            | Self::FindReferences { project, .. }
+            | Self::CallHierarchy { project, .. } => project.as_str(),
+        }
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::Status { session_id, .. }
+            | Self::DocumentSymbols { session_id, .. }
+            | Self::DocumentDiagnostics { session_id, .. }
+            | Self::Hover { session_id, .. }
+            | Self::WorkspaceSymbols { session_id, .. }
+            | Self::GotoDefinition { session_id, .. }
+            | Self::FindReferences { session_id, .. }
+            | Self::CallHierarchy { session_id, .. } => session_id.as_deref(),
+        }
+    }
+
+    /// Convert into the legacy flat variant so the consolidated tool reuses
+    /// the existing runner-side LSP handlers unchanged.
+    pub fn into_legacy_tool_call(self) -> ToolCall {
+        match self {
+            Self::Status {
+                project,
+                session_id,
+            } => ToolCall::LspStatus {
+                project,
+                session_id,
+            },
+            Self::DocumentSymbols {
+                project,
+                path,
+                limit,
+                session_id,
+            } => ToolCall::DocumentSymbols {
+                project,
+                path,
+                limit,
+                session_id,
+            },
+            Self::DocumentDiagnostics {
+                project,
+                path,
+                limit,
+                session_id,
+            } => ToolCall::DocumentDiagnostics {
+                project,
+                path,
+                limit,
+                session_id,
+            },
+            Self::Hover {
+                project,
+                path,
+                line,
+                column,
+                session_id,
+            } => ToolCall::Hover {
+                project,
+                path,
+                line,
+                column,
+                session_id,
+            },
+            Self::WorkspaceSymbols {
+                project,
+                query,
+                limit,
+                session_id,
+            } => ToolCall::WorkspaceSymbols {
+                project,
+                query,
+                limit,
+                session_id,
+            },
+            Self::GotoDefinition {
+                project,
+                path,
+                line,
+                column,
+                limit,
+                session_id,
+            } => ToolCall::GotoDefinition {
+                project,
+                path,
+                line,
+                column,
+                limit,
+                session_id,
+            },
+            Self::FindReferences {
+                project,
+                path,
+                line,
+                column,
+                include_declaration,
+                limit,
+                session_id,
+            } => ToolCall::FindReferences {
+                project,
+                path,
+                line,
+                column,
+                include_declaration,
+                limit,
+                session_id,
+            },
+            Self::CallHierarchy {
+                project,
+                path,
+                line,
+                column,
+                direction,
+                depth,
+                limit,
+                session_id,
+            } => ToolCall::CallHierarchy {
+                project,
+                path,
+                line,
+                column,
+                direction: direction.unwrap_or_default(),
+                depth: depth.unwrap_or(DEFAULT_CALL_HIERARCHY_DEPTH),
+                limit: limit.unwrap_or(DEFAULT_CALL_HIERARCHY_LIMIT),
+                session_id,
+            },
+        }
+    }
+}
+
+/// Action payload for the consolidated `validate` tool. The cargo/go actions
+/// execute structured validation (long runs hand off to the same-execution
+/// Job); `summary` reads the bounded validation history of one Session.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ValidateToolCall {
+    CargoFmt {
+        project: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        check: Option<bool>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
+        sync_wait_secs: Option<u64>,
+    },
+    CargoCheck {
+        project: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        all_targets: Option<bool>,
+        #[serde(default)]
+        all_features: Option<bool>,
+        #[serde(default)]
+        no_default_features: Option<bool>,
+        #[serde(default)]
+        features: Option<String>,
+        #[serde(default)]
+        package: Option<String>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
+        sync_wait_secs: Option<u64>,
+    },
+    CargoTest {
+        project: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        filter: Option<String>,
+        #[serde(default)]
+        all_targets: Option<bool>,
+        #[serde(default)]
+        all_features: Option<bool>,
+        #[serde(default)]
+        no_default_features: Option<bool>,
+        #[serde(default)]
+        features: Option<String>,
+        #[serde(default)]
+        package: Option<String>,
+        #[serde(default)]
+        no_run: Option<bool>,
+        #[serde(default)]
+        require_tests: Option<bool>,
+        #[serde(default)]
+        min_tests: Option<u64>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
+        sync_wait_secs: Option<u64>,
+    },
+    GoTest {
+        project: String,
+        #[serde(default)]
+        session_id: Option<String>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        packages: Option<Vec<String>>,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+        #[serde(default)]
+        sync_wait_secs: Option<u64>,
+    },
+    Summary {
+        project: String,
+        session_id: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+}
+
+impl ValidateToolCall {
+    pub fn project(&self) -> &str {
+        match self {
+            Self::CargoFmt { project, .. }
+            | Self::CargoCheck { project, .. }
+            | Self::CargoTest { project, .. }
+            | Self::GoTest { project, .. }
+            | Self::Summary { project, .. } => project.as_str(),
+        }
+    }
+
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::CargoFmt { session_id, .. }
+            | Self::CargoCheck { session_id, .. }
+            | Self::CargoTest { session_id, .. }
+            | Self::GoTest { session_id, .. } => session_id.as_deref(),
+            Self::Summary { session_id, .. } => Some(session_id.as_str()),
+        }
+    }
+
+    /// Convert into the legacy flat variant so the consolidated tool reuses
+    /// the existing validation handlers unchanged.
+    pub fn into_legacy_tool_call(self) -> ToolCall {
+        match self {
+            Self::CargoFmt {
+                project,
+                session_id,
+                cwd,
+                check,
+                timeout_secs,
+                sync_wait_secs,
+            } => ToolCall::CargoFmt {
+                project,
+                session_id,
+                cwd,
+                check,
+                timeout_secs,
+                sync_wait_secs,
+            },
+            Self::CargoCheck {
+                project,
+                session_id,
+                cwd,
+                all_targets,
+                all_features,
+                no_default_features,
+                features,
+                package,
+                timeout_secs,
+                sync_wait_secs,
+            } => ToolCall::CargoCheck {
+                project,
+                session_id,
+                cwd,
+                all_targets,
+                all_features,
+                no_default_features,
+                features,
+                package,
+                timeout_secs,
+                sync_wait_secs,
+            },
+            Self::CargoTest {
+                project,
+                session_id,
+                cwd,
+                filter,
+                all_targets,
+                all_features,
+                no_default_features,
+                features,
+                package,
+                no_run,
+                require_tests,
+                min_tests,
+                timeout_secs,
+                sync_wait_secs,
+            } => ToolCall::CargoTest {
+                project,
+                session_id,
+                cwd,
+                filter,
+                all_targets,
+                all_features,
+                no_default_features,
+                features,
+                package,
+                no_run,
+                require_tests,
+                min_tests,
+                timeout_secs,
+                sync_wait_secs,
+            },
+            Self::GoTest {
+                project,
+                session_id,
+                cwd,
+                packages,
+                timeout_secs,
+                sync_wait_secs,
+            } => ToolCall::GoTest {
+                project,
+                session_id,
+                cwd,
+                packages,
+                timeout_secs,
+                sync_wait_secs,
+            },
+            Self::Summary {
+                project,
+                session_id,
+                limit,
+            } => ToolCall::ValidationSummary {
+                project,
+                session_id,
+                limit,
+            },
+        }
+    }
+}
+
+/// Action payload for the consolidated `goal` tool. Durable Goal control is
+/// global (never project-scoped); mutations require caller idempotency keys
+/// and `update` additionally requires an exact observed revision.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum GoalToolCall {
+    Create {
+        title: String,
+        objective: String,
+        idempotency_key: String,
+    },
+    Get {
+        goal_id: String,
+    },
+    PresentPlan {
+        goal_id: String,
+    },
+    List {
+        #[serde(default)]
+        lifecycle: Option<String>,
+        #[serde(default)]
+        offset: Option<usize>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    Update {
+        goal_id: String,
+        expected_revision: i64,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        objective: Option<String>,
+        #[serde(default)]
+        lifecycle: Option<String>,
+        #[serde(default)]
+        terminal_reason: Option<String>,
+        idempotency_key: String,
+    },
+    AssociateAgentTask {
+        goal_id: String,
+        task_id: String,
+        idempotency_key: String,
+    },
+    AssociateWorkflowSession {
+        goal_id: String,
+        session_id: String,
+        idempotency_key: String,
+    },
+}
+
+impl GoalToolCall {
+    /// The exact Workflow Session named by `associate_workflow_session`;
+    /// `None` for every other action. This is recorder provenance only and
+    /// never grants Session authority.
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::AssociateWorkflowSession { session_id, .. } => Some(session_id.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn goal_id(&self) -> Option<&str> {
+        match self {
+            Self::Get { goal_id }
+            | Self::PresentPlan { goal_id }
+            | Self::Update { goal_id, .. }
+            | Self::AssociateAgentTask { goal_id, .. }
+            | Self::AssociateWorkflowSession { goal_id, .. } => Some(goal_id.as_str()),
+            Self::Create { .. } | Self::List { .. } => None,
+        }
+    }
+
+    /// Convert into the legacy flat variant so the consolidated tool reuses
+    /// the existing Goal handlers unchanged.
+    pub fn into_legacy_tool_call(self) -> ToolCall {
+        match self {
+            Self::Create {
+                title,
+                objective,
+                idempotency_key,
+            } => ToolCall::CreateGoal {
+                title,
+                objective,
+                idempotency_key,
+            },
+            Self::Get { goal_id } => ToolCall::GetGoal { goal_id },
+            Self::PresentPlan { goal_id } => ToolCall::PresentGoalPlan { goal_id },
+            Self::List {
+                lifecycle,
+                offset,
+                limit,
+            } => ToolCall::ListGoals {
+                lifecycle,
+                offset,
+                limit,
+            },
+            Self::Update {
+                goal_id,
+                expected_revision,
+                title,
+                objective,
+                lifecycle,
+                terminal_reason,
+                idempotency_key,
+            } => ToolCall::UpdateGoal {
+                goal_id,
+                expected_revision,
+                title,
+                objective,
+                lifecycle,
+                terminal_reason,
+                idempotency_key,
+            },
+            Self::AssociateAgentTask {
+                goal_id,
+                task_id,
+                idempotency_key,
+            } => ToolCall::AssociateGoalAgentTask {
+                goal_id,
+                task_id,
+                idempotency_key,
+            },
+            Self::AssociateWorkflowSession {
+                goal_id,
+                session_id,
+                idempotency_key,
+            } => ToolCall::AssociateGoalWorkflowSession {
+                goal_id,
+                session_id,
+                idempotency_key,
+            },
+        }
+    }
+}
+
+/// Shared project accessor for the consolidated checkpoint tool.
+#[cfg(feature = "workspace-checkpoints")]
+pub fn checkpoint_tool_call_project(call: &CheckpointToolCall) -> &str {
+    match call {
+        CheckpointToolCall::Create { project, .. }
+        | CheckpointToolCall::List { project, .. }
+        | CheckpointToolCall::Show { project, .. }
+        | CheckpointToolCall::Restore { project, .. }
+        | CheckpointToolCall::Delete { project, .. } => project.as_str(),
+    }
+}
+
+impl SessionToolCall {
+    pub fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::Get { session_id }
+            | Self::AttachProject { session_id, .. }
+            | Self::DetachProject { session_id, .. }
+            | Self::UpdateContext { session_id, .. }
+            | Self::Compact { session_id, .. }
+            | Self::Restore { session_id, .. }
+            | Self::Summary { session_id, .. }
+            | Self::Close { session_id } => Some(session_id.as_str()),
+            Self::Start { .. } | Self::List { .. } => None,
+        }
+    }
+}
+
+/// Action payload for the consolidated `todo` tool.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum TodoToolCall {
+    Create {
+        session_id: String,
+        subject: String,
+        #[serde(default)]
+        description: Option<String>,
+        #[serde(default)]
+        depends_on: Option<Vec<String>>,
+    },
+    List {
+        session_id: String,
+        #[serde(default)]
+        status: Option<String>,
+    },
+    Get {
+        session_id: String,
+        todo_id: String,
+    },
+    Claim {
+        session_id: String,
+        todo_id: String,
+        assignee: String,
+        expected_revision: u64,
+    },
+    Release {
+        session_id: String,
+        todo_id: String,
+        expected_revision: u64,
+    },
+    Advance {
+        session_id: String,
+        todo_id: String,
+        status: String,
+        #[serde(default)]
+        note: Option<String>,
+        expected_revision: u64,
+    },
+    Complete {
+        session_id: String,
+        todo_id: String,
+        #[serde(default)]
+        resolution: Option<String>,
+        expected_revision: u64,
+    },
+}
+
+impl TodoToolCall {
+    pub fn session_id(&self) -> &str {
+        match self {
+            Self::Create { session_id, .. }
+            | Self::List { session_id, .. }
+            | Self::Get { session_id, .. }
+            | Self::Claim { session_id, .. }
+            | Self::Release { session_id, .. }
+            | Self::Advance { session_id, .. }
+            | Self::Complete { session_id, .. } => session_id.as_str(),
+        }
+    }
+}
+
+/// Action payload for the consolidated `checkpoint` tool.
+#[cfg(feature = "workspace-checkpoints")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum CheckpointToolCall {
+    Create {
+        project: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        note: Option<String>,
+        #[serde(default)]
+        labels: Option<Vec<String>>,
+        #[serde(default)]
+        validation: Option<CheckpointValidationInput>,
+    },
+    List {
+        project: String,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    Show {
+        project: String,
+        checkpoint_id: String,
+    },
+    Restore {
+        project: String,
+        checkpoint_id: String,
+        confirm: bool,
+    },
+    Delete {
+        project: String,
+        checkpoint_id: String,
+        confirm: bool,
+    },
 }
 
 fn validate_coding_project_source_shape(tool_name: &str, arguments: &Value) -> Result<(), String> {
@@ -2609,12 +3393,32 @@ fn reject_unknown_bounded_computer_fields(
 }
 
 fn validate_structured_validation_sync_wait(name: &str, arguments: &Value) -> Result<(), String> {
-    if !matches!(name, "cargo_fmt" | "cargo_check" | "cargo_test" | "go_test") {
+    if !matches!(
+        name,
+        "cargo_fmt" | "cargo_check" | "cargo_test" | "go_test" | "validate"
+    ) {
         return Ok(());
     }
     let Some(object) = arguments.as_object() else {
         return Ok(());
     };
+    let action = object.get("action").and_then(Value::as_str);
+    if name == "validate"
+        && !matches!(
+            action,
+            Some("cargo_fmt" | "cargo_check" | "cargo_test" | "go_test")
+        )
+    {
+        // The summary action never executes validation and cannot hand off
+        // to a Job, so sync_wait_secs is meaningless there.
+        if object.contains_key("sync_wait_secs") {
+            return Err(
+                "invalid arguments for tool 'validate': sync_wait_secs is supported only by the cargo/go actions, not summary"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
     let Some(sync_wait_value) = object.get("sync_wait_secs") else {
         return Ok(());
     };
@@ -2629,7 +3433,8 @@ fn validate_structured_validation_sync_wait(name: &str, arguments: &Value) -> Re
             "invalid arguments for tool '{name}': sync_wait_secs must be at least 1"
         ));
     }
-    if name == "cargo_fmt" && object.get("check").and_then(Value::as_bool) != Some(true) {
+    let is_cargo_fmt = name == "cargo_fmt" || (name == "validate" && action == Some("cargo_fmt"));
+    if is_cargo_fmt && object.get("check").and_then(Value::as_bool) != Some(true) {
         return Err(
             "invalid arguments for tool 'cargo_fmt': sync_wait_secs is available only with check=true"
                 .to_string(),
@@ -2990,6 +3795,13 @@ impl ToolCall {
             Self::RuntimeStatus { .. } => "runtime_status",
             Self::ReadToolTrace { .. } => "read_tool_trace",
             Self::ToolManifest { .. } => "tool_manifest",
+            Self::Session(_) => "session",
+            Self::Todo(_) => "todo",
+            Self::Lsp(_) => "lsp",
+            Self::Validate(_) => "validate",
+            Self::Goal(_) => "goal",
+            #[cfg(feature = "workspace-checkpoints")]
+            Self::Checkpoint(_) => "checkpoint",
         }
     }
 
@@ -3069,6 +3881,11 @@ impl ToolCall {
             | Self::SessionShellExec { session_id, .. }
             | Self::SessionShellStatus { session_id, .. }
             | Self::CloseSessionShell { session_id, .. } => Some(session_id.as_str()),
+            Self::Session(call) => call.session_id(),
+            Self::Todo(call) => Some(call.session_id()),
+            Self::Lsp(call) => call.session_id(),
+            Self::Validate(call) => call.session_id(),
+            Self::Goal(call) => call.session_id(),
             _ => None,
         }
     }
@@ -3203,6 +4020,24 @@ impl ToolCall {
             Self::UpdateSessionContext { project, .. }
             | Self::ValidationSummary { project, .. } => Some(project.as_str()),
             Self::SessionHandoffSummary { project, .. } => project.as_deref(),
+            Self::Session(call) => match call {
+                SessionToolCall::UpdateContext { project, .. } => Some(project.as_str()),
+                // Attach/detach name a workspace argument, not the Session
+                // context: the handler resolves and authorizes it itself, and
+                // the generic session-project-mismatch precheck must not fire.
+                SessionToolCall::Start {
+                    project: Some(project),
+                    ..
+                } => Some(project.as_str()),
+                SessionToolCall::Start { projects, .. } => projects
+                    .as_ref()
+                    .and_then(|projects| projects.first().map(String::as_str)),
+                _ => None,
+            },
+            Self::Lsp(call) => Some(call.project()),
+            Self::Validate(call) => Some(call.project()),
+            #[cfg(feature = "workspace-checkpoints")]
+            Self::Checkpoint(call) => Some(checkpoint_tool_call_project(call)),
             _ => None,
         }
     }
