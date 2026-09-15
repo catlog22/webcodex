@@ -1,5 +1,6 @@
 mod action_tools;
 mod agent_tasks;
+mod agent_waits;
 mod artifacts;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoints;
@@ -38,6 +39,10 @@ pub use agent_tasks::{
     list_agent_tasks_input_schema, read_agent_task_input_schema,
     reconcile_agent_task_coding_run_input_schema, start_agent_task_attempt_input_schema,
     start_agent_task_coding_run_input_schema, start_agent_task_endpoint_continuation_input_schema,
+};
+pub use agent_waits::{
+    agent_wait_state_input_schema, cancel_agent_wait_input_schema, read_agent_wait_input_schema,
+    wait_for_agent_events_input_schema,
 };
 pub use artifacts::{
     artifact_upload_abort_input_schema, artifact_upload_begin_input_schema,
@@ -86,9 +91,6 @@ pub use computer::{
     computer_snapshot_display_input_schema, computer_snapshot_input_schema,
     computer_write_clipboard_input_schema,
 };
-#[cfg(any(test, feature = "root-test-support"))]
-pub use discovery::ACCEPTED_FLATTENED_ARG_PREFERRED_ORDER;
-pub use discovery::{accepted_flattened_args_for_spec, generic_tool_call_flattened_args_for_spec};
 pub use discovery::{
     empty_input_schema, list_projects_input_schema, list_runners_input_schema,
     list_tools_input_schema, read_tool_trace_input_schema, runtime_status_input_schema,

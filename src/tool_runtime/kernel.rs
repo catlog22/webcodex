@@ -5,7 +5,7 @@ use super::sessions::{
 };
 use super::tool_audit::{session_log_arguments_for_tool_request, session_log_result_for_tool};
 use super::tool_definition::{runtime_tool_operator_extension_family, ToolOperatorExtensionFamily};
-use super::{session_context, ToolCall, ToolResult, ToolRuntime};
+use super::{session_context, HostFileImportProvenance, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::scopes::OAuthToolScopePolicy;
 use crate::auth::AuthContext;
 use serde_json::Value;
@@ -25,18 +25,7 @@ impl From<ToolTransport> for SessionTransport {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum HostFileImportTrust {
-    #[default]
-    Untrusted,
-    TrustedOAuthClient,
-}
-
-impl HostFileImportTrust {
-    pub(crate) fn is_trusted(self) -> bool {
-        matches!(self, Self::TrustedOAuthClient)
-    }
-}
+pub(crate) use super::HostFileImportProvenance as HostFileImportTrust;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ToolCallContext<'a> {
@@ -50,7 +39,7 @@ pub(crate) struct ToolCallContext<'a> {
     pub(crate) record_oauth_scope_denials: bool,
     /// Server-derived provenance for ChatGPT host file references. Raw tool
     /// arguments cannot set this value.
-    pub(crate) host_file_import_trust: HostFileImportTrust,
+    pub(crate) host_file_import_trust: HostFileImportProvenance,
 }
 
 #[derive(Debug, Clone)]
@@ -402,6 +391,7 @@ impl ToolRuntime {
                 | "agent_continuation_wake_prepare"
                 | "agent_continuation_wake_finish"
                 | "agent_continuation_unbind"
+                | "agent_wait_state"
         ) && !capabilities.agent_continuation_app
         {
             return ToolCallOutcome {
@@ -825,11 +815,11 @@ impl ToolRuntime {
             }
         }
         if let ToolCall::ImportConversationFilesToProject {
-            trusted_mcp_host_file_import,
+            host_file_import_provenance,
             ..
         } = &mut call
         {
-            *trusted_mcp_host_file_import = context.host_file_import_trust.is_trusted();
+            *host_file_import_provenance = context.host_file_import_trust;
         }
         if let ToolCall::CompleteSessionMessage {
             trusted_recording_session_id,
@@ -989,7 +979,8 @@ impl ToolRuntime {
         correlation: &super::window_activity::ToolCallCorrelation,
     ) -> Option<String> {
         if tool_name == "work_on_project"
-            || !super::observations::is_meaningful_activity_tool(tool_name)
+            || !webcodex_tool_contracts::runtime_tool_activity_interaction(tool_name)
+                .is_meaningful()
         {
             return None;
         }

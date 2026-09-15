@@ -329,7 +329,7 @@ fn find_todo<'a>(
                     "state_changed": false,
                 }),
             )
-            .with_recovery(super::RecoveryKind::FixInput, None)
+            .with_recovery(super::RecoveryKind::FixInput)
         })
 }
 

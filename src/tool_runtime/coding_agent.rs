@@ -1559,6 +1559,10 @@ fn start_projection(run: &CodingAgentRunSnapshot, token: String) -> Value {
         "state": state_name(&run.state),
         "execution_state": execution_name(run.execution_state),
         "observation_token": token,
+        "continuation_semantics": super::ContinuationSemantics::new(
+            super::ContinuationKind::Observe,
+            super::ContinuationCarrier::ObservationToken,
+        ).to_value(),
         "terminal": terminal_projection(run),
     })
 }
@@ -1595,6 +1599,10 @@ fn observe_projection(
         "execution_state": execution_name(run.execution_state),
         "events": events,
         "observation_token": token,
+        "continuation_semantics": super::ContinuationSemantics::new(
+            super::ContinuationKind::Observe,
+            super::ContinuationCarrier::ObservationToken,
+        ).to_value(),
         "has_more": observation.has_more,
         "history_lost": observation.history_lost || reset,
         "first_retained_sequence": observation.first_retained_sequence,
@@ -1671,7 +1679,7 @@ fn coding_agent_project_not_writable_result(run_id: &str) -> ToolResult {
             "execution_state": "not_started",
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 fn coding_agent_error(
@@ -1689,7 +1697,7 @@ fn coding_agent_error(
             "execution_state": execution_state,
         }),
     )
-    .with_recovery(recovery, None)
+    .with_recovery(recovery)
 }
 
 fn coding_agent_start_failure_from_response(

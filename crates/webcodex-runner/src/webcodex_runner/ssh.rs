@@ -1478,7 +1478,15 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::process::{Child, Command, Stdio};
+    #[cfg(target_os = "linux")]
+    use std::sync::{Mutex, OnceLock};
     use std::time::{Duration, Instant};
+
+    #[cfg(target_os = "linux")]
+    fn test_ssh_server_start_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     struct TestSshServer {
         _temp: tempfile::TempDir,
@@ -1498,7 +1506,14 @@ mod tests {
     impl TestSshServer {
         #[cfg(target_os = "linux")]
         fn start() -> Option<Self> {
+            // Reserve/start/readiness is one critical section. Without this,
+            // parallel fixtures can reuse the same ephemeral port after the
+            // reservation listener is dropped but before this sshd binds it.
+            let _startup_guard = test_ssh_server_start_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let sshd = executable_on_path("sshd")?;
+            let ssh = executable_on_path("ssh")?;
             if Command::new(&sshd)
                 .arg("-V")
                 .stdout(Stdio::null())
@@ -1574,15 +1589,6 @@ mod tests {
                 .expect("start SSH test daemon");
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
-                if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-                    return Some(Self {
-                        _temp: temp,
-                        child,
-                        client_config,
-                        alias,
-                        remote_cwd,
-                    });
-                }
                 if let Some(status) = child.try_wait().expect("poll SSH test daemon") {
                     let mut stderr = String::new();
                     if let Some(mut pipe) = child.stderr.take() {
@@ -1590,6 +1596,29 @@ mod tests {
                         let _ = pipe.read_to_string(&mut stderr);
                     }
                     panic!("SSH test daemon exited early ({status}): {stderr}");
+                }
+                if TcpStream::connect(("127.0.0.1", port)).is_ok()
+                    && Command::new(&ssh)
+                        .arg("-F")
+                        .arg(&client_config)
+                        .arg("-o")
+                        .arg("BatchMode=yes")
+                        .arg("-o")
+                        .arg("ConnectTimeout=1")
+                        .arg(&alias)
+                        .arg("true")
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .status()
+                        .is_ok_and(|status| status.success())
+                {
+                    return Some(Self {
+                        _temp: temp,
+                        child,
+                        client_config,
+                        alias,
+                        remote_cwd,
+                    });
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
@@ -3581,6 +3610,7 @@ fn main() {
         SshConnectionPool::with_test_executable(fake_ssh().path.clone())
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     fn grandchild_pid(text: &str) -> u32 {
         text.lines()
             .find_map(|line| line.trim().strip_prefix("GRANDCHILD_PID="))
@@ -3588,6 +3618,7 @@ fn main() {
             .unwrap_or_else(|| panic!("missing GRANDCHILD_PID in {text:?}"))
     }
 
+    #[cfg(feature = "runner-real-process-tests")]
     fn wait_for_process_exit(pid: u32) -> bool {
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
@@ -4016,6 +4047,7 @@ fn main() {
     }
 
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: fake SSH blocks program delivery until timeout"]
     fn runner_real_process_windows_blocked_program_writer_timeout_drains_output_and_returns_bounded(
     ) {
@@ -4049,6 +4081,7 @@ fn main() {
     }
 
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: fake SSH blocked writer is stopped and reaped"]
     fn runner_real_process_windows_blocked_program_writer_stop_is_outcome_unknown_and_reaps_client()
     {
@@ -4221,6 +4254,7 @@ fn main() {
     }
 
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: one-shot fake SSH stop reaps a real process"]
     fn runner_real_process_windows_one_shot_post_dispatch_stop_is_outcome_unknown_and_reaps_tree() {
         let temp = tempfile::tempdir().unwrap();
@@ -4388,6 +4422,7 @@ fn main() {
     }
 
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: post-spawn rejection terminates a fake SSH process tree"]
     fn runner_real_process_windows_background_ssh_post_spawn_rejection_reaps_owned_tree() {
         use std::io::{BufRead, BufReader};
@@ -4441,6 +4476,7 @@ fn main() {
     }
 
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: one-shot fake SSH timeout reaps a real process tree"]
     fn runner_real_process_windows_one_shot_timeout_reaps_the_managed_ssh_tree() {
         let temp = tempfile::tempdir().unwrap();
@@ -4475,6 +4511,7 @@ fn main() {
     }
 
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: background fake SSH exercises repeated child-process lifecycle"]
     fn runner_real_process_windows_background_ssh_reuses_job_manager_lifecycle_and_bounds_output() {
         let config = ssh_config("spe", None);
@@ -4608,6 +4645,7 @@ fn main() {
     }
 
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: background fake SSH stop and timeout reap process trees"]
     fn runner_real_process_windows_background_ssh_stop_and_timeout_reap_owned_trees() {
         let temp = tempfile::tempdir().unwrap();
@@ -4686,6 +4724,7 @@ fn main() {
     }
 
     #[test]
+    #[cfg(feature = "runner-real-process-tests")]
     #[ignore = "runner real-process lane: Runner shutdown drains and reaps a fake SSH tree"]
     fn runner_real_process_windows_background_ssh_shutdown_drain_is_bounded_and_reaps_tree() {
         let temp = tempfile::tempdir().unwrap();

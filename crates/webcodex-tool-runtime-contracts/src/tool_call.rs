@@ -265,6 +265,15 @@ pub struct ObserveJobsItem {
     pub after_observation_token: Option<String>,
 }
 
+/// Which observable changes may end a bounded batch Job wait early.
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ObserveJobsWakeOn {
+    #[default]
+    Change,
+    Terminal,
+}
+
 fn deserialize_non_empty_read_path<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -412,11 +421,29 @@ where
 #[serde(deny_unknown_fields)]
 pub struct OpenAiHostFileRef {
     pub download_url: String,
-    pub file_id: String,
+    #[serde(default)]
+    pub file_id: Option<String>,
     #[serde(default)]
     pub mime_type: Option<String>,
     #[serde(default)]
     pub file_name: Option<String>,
+}
+
+/// Adapter-derived provenance for host file references. This is deliberately
+/// skipped by serde on ToolCall: caller/model JSON can never grant either trust
+/// path, and the two host mechanisms cannot impersonate one another.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HostFileImportProvenance {
+    #[default]
+    Untrusted,
+    GptActionOpenAiHost,
+    TrustedMcpHostFile,
+}
+
+impl HostFileImportProvenance {
+    pub fn is_trusted(self) -> bool {
+        !matches!(self, Self::Untrusted)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -426,6 +453,13 @@ pub struct ComputerSnapshotRegion {
     pub y: u32,
     pub width: u32,
     pub height: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentWaitEventSelectorCall {
+    pub kind: String,
+    pub task_id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -646,8 +680,7 @@ pub enum ToolCall {
     /// open todos/risks/questions/guidance, recent failed tool calls, and
     /// optional workspace, checkpoint, and ledger-derived validation metadata.
     /// Read-only; never calls an LLM or generates natural-language summaries.
-    /// Exposed only through runtime tools / MCP / `callRuntimeTool` (no
-    /// dedicated OpenAPI op).
+    /// Model/API exposure is derived from the canonical ToolDefinition surface.
     SessionHandoffSummary {
         session_id: String,
         #[serde(default)]
@@ -1026,6 +1059,8 @@ pub enum ToolCall {
         #[serde(default)]
         filter: Option<String>,
         #[serde(default)]
+        lib: Option<bool>,
+        #[serde(default)]
         all_targets: Option<bool>,
         #[serde(default)]
         all_features: Option<bool>,
@@ -1215,6 +1250,31 @@ pub enum ToolCall {
         goal_id: String,
         session_id: String,
         idempotency_key: String,
+    },
+
+    /// Create one explicit durable one-shot interest in future AgentTask terminal facts.
+    WaitForAgentEvents {
+        agent_id: String,
+        endpoint_id: String,
+        expected_controller_generation: i64,
+        events: Vec<AgentWaitEventSelectorCall>,
+        idempotency_key: String,
+    },
+
+    /// Read one exact caller-owned durable AgentWait.
+    ReadAgentWait {
+        wait_id: String,
+    },
+
+    /// Cancel one exact AgentWait before the durable Host-dispatch fence.
+    CancelAgentWait {
+        wait_id: String,
+        idempotency_key: String,
+    },
+
+    /// App-only exact read of one caller-owned AgentWait.
+    AgentWaitState {
+        wait_id: String,
     },
 
     /// Create explicit durable Agent work independent from communication messages and execution backends.
@@ -1657,6 +1717,8 @@ pub enum ToolCall {
         tail_lines: usize,
         #[serde(default, deserialize_with = "deserialize_observe_jobs_wait_secs")]
         wait_secs: Option<u64>,
+        #[serde(default)]
+        wake_on: ObserveJobsWakeOn,
     },
 
     /// List files in a Runner-registered project directory (bounded, read-only).
@@ -1816,11 +1878,11 @@ pub enum ToolCall {
         overwrite: Option<bool>,
         #[serde(default)]
         session_id: Option<String>,
-        /// Internal provenance bit set only by the MCP HTTP adapter after
-        /// authenticating the OAuth client registration. Never deserialized
-        /// from model/caller arguments and never serialized back out.
+        /// Internal host-file provenance set only by a trusted protocol
+        /// adapter. Never deserialized from model/caller arguments and never
+        /// serialized back out.
         #[serde(skip)]
-        trusted_mcp_host_file_import: bool,
+        host_file_import_provenance: HostFileImportProvenance,
     },
 
     /// Prepare one project artifact for standards-native MCP resource export.
@@ -1913,9 +1975,8 @@ pub enum ToolCall {
     /// Apply a bounded transactional batch of edit/create/delete/rename file
     /// changes via the owning Runner. Every existing input file requires a
     /// sha256 precondition and every change is preflighted before the first
-    /// mutation. `dry_run` computes the full plan without writing. Exposed only
-    /// through runtime tools / MCP / `callRuntimeTool` (no dedicated OpenAPI
-    /// operation).
+    /// mutation. `dry_run` computes the full plan without writing. Model/API
+    /// exposure is derived from the canonical ToolDefinition surface.
     ApplyTextEdits {
         project: String,
         changes: Vec<ApplyFileChangeInput>,
@@ -1931,8 +1992,8 @@ pub enum ToolCall {
     /// path names, and large untracked files. Never cleans, deletes, restores,
     /// or modifies the project. Never reads file contents, env values, tokens,
     /// or stdout/stderr bodies. Suspicious secret files are identified by
-    /// path/name only. Exposed only through runtime tools / MCP /
-    /// `callRuntimeTool` (no dedicated OpenAPI op).
+    /// path/name only. Model/API exposure is derived from the canonical
+    /// ToolDefinition surface.
     WorkspaceHygieneCheck {
         project: String,
         #[serde(default)]
@@ -2726,6 +2787,8 @@ pub enum ValidateToolCall {
         #[serde(default)]
         filter: Option<String>,
         #[serde(default)]
+        lib: Option<bool>,
+        #[serde(default)]
         all_targets: Option<bool>,
         #[serde(default)]
         all_features: Option<bool>,
@@ -2835,6 +2898,7 @@ impl ValidateToolCall {
                 session_id,
                 cwd,
                 filter,
+                lib,
                 all_targets,
                 all_features,
                 no_default_features,
@@ -2850,6 +2914,7 @@ impl ValidateToolCall {
                 session_id,
                 cwd,
                 filter,
+                lib,
                 all_targets,
                 all_features,
                 no_default_features,
@@ -3243,6 +3308,7 @@ fn reject_unknown_observe_jobs_fields(arguments: &Value) -> Result<(), String> {
         "items",
         "tail_lines",
         "wait_secs",
+        "wake_on",
         // Wrapper/session metadata that transports may leave in params.
         "session_id",
         "recording_session_id",
@@ -3433,13 +3499,6 @@ fn validate_structured_validation_sync_wait(name: &str, arguments: &Value) -> Re
             "invalid arguments for tool '{name}': sync_wait_secs must be at least 1"
         ));
     }
-    let is_cargo_fmt = name == "cargo_fmt" || (name == "validate" && action == Some("cargo_fmt"));
-    if is_cargo_fmt && object.get("check").and_then(Value::as_bool) != Some(true) {
-        return Err(
-            "invalid arguments for tool 'cargo_fmt': sync_wait_secs is available only with check=true"
-                .to_string(),
-        );
-    }
     Ok(())
 }
 
@@ -3476,14 +3535,14 @@ impl ToolCall {
             );
         }
         // Reject unknown tool names up front with a helpful message that lists
-        // every accepted tool and points the caller at listRuntimeTools. This
-        // avoids leaking a raw serde "unknown variant" error and gives custom
-        // GPTs an actionable discovery hint.
+        // every accepted tool and points the caller at canonical discovery. This
+        // avoids leaking a raw serde "unknown variant" error and gives model/API
+        // callers an actionable discovery hint.
         let definition = lookup_tool_definition(name).ok_or_else(|| {
             format!(
-                "unknown tool '{}'. Available tools: {}. Call listRuntimeTools \
-                 (POST /api/tools/list) or the list_tools runtime tool to \
-                 discover accepted tool names.",
+                "unknown tool '{}'. Available tools: {}. Call tool_manifest with \
+                 an exact tool_name (or use its category/intent views) to discover \
+                 accepted model-visible tool names.",
                 name,
                 model_visible_tool_names_csv()
             )
@@ -3502,7 +3561,36 @@ impl ToolCall {
             );
         }
         let recorder_metadata = ToolCallRecorderMetadata::from_business_arguments(&arguments);
-        let arguments = strip_tool_call_expectation_metadata(arguments);
+        let mut arguments = strip_tool_call_expectation_metadata(arguments);
+        if name == "tool_manifest" {
+            if let Some(object) = arguments.as_object_mut() {
+                if !object.contains_key("include_recommended_flows") {
+                    let exact_lookup = object.contains_key("tool_name");
+                    object.insert(
+                        "include_recommended_flows".to_string(),
+                        Value::Bool(!exact_lookup),
+                    );
+                }
+            }
+        }
+        if name == "cargo_test" {
+            if let Some(object) = arguments.as_object_mut() {
+                if object.get("lib").and_then(Value::as_bool) == Some(false) {
+                    object.remove("lib");
+                }
+            }
+        }
+        if name == "cargo_fmt" {
+            if let Some(object) = arguments.as_object_mut() {
+                // Positive sync_wait_secs is a recognized caller-shape hint in
+                // ensure-format mode, but that mode is intentionally synchronous.
+                // Canonicalize the inert hint away before concrete ToolCall serde
+                // so execution/audit truth has one representation: omission.
+                if object.get("check").and_then(Value::as_bool) != Some(true) {
+                    object.remove("sync_wait_secs");
+                }
+            }
+        }
         if name == "read_project_artifact"
             && arguments
                 .as_object()
@@ -3692,6 +3780,10 @@ impl ToolCall {
             Self::UpdateGoal { .. } => "update_goal",
             Self::AssociateGoalAgentTask { .. } => "associate_goal_agent_task",
             Self::AssociateGoalWorkflowSession { .. } => "associate_goal_workflow_session",
+            Self::WaitForAgentEvents { .. } => "wait_for_agent_events",
+            Self::ReadAgentWait { .. } => "read_agent_wait",
+            Self::CancelAgentWait { .. } => "cancel_agent_wait",
+            Self::AgentWaitState { .. } => "agent_wait_state",
             Self::CreateAgentTask { .. } => "create_agent_task",
             Self::ListAgentTasks { .. } => "list_agent_tasks",
             Self::ReadAgentTask { .. } => "read_agent_task",

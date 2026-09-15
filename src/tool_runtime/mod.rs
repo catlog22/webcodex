@@ -5,6 +5,7 @@
 
 pub mod activity;
 mod agent_task;
+mod agent_wait;
 mod cargo;
 mod cargo_tools;
 #[cfg(feature = "workspace-checkpoints")]
@@ -68,7 +69,6 @@ mod script;
 mod search_project_texts;
 mod semantic_navigation;
 mod session_context;
-pub(crate) use observations::is_meaningful_activity_tool;
 pub(crate) use session_context::runtime_observation_principal;
 pub(crate) use window_activity::{
     ToolCallCorrelation, WindowActivityGuard, WindowLoopTransition, WorkflowSessionCorrelation,
@@ -115,7 +115,6 @@ pub(crate) use files::{
     validate_project_artifact_export_snapshot, ProjectArtifactExportSnapshot,
     MAX_PROJECT_ARTIFACT_EXPORT_BYTES, MAX_READ_PROJECT_ARTIFACT_LENGTH,
 };
-pub(crate) use patch::MAX_UNIFIED_DIFF_BYTES;
 #[cfg(test)]
 pub(crate) use permissions::{AuthorityMode, PermissionEvaluator};
 #[cfg(test)]
@@ -129,7 +128,8 @@ pub(crate) use sessions::{SessionCreateOptions, SessionGuards, SessionSummary};
 #[cfg(feature = "workspace-checkpoints")]
 pub use tool_call::CheckpointToolCall;
 pub use tool_call::{
-    GoalToolCall, LspToolCall, ObserveJobsItem, PluginToolCall, ReadFilesItem, SearchPatternMode,
+    AgentWaitEventSelectorCall, GoalToolCall, HostFileImportProvenance, LspToolCall,
+    ObserveJobsItem, ObserveJobsWakeOn, PluginToolCall, ReadFilesItem, SearchPatternMode,
     SearchProjectTextsQuery, SearchResultMode, SessionToolCall, SshResourceToolCall, TodoToolCall,
     ToolCall, ValidateToolCall,
 };
@@ -154,18 +154,18 @@ pub use tool_inputs::{
     ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind, SessionMode, StartupDetail,
 };
 pub use tool_result::ToolResult;
-pub(crate) use tool_result::{RecoveryKind, RecoveryTool, RECOVERY_KIND_VALUES};
+pub(crate) use tool_result::{
+    ContinuationCarrier, ContinuationKind, ContinuationSemantics, RecoveryKind, SuggestedToolCall,
+    RECOVERY_KIND_VALUES,
+};
 pub use tool_spec::ToolSpec;
 
 #[cfg(test)]
 pub(crate) use project_resolution::ProjectResolverErrorKind;
 pub(crate) use project_resolution::{runner_project_runtime_id, ProjectResolverError};
-#[cfg(test)]
-pub(crate) use registry::accepted_flattened_args_for_spec;
 pub(crate) use registry::{
-    agent_continuation_app_tool_specs, generic_tool_call_flattened_args_for_spec,
-    goal_plan_app_tool_specs, registered_tool_specs, stateless_operator_extension_tool_specs,
-    work_result_app_tool_specs,
+    agent_continuation_app_tool_specs, goal_plan_app_tool_specs, registered_tool_specs,
+    stateless_operator_extension_tool_specs, work_result_app_tool_specs,
 };
 #[cfg(test)]
 pub(crate) use registry::{

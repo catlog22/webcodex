@@ -172,7 +172,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                     attach_agent_endpoint_input_schema,
                 ),
                 PERMISSION_RISK_WRITE,
-            ),
+            )
+            .with_gpt_action_unsupported(),
             19,
         ),
         COMMUNICATION_MANAGE_SCOPES,
@@ -257,7 +258,8 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 ),
                 "Present one explicit durable Agent/Endpoint generation as a sparse MCP App continuation controller card. All three identity fields are required; the tool never infers an Agent or Endpoint from Goal, Project, Workflow Session, ClientWindow, credential, recent activity, or any ambient state. Presentation is read-only and creates no Host binding when Apps are unavailable.",
                 present_agent_continuation_input_schema,
-            ),
+            )
+            .with_gpt_action_unsupported(),
             18,
         ),
         COMMUNICATION_READ_SCOPES,
@@ -289,6 +291,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Transport,
+                super::ToolActivityInteraction::NonMeaningful,
             ),
             PERMISSION_RISK_WRITE,
         ),
@@ -325,6 +331,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Transport,
+                super::ToolActivityInteraction::NonMeaningful,
             ),
             PERMISSION_RISK_WRITE,
         ),
@@ -359,6 +369,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Transport,
+                super::ToolActivityInteraction::NonMeaningful,
             ),
             PERMISSION_RISK_WRITE,
         ),
@@ -393,6 +407,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Transport,
+                super::ToolActivityInteraction::NonMeaningful,
             ),
             PERMISSION_RISK_WRITE,
         ),
@@ -428,6 +446,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Transport,
+                super::ToolActivityInteraction::NonMeaningful,
             ),
             PERMISSION_RISK_WRITE,
         ),
@@ -465,6 +487,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Transport,
+                super::ToolActivityInteraction::NonMeaningful,
             ),
             PERMISSION_RISK_WRITE,
         ),
@@ -498,6 +524,10 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 true,
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
+            )
+            .with_activity(
+                super::ToolActivityPresentation::Transport,
+                super::ToolActivityInteraction::NonMeaningful,
             ),
             PERMISSION_RISK_WRITE,
         ),

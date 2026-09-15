@@ -1,10 +1,12 @@
 use serde_json::{json, Value};
 
 use super::common::{
-    array_schema, cargo_test_count_assertion_schema, job_activity_schema, nullable_schema,
-    observe_job_continuation_schema, permission_decision_schema, recovery_kind_schema, schema_type,
-    session_hint_schema, wrapped_output_schema,
+    array_schema, cargo_test_count_assertion_schema, continuation_semantics_schema,
+    job_activity_schema, nullable_schema, observe_job_continuation_schema,
+    permission_decision_schema, recovery_kind_schema, schema_type, session_hint_schema,
+    suggested_tool_call_schema, wrapped_output_schema,
 };
+use webcodex_core::runtime_contract::{ContinuationCarrier, ContinuationKind};
 
 fn validation_job_projection_schema() -> Value {
     json!({
@@ -98,7 +100,7 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                 "properties": {"promoted_to_job": {"const": true}},
                 "required": ["promoted_to_job"]
             },
-            "then": {"required": ["activity", "continuation"]}
+            "then": {"required": ["activity", "continuation", "continuation_semantics"]}
         },
         {
             "if": {"required": ["async_handoff_available"]},
@@ -271,6 +273,7 @@ fn structured_execution_lifecycle_constraints(execution_source: &str) -> Value {
                     "job_id": {"type": "null"},
                     "job_status": {"type": "null"},
                     "continuation": {"enum": []},
+                    "continuation_semantics": {"enum": []},
                     "execution_state": {
                         "enum": ["not_started", "outcome_unknown", "completed", "timed_out"]
                     }
@@ -334,6 +337,14 @@ fn structured_continuation_properties() -> Vec<(&'static str, Value)> {
             nullable_schema(
                 "string",
                 "Current Job observation token when a continuation was exposed.",
+            ),
+        ),
+        (
+            "continuation_semantics",
+            continuation_semantics_schema(
+                ContinuationKind::Observe,
+                ContinuationCarrier::ObservationToken,
+                "A promoted execution continues by observing the exact Job stream; observation_token is a delta cursor, never execution or retry authority.",
             ),
         ),
         ("continuation", observe_job_continuation_schema()),
@@ -410,6 +421,24 @@ fn job_structured_execution_metadata_schema() -> Value {
     })
 }
 
+fn list_jobs_recovery_call_schema(project: bool) -> Value {
+    let arguments = if project {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"project": {"type": "string", "minLength": 1}},
+            "required": ["project"]
+        })
+    } else {
+        json!({"type": "object", "additionalProperties": false, "properties": {}})
+    };
+    suggested_tool_call_schema(
+        "list_jobs",
+        arguments,
+        "Parser-ready advisory list_jobs recovery call. It grants no authority and carries only business identity proven by the producing Job path.",
+    )
+}
+
 fn observe_jobs_output_schema() -> Value {
     let job_observation = json!({
         "type": "object",
@@ -447,6 +476,11 @@ fn observe_jobs_output_schema() -> Value {
                 "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN,
                 "description": "Opaque Job-bound lifecycle/log-delta token for this frozen returned snapshot. Return it unchanged."
             },
+            "continuation_semantics": continuation_semantics_schema(
+                ContinuationKind::Observe,
+                ContinuationCarrier::ObservationToken,
+                "The Job observation token is an exact Job-bound stream cursor copied into after_observation_token on the next observation. It is not a retry token.",
+            ),
             "last_update_seq": nullable_schema("integer", "Agent protocol diagnostic sequence, when available."),
             "cursor": {
                 "type": "object",
@@ -485,7 +519,7 @@ fn observe_jobs_output_schema() -> Value {
             "job_id", "status", "exit_code", "stdout_tail", "stderr_tail",
             "stdout_lines", "stderr_lines", "stdout_truncated", "stderr_truncated",
             "log_delta_status", "stdout_delta_reset", "stderr_delta_reset",
-            "observation_token", "cursor", "changed",
+            "observation_token", "continuation_semantics", "cursor", "changed",
             "terminal", "executor", "cwd", "shell", "purpose", "command_summary",
             "activity", "detected_summary", "validation"
         ]
@@ -509,6 +543,11 @@ fn observe_jobs_output_schema() -> Value {
                 "maxLength": webcodex_core::job_observation::MAX_JOB_OBSERVATION_TOKEN_LEN,
                 "description": "Opaque authoritative token copied unchanged from the canonical Job observation for the next after_observation_token."
             },
+            "continuation_semantics": continuation_semantics_schema(
+                ContinuationKind::Observe,
+                ContinuationCarrier::ObservationToken,
+                "Compact Job observation retains the same exact Job-bound observation cursor semantics as the canonical result.",
+            ),
             "exit_code": schema_type("integer", "Terminal process exit code when available and meaningful."),
             "command_execution_state": job_command_execution_state_schema(),
             "activity": job_activity_schema(),
@@ -546,9 +585,12 @@ fn observe_jobs_output_schema() -> Value {
             "detected_summary": {"type": "object", "additionalProperties": true},
             "validation": validation_job_projection_schema()
         },
-        "required": ["job_id", "status", "terminal", "changed", "log_delta_status", "observation_token"]
+        "required": [
+            "job_id", "status", "terminal", "changed", "log_delta_status",
+            "observation_token", "continuation_semantics"
+        ]
     });
-    let item = json!({
+    let mut item = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
@@ -558,7 +600,7 @@ fn observe_jobs_output_schema() -> Value {
             "output": {"anyOf": [job_observation.clone(), {"type": "null"}]},
             "error_kind": {"anyOf": [{"type": "string"}, {"type": "null"}]},
             "recovery_kind": recovery_kind_schema(),
-            "recovery_tool": {"type": "string", "const": "list_jobs", "description": "Optional bounded re-observation target for a missing Job."},
+            "suggested_call": list_jobs_recovery_call_schema(false),
             "error": {"anyOf": [{"type": "string"}, {"type": "null"}]}
         },
         "required": ["index", "job_id", "success", "output", "error_kind", "error"],
@@ -569,7 +611,7 @@ fn observe_jobs_output_schema() -> Value {
                     "output": job_observation,
                     "error_kind": {"type": "null"},
                     "recovery_kind": {"type": "null", "const": "__forbidden_on_success__"},
-                    "recovery_tool": {"type": "null", "const": "__forbidden_on_success__"},
+                    "suggested_call": {"type": "null", "const": "__forbidden_on_success__"},
                     "error": {"type": "null"}
                 }
             },
@@ -583,6 +625,16 @@ fn observe_jobs_output_schema() -> Value {
             }
         }]
     });
+    item["allOf"].as_array_mut().unwrap().push(json!({
+        "if": {
+            "properties": {"error_kind": {"const": "unknown_job"}},
+            "required": ["error_kind"]
+        },
+        "then": {
+            "required": ["suggested_call"],
+            "properties": {"recovery_kind": {"const": "reobserve"}}
+        }
+    }));
     let batch_output = json!({
         "type": "object",
         "additionalProperties": false,
@@ -603,12 +655,17 @@ fn observe_jobs_output_schema() -> Value {
                     "waited_ms": {"type": "integer", "minimum": 0}
                 },
                 "required": ["outcome", "waited_ms"],
-                "description": "The single shared-wait fact for this batch. Final item outputs are snapshots and do not expose a second wait outcome."
+                "description": "The single shared-wait fact for this batch. terminal policy never wakes updated: timeout means the deadline elapsed and may coexist with changed=true and cumulative log deltas. Item errors take precedence over terminal, then timeout. Final item outputs are snapshots and do not expose a second wait outcome."
             },
             "changed_count": {"type": "integer", "minimum": 0, "maximum": 8},
             "terminal_count": {"type": "integer", "minimum": 0, "maximum": 8},
             "output_truncated": {"type": "boolean"},
             "next_index": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 7}, {"type": "null"}]},
+            "continuation_semantics": continuation_semantics_schema(
+                ContinuationKind::Batch,
+                ContinuationCarrier::Index,
+                "Present only when aggregate output packing stops at a later input item. next_index is an aggregate batch boundary, not an observation token.",
+            ),
             "session_hint": session_hint_schema(),
             "permission": permission_decision_schema()
         },
@@ -616,7 +673,14 @@ fn observe_jobs_output_schema() -> Value {
             "requested_count", "returned_count", "succeeded_count", "failed_count",
             "items", "wait", "changed_count", "terminal_count",
             "output_truncated", "next_index"
-        ]
+        ],
+        "allOf": [{
+            "if": {
+                "properties": {"next_index": {"type": "integer"}},
+                "required": ["next_index"]
+            },
+            "then": {"required": ["continuation_semantics"]}
+        }]
     });
     let sparse_success_output = json!({
         "type": "object",
@@ -643,7 +707,7 @@ fn observe_jobs_output_schema() -> Value {
                     }
                 },
                 "required": ["outcome"],
-                "description": "The one shared-wait fact for an ordinary all-success, non-truncated compact batch."
+                "description": "The one shared-wait fact for an ordinary all-success, non-truncated compact batch. terminal policy never wakes updated; timeout may coexist with changed=true and cumulative deltas."
             },
             "session_hint": session_hint_schema(),
             "permission": permission_decision_schema()
@@ -695,6 +759,11 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ("effective_timeout_secs", schema_type("integer", "Total detached process runtime budget in seconds.")),
                 ("created_at", schema_type("integer", "Durable Job creation timestamp.")),
                 ("observation_token", nullable_schema("string", "Current Job observation token when available.")),
+                ("continuation_semantics", continuation_semantics_schema(
+                    ContinuationKind::Observe,
+                    ContinuationCarrier::ObservationToken,
+                    "Detached Job follow-up observes the same exact durable Job with its Job-bound observation token; this is not replay authority.",
+                )),
                 ("continuation", observe_job_continuation_schema()),
                 ("last_update_seq", nullable_schema("integer", "Latest agent update sequence when available.")),
                 ("redispatched", schema_type("boolean", "False when bounded replay recovery returns an existing Job.")),
@@ -702,6 +771,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             schema["properties"]["output"]["properties"]["execution_source"]["const"] =
                 json!("run_detached_process");
             require_success_output_field(&mut schema, "continuation");
+            require_success_output_field(&mut schema, "continuation_semantics");
             Some(schema)
         }
         "run_process" => {
@@ -794,6 +864,20 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 (
                     "execution_state",
                     process_execution_state_schema(),
+                ),
+                (
+                    "execution_success",
+                    schema_type(
+                        "boolean",
+                        "Present only for an explicit public result expectation. True only when the process reached a completed known exit-0 result; independent from outer ToolResult success and from expectation_satisfied.",
+                    ),
+                ),
+                (
+                    "expectation_satisfied",
+                    schema_type(
+                        "boolean",
+                        "Present only for an explicit accepted_exit_codes/result_expectation declaration. Uses the canonical Workflow Session expectation classifier; true means the declared observation expectation matched without changing outer ToolResult success or command_ok.",
+                    ),
                 ),
             ];
             properties.extend(structured_continuation_properties());
@@ -1071,6 +1155,11 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "observation_token",
                 schema_type("string", "Opaque Job-bound observation token. Return it unchanged as after_observation_token for one bounded wait."),
             ),
+            ("continuation_semantics", continuation_semantics_schema(
+                ContinuationKind::Observe,
+                ContinuationCarrier::ObservationToken,
+                "run_job returns an immediate asynchronous Job whose next observation uses this Job-bound token; the token is not execution identity or retry authority.",
+            )),
             ("continuation", observe_job_continuation_schema()),
             (
                 "last_update_seq",
@@ -1078,6 +1167,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
         ]);
             require_success_output_field(&mut schema, "continuation");
+            require_success_output_field(&mut schema, "continuation_semantics");
             Some(schema)
         }
         "list_jobs" => Some(wrapped_output_schema(vec![
@@ -1136,6 +1226,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             ("job_id", schema_type("string", "Runtime job id.")),
             ("project", schema_type("string", "Project id.")),
+            ("suggested_call", list_jobs_recovery_call_schema(true)),
             (
                 "status_before",
                 schema_type("string", "Job status observed before stop."),
@@ -1157,6 +1248,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         "job_tail" => {
             let mut schema = wrapped_output_schema(vec![
             ("job_id", schema_type("string", "Runtime job id.")),
+            ("suggested_call", list_jobs_recovery_call_schema(false)),
             (
                 "session_id",
                 nullable_schema("string", "Workflow Session that owns this job, when recorded."),

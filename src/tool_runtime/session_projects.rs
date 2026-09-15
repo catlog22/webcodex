@@ -86,15 +86,6 @@ impl SessionProjectsRecord {
             attached: Vec::new(),
         }
     }
-
-    pub(crate) fn to_json(&self) -> Value {
-        json!({
-            "version": self.version,
-            "session_id": self.session_id,
-            "revision": self.revision,
-            "attached": self.attached,
-        })
-    }
 }
 
 #[derive(Debug, Clone)]

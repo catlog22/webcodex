@@ -4,6 +4,7 @@ mod support;
 
 mod action_tools;
 mod agent_tasks;
+mod agent_waits;
 mod apply_text_edits;
 mod assignment_fence;
 mod builtin_coding_workflow;
@@ -12,6 +13,7 @@ mod checkpoint;
 mod coding_task;
 mod coding_task_semantic_navigation;
 mod collaboration;
+mod computer_budgets;
 mod context_projection;
 mod continuation_feedback;
 mod diagnostics;

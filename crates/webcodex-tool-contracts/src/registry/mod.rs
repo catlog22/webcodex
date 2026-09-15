@@ -5,13 +5,10 @@ mod tool_specs;
 
 pub use annotations::tool_annotations;
 #[cfg(any(test, feature = "root-test-support"))]
-pub use input_schemas::ACCEPTED_FLATTENED_ARG_PREFERRED_ORDER;
-pub use input_schemas::{
-    accepted_flattened_args_for_spec, generic_tool_call_flattened_args_for_spec,
-};
-#[cfg(any(test, feature = "root-test-support"))]
 pub use output_schemas::coding_workflow_diagnostic_output_schema_for_test;
-pub use output_schemas::output_schema_for_tool;
+pub use output_schemas::{
+    continuation_semantics_schema, output_schema_for_tool, suggested_tool_call_schema,
+};
 pub use tool_specs::{
     agent_continuation_app_tool_specs, goal_plan_app_tool_specs, memory_management_tool_specs,
     memory_runtime_tool_specs, operator_diagnostic_tool_specs, registered_tool_specs,

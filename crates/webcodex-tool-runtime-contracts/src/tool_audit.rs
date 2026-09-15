@@ -146,6 +146,9 @@ fn typed_structured_validation_request_audit(
                     "timeout_secs",
                 ],
             );
+            if obj.get("lib").and_then(Value::as_bool) == Some(true) {
+                out.insert("lib".to_string(), Value::Bool(true));
+            }
             out.insert(
                 "filter_present".to_string(),
                 Value::Bool(
@@ -1203,6 +1206,7 @@ fn canonical_cargo_validation_target(
             let mut all_features = false;
             let mut no_default_features = false;
             let mut no_run = false;
+            let mut lib = false;
             let mut index = 0;
             while index < rest.len() {
                 let arg = &rest[index];
@@ -1221,6 +1225,7 @@ fn canonical_cargo_validation_target(
                         continue;
                     }
                     "--all-targets" if !all_targets => all_targets = true,
+                    "--lib" if is_test && !lib => lib = true,
                     "--all-features" if !all_features => all_features = true,
                     "--no-default-features" if !no_default_features => no_default_features = true,
                     "--no-run" if is_test && !no_run => no_run = true,
@@ -1259,6 +1264,9 @@ fn canonical_cargo_validation_target(
                     None => None,
                 };
                 input.insert("filter".to_string(), serde_json::json!(filter));
+                if lib {
+                    input.insert("lib".to_string(), Value::Bool(true));
+                }
                 input.insert("no_run".to_string(), Value::Bool(no_run));
                 "cargo_test"
             } else {
@@ -3480,6 +3488,7 @@ impl ToolCall {
                 items,
                 tail_lines,
                 wait_secs,
+                wake_on,
             } => serde_json::json!({
                 "item_count": items.len(),
                 "token_count": items
@@ -3492,6 +3501,7 @@ impl ToolCall {
                     .collect::<Vec<_>>(),
                 "tail_lines": tail_lines,
                 "wait_secs": wait_secs,
+                "wake_on": wake_on,
             }),
             Self::ApplyUnifiedDiff {
                 project,
@@ -3635,6 +3645,7 @@ impl ToolCall {
                 project,
                 cwd,
                 filter,
+                lib,
                 all_targets,
                 all_features,
                 no_default_features,
@@ -3652,6 +3663,7 @@ impl ToolCall {
                     "project": project,
                     "cwd": cwd,
                     "filter": filter,
+                    "lib": lib,
                     "all_targets": all_targets,
                     "all_features": all_features,
                     "no_default_features": no_default_features,
@@ -3769,6 +3781,29 @@ impl ToolCall {
                     "idempotency_key": idempotency_key,
                 }),
             ),
+            Self::WaitForAgentEvents {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                events,
+                idempotency_key,
+            } => serde_json::json!({
+                "agent_id": agent_id,
+                "endpoint_id": endpoint_id,
+                "expected_controller_generation": expected_controller_generation,
+                "event_count": events.len(),
+                "idempotency_key_present": !idempotency_key.is_empty(),
+            }),
+            Self::ReadAgentWait { wait_id } | Self::AgentWaitState { wait_id } => {
+                serde_json::json!({"wait_id": wait_id})
+            }
+            Self::CancelAgentWait {
+                wait_id,
+                idempotency_key,
+            } => serde_json::json!({
+                "wait_id": wait_id,
+                "idempotency_key_present": !idempotency_key.is_empty(),
+            }),
             Self::CreateAgentTask {
                 title,
                 instruction,

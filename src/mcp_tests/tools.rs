@@ -737,6 +737,14 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
             suggested["properties"]["arguments"]["required"],
             json!(["session_id"])
         );
+        let continuity = &tool["outputSchema"]["properties"]["output"]["properties"]
+            ["session_continuity"]["properties"];
+        assert!(continuity.get("recovery_tool").is_none());
+        assert!(continuity.get("recovery_session_id").is_none());
+        assert!(continuity.get("recovery_required").is_none());
+        assert!(tool["outputSchema"]["properties"]["output"]["properties"]
+            .get("session_context_continuation")
+            .is_none());
         assert!(properties.contains_key(
             crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD
         ));
@@ -758,6 +766,12 @@ fn stateless_workflow_recorder_metadata_does_not_expand_project_connector_or_loc
         .find(|tool| tool["name"] == "read_files")
         .expect("full-operator read_files schema");
     let read_files_output = serde_json::to_string(&read_files["outputSchema"]).unwrap();
+    assert!(!serde_json::to_string(&full)
+        .unwrap()
+        .contains("\"recovery_required\""));
+    assert!(!serde_json::to_string(&full)
+        .unwrap()
+        .contains("\"session_context_continuation\""));
     assert!(read_files_output.contains("context_projection"));
     assert!(read_files_output.contains("post_tool"));
     let list_tools = full["tools"]
@@ -1109,16 +1123,20 @@ fn mcp_file_params_keep_raw_object_shape_and_reject_model_mask_strings() {
     .expect("post-host-rewrite provided-file object[] must deserialize");
     let crate::tool_runtime::ToolCall::ImportConversationFilesToProject {
         openai_file_id_refs,
-        trusted_mcp_host_file_import,
+        host_file_import_provenance,
         ..
     } = call
     else {
         unreachable!()
     };
     assert_eq!(openai_file_id_refs.len(), 1);
-    assert_eq!(openai_file_id_refs[0].file_id, "file_host_rewritten");
-    assert!(
-        !trusted_mcp_host_file_import,
+    assert_eq!(
+        openai_file_id_refs[0].file_id.as_deref(),
+        Some("file_host_rewritten")
+    );
+    assert_eq!(
+        host_file_import_provenance,
+        HostFileImportTrust::Untrusted,
         "raw input cannot set provenance"
     );
 }
@@ -1158,7 +1176,7 @@ fn mcp_file_import_trust_requires_exact_configured_active_client_id() {
     let trusted_auth = auth_for(&trusted.client_id);
     assert_eq!(
         mcp_host_file_import_trust_from_state(&config, &db, Some(&trusted_auth)),
-        HostFileImportTrust::TrustedOAuthClient,
+        HostFileImportTrust::TrustedMcpHostFile,
         "the exact configured active OAuth client ID is trusted"
     );
 
@@ -1175,7 +1193,7 @@ fn mcp_file_import_trust_requires_exact_configured_active_client_id() {
     );
     assert_eq!(
         mcp_host_file_import_trust_from_state(&config, &db, Some(&trusted_auth)),
-        HostFileImportTrust::TrustedOAuthClient,
+        HostFileImportTrust::TrustedMcpHostFile,
         "multiple active clients sharing the callback must not revoke explicit client-ID trust"
     );
 

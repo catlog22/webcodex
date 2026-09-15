@@ -1,8 +1,10 @@
 use serde_json::{json, Value};
 
 use super::common::{
-    array_schema, nullable_schema, open_object_schema, schema_type, wrapped_output_schema,
+    array_schema, continuation_semantics_schema, nullable_schema, open_object_schema, schema_type,
+    suggested_tool_call_schema, wrapped_output_schema,
 };
+use webcodex_core::runtime_contract::{ContinuationCarrier, ContinuationKind};
 
 fn git_diff_hunks_recovery_arguments_schema() -> Value {
     json!({
@@ -29,15 +31,11 @@ fn git_diff_hunks_recovery_arguments_schema() -> Value {
 }
 
 fn git_diff_hunks_recovery_call_schema() -> Value {
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-            "tool": {"type": "string", "const": "git_diff_hunks"},
-            "arguments": git_diff_hunks_recovery_arguments_schema()
-        },
-        "required": ["tool", "arguments"]
-    })
+    suggested_tool_call_schema(
+        "git_diff_hunks",
+        git_diff_hunks_recovery_arguments_schema(),
+        "Parser-ready advisory git_diff_hunks call for later-record continuation, proven bounded parameter refinement, or exact current-hunk fragment continuation. It grants no authority and is not the continuation identity itself.",
+    )
 }
 
 fn nullable_git_diff_hunks_recovery_call_schema() -> Value {
@@ -52,29 +50,80 @@ fn nullable_git_diff_hunks_recovery_arguments_schema() -> Value {
     })
 }
 
+fn nullable_continuation_semantics_schema(
+    kind: ContinuationKind,
+    carrier: ContinuationCarrier,
+    description: &str,
+) -> Value {
+    json!({
+        "anyOf": [
+            continuation_semantics_schema(kind, carrier, description),
+            {"type": "null"}
+        ]
+    })
+}
+
+fn git_diff_hunks_omitted_lines_continuation_semantics_schema() -> Value {
+    json!({
+        "anyOf": [
+            continuation_semantics_schema(
+                ContinuationKind::Refine,
+                ContinuationCarrier::None,
+                "Bounded parameter refinement such as increasing max_hunk_lines and/or narrowing paths. It is not a cursor and safe_continuation_for_omitted_lines remains false.",
+            ),
+            continuation_semantics_schema(
+                ContinuationKind::Page,
+                ContinuationCarrier::OpaqueToken,
+                "Exact scope/fence-bound current-hunk fragment cursor. It advances to later complete lines of the same logical hunk and is distinct from next_continuation, which remains later-record only.",
+            ),
+            {"type": "null"}
+        ]
+    })
+}
+
 fn git_diff_hunks_recovery_schema() -> Value {
+    let refine_semantics = continuation_semantics_schema(
+        ContinuationKind::Refine,
+        ContinuationCarrier::None,
+        "Bounded parameter refinement for omitted hunk lines.",
+    );
+    let fragment_semantics = continuation_semantics_schema(
+        ContinuationKind::Page,
+        ContinuationCarrier::OpaqueToken,
+        "Exact current-hunk fragment continuation.",
+    );
     json!({
         "type": "object",
-        "description": "Actionable bounded recovery. Page continuation obtains later hunks only. omitted_lines reports whether the current bounded git_diff_hunks contract can actually recover missing hunk content; fixed byte or line ceilings never receive a fake recovery call.",
+        "description": "Actionable bounded recovery. recovery.continuation obtains later logical diff records only. recovery.omitted_lines independently reports bounded refinement or an exact scope/fence-bound current-hunk fragment continuation; fixed byte or line ceilings never receive a fake recovery call.",
         "additionalProperties": false,
         "properties": {
             "kind": {"type": "string", "enum": ["page", "hunk_lines", "mixed"]},
             "tool": {"type": "string", "const": "git_diff_hunks"},
             "arguments": nullable_git_diff_hunks_recovery_arguments_schema(),
-            "safe_continuation_for_omitted_lines": nullable_schema("boolean", "False when current-hunk content was omitted for any reason; null when no current hunk content was omitted."),
+            "safe_continuation_for_omitted_lines": nullable_schema("boolean", "True only when recovery.omitted_lines carries a safe exact hunk-fragment opaque token; false when only parameter refinement exists or omitted lines are unrecoverable; null when no current-hunk lines were omitted."),
             "continuation": {
                 "type": "object",
+                "description": "Later-record lane only. This continuation never stands in for current-hunk omitted lines.",
                 "additionalProperties": false,
                 "properties": {
                     "available": {"type": "boolean"},
                     "recovers_later_hunks": {"type": "boolean"},
                     "recovers_omitted_lines": {"type": "boolean", "const": false},
+                    "continuation_semantics": nullable_continuation_semantics_schema(
+                        ContinuationKind::Page,
+                        ContinuationCarrier::OpaqueToken,
+                        "When available, next_continuation is a scope/fence-bound opaque page cursor that recovers later diff records only; it never recovers omitted lines from the current hunk.",
+                    ),
                     "next_call": nullable_git_diff_hunks_recovery_call_schema()
                 },
-                "required": ["available", "recovers_later_hunks", "recovers_omitted_lines", "next_call"]
+                "required": [
+                    "available", "recovers_later_hunks", "recovers_omitted_lines",
+                    "continuation_semantics", "next_call"
+                ]
             },
             "omitted_lines": {
                 "type": "object",
+                "description": "Current-hunk omitted-line lane. Recoverable content uses either bounded refinement or a distinct exact hunk-fragment opaque token.",
                 "additionalProperties": false,
                 "properties": {
                     "present": {"type": "boolean"},
@@ -85,6 +134,7 @@ fn git_diff_hunks_recovery_schema() -> Value {
                                 "type": "string",
                                 "enum": [
                                     "larger_max_hunk_lines_available",
+                                    "hunk_fragment_continuation_available",
                                     "page_byte_budget_prevents_proven_recovery",
                                     "max_hunk_lines_ceiling_reached",
                                     "max_hunk_lines_ceiling_insufficient",
@@ -97,14 +147,83 @@ fn git_diff_hunks_recovery_schema() -> Value {
                     },
                     "path_provenance": {"type": "string", "enum": ["none", "scope", "exact"]},
                     "paths": {"type": "array", "items": {"type": "string"}},
+                    "continuation_semantics": git_diff_hunks_omitted_lines_continuation_semantics_schema(),
                     "next_call": nullable_git_diff_hunks_recovery_call_schema()
                 },
-                "required": ["present", "recoverable", "reason_code", "path_provenance", "paths", "next_call"]
+                "required": [
+                    "present", "recoverable", "reason_code", "path_provenance", "paths",
+                    "continuation_semantics", "next_call"
+                ],
+                "allOf": [
+                    {
+                        "if": {"properties": {"present": {"const": false}}, "required": ["present"]},
+                        "then": {"properties": {
+                            "recoverable": {"const": false},
+                            "reason_code": {"type": "null"},
+                            "path_provenance": {"const": "none"},
+                            "continuation_semantics": {"type": "null"},
+                            "next_call": {"type": "null"}
+                        }}
+                    },
+                    {
+                        "if": {"properties": {"present": {"const": true}}, "required": ["present"]},
+                        "then": {"properties": {"reason_code": {"type": "string"}}}
+                    },
+                    {
+                        "if": {"properties": {"reason_code": {"const": "larger_max_hunk_lines_available"}}, "required": ["reason_code"]},
+                        "then": {"properties": {
+                            "recoverable": {"const": true},
+                            "continuation_semantics": refine_semantics,
+                            "next_call": git_diff_hunks_recovery_call_schema()
+                        }}
+                    },
+                    {
+                        "if": {"properties": {"reason_code": {"const": "hunk_fragment_continuation_available"}}, "required": ["reason_code"]},
+                        "then": {"properties": {
+                            "recoverable": {"const": true},
+                            "continuation_semantics": fragment_semantics,
+                            "next_call": git_diff_hunks_recovery_call_schema()
+                        }}
+                    },
+                    {
+                        "if": {"properties": {"reason_code": {"enum": [
+                            "page_byte_budget_prevents_proven_recovery",
+                            "max_hunk_lines_ceiling_reached",
+                            "max_hunk_lines_ceiling_insufficient",
+                            "bounded_recovery_unavailable"
+                        ]}}, "required": ["reason_code"]},
+                        "then": {"properties": {
+                            "recoverable": {"const": false},
+                            "continuation_semantics": {"type": "null"},
+                            "next_call": {"type": "null"}
+                        }}
+                    }
+                ]
             }
         },
         "required": [
             "kind", "tool", "arguments", "safe_continuation_for_omitted_lines",
             "continuation", "omitted_lines"
+        ],
+        "allOf": [
+            {
+                "if": {"properties": {"omitted_lines": {"properties": {"present": {"const": false}}, "required": ["present"]}}, "required": ["omitted_lines"]},
+                "then": {"properties": {"safe_continuation_for_omitted_lines": {"type": "null"}}}
+            },
+            {
+                "if": {"properties": {"omitted_lines": {"properties": {"reason_code": {"const": "hunk_fragment_continuation_available"}}, "required": ["reason_code"]}}, "required": ["omitted_lines"]},
+                "then": {"properties": {"safe_continuation_for_omitted_lines": {"const": true}}}
+            },
+            {
+                "if": {"properties": {"omitted_lines": {"properties": {"reason_code": {"enum": [
+                    "larger_max_hunk_lines_available",
+                    "page_byte_budget_prevents_proven_recovery",
+                    "max_hunk_lines_ceiling_reached",
+                    "max_hunk_lines_ceiling_insufficient",
+                    "bounded_recovery_unavailable"
+                ]}}, "required": ["reason_code"]}}, "required": ["omitted_lines"]},
+                "then": {"properties": {"safe_continuation_for_omitted_lines": {"const": false}}}
+            }
         ]
     })
 }
@@ -126,6 +245,36 @@ fn show_changes_handoff_arguments_schema() -> Value {
             }
         },
         "required": ["project", "cached", "paths", "max_hunks", "max_hunk_lines", "max_page_bytes"]
+    })
+}
+
+fn show_changes_diff_hunk_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One bounded diff hunk. source_completeness is the single authoritative statement about whether the returned hunk is proven source-complete.",
+        "additionalProperties": true,
+        "properties": {
+            "source_completeness": {
+                "type": "string",
+                "enum": ["complete", "unknown"],
+                "description": "complete means producer metadata and parsing prove this returned hunk source-complete; unknown means the system cannot prove completeness."
+            }
+        },
+        "required": ["source_completeness"]
+    })
+}
+
+fn show_changes_diff_file_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "One changed file with bounded diff hunks.",
+        "additionalProperties": true,
+        "properties": {
+            "hunks": {
+                "type": "array",
+                "items": show_changes_diff_hunk_schema()
+            }
+        }
     })
 }
 
@@ -264,7 +413,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "next_continuation",
-                nullable_schema("string", "Opaque continuation for the next stable diff page."),
+                nullable_schema("string", "Opaque scope/fence-bound continuation for later logical diff records only. It is classified as page + opaque_token by recovery.continuation.continuation_semantics and never stands in for recovery.omitted_lines current-hunk fragment continuation."),
             ),
             ("recovery", git_diff_hunks_recovery_schema()),
             (
@@ -547,8 +696,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "hunks",
                 array_schema(
-                    open_object_schema("Bounded file diff hunks."),
-                    "Diff hunks.",
+                    show_changes_diff_file_schema(),
+                    "Diff hunks. source_completeness is authoritative for each returned hunk; top-level truncation metadata describes omitted records/content outside that per-hunk proof.",
                 ),
             ),
             (
@@ -566,10 +715,6 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                     "description": "Present only when bounded show_changes diff hunks are incomplete; identifies the canonical focused/paged review tool without starting it or inventing a continuation.",
                     "additionalProperties": false,
                     "properties": {
-                        "tool": {
-                            "type": "string",
-                            "const": "git_diff_hunks"
-                        },
                         "scope": {
                             "type": "string",
                             "const": "worktree"
@@ -593,19 +738,18 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                         },
                         "recovery": {
                             "type": "object",
-                            "description": "Structured parser-ready first recovery call plus the truncation class. For line or mixed truncation, continuation is explicitly unsafe for omitted current-hunk lines.",
+                            "description": "Canonical parser-ready first recovery call is the exact tool + arguments pair here; kind and safety fields classify the recovery. For line or mixed truncation, continuation is explicitly unsafe for omitted current-hunk lines.",
                             "additionalProperties": false,
                             "properties": {
                                 "kind": {"type": "string", "enum": ["page", "hunk_lines", "mixed"]},
                                 "tool": {"type": "string", "const": "git_diff_hunks"},
                                 "arguments": show_changes_handoff_arguments_schema(),
-                                "safe_continuation_for_omitted_lines": nullable_schema("boolean", "False for hunk-line or mixed truncation; null for page-only truncation.")
+                                "safe_continuation_for_omitted_lines": nullable_schema("boolean", "False when show_changes omitted current-hunk content because this handoff starts a fresh git_diff_hunks observation and carries no exact hunk-fragment identity; null for page-only truncation. The resulting git_diff_hunks observation may itself return a safe fragment continuation.")
                             },
                             "required": ["kind", "tool", "arguments", "safe_continuation_for_omitted_lines"]
-                        },
-                        "suggested_call": show_changes_handoff_arguments_schema()
+                        }
                     },
-                    "required": ["tool", "scope", "reason", "truncation_reasons", "recovery", "suggested_call"]
+                    "required": ["scope", "reason", "truncation_reasons", "recovery"]
                 }),
             ),
             (

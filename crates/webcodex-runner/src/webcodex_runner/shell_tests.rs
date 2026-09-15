@@ -1555,6 +1555,7 @@ fn typescript_temp_file_uses_mts_and_exact_script_bytes() {
 }
 
 #[test]
+#[cfg(feature = "runner-real-process-tests")]
 #[ignore = "manual real-process smoke: requires compatible Node.js on PATH"]
 fn runner_real_process_node_script_runtime_preserves_argv_stdin_and_cwd() {
     let cwd = tempfile::tempdir().unwrap();
@@ -1609,7 +1610,7 @@ const payload: Payload = identity<Payload>({ value: process.argv[2] ?? '' });
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "runner-real-process-tests"))]
 #[test]
 #[ignore = "real-process stdin isolation: runs an isolated test process with a fake Node runtime"]
 fn runner_real_process_typescript_probe_receives_eof_instead_of_runner_stdin() {
@@ -2064,5 +2065,20 @@ fn default_shell_preserves_non_unicode_environment_without_panicking() {
         "WEBCODEX_OPAQUE_TOOLCHAIN_ENV",
         OsString::from_vec(vec![0xff]),
     );
-    configured_process_command(&ShellConfig::default(), None, "true", &[], None).unwrap();
+    let shell = ShellConfig::default();
+    configured_process_command(&shell, None, "true", &[], None).unwrap();
+    let snapshot = base_shell_env(&shell, &ShellProfileConfig::default()).unwrap();
+    assert!(
+        !snapshot.contains_key("WEBCODEX_OPAQUE_TOOLCHAIN_ENV"),
+        "String-backed prepared environments must ignore inherited values they cannot represent instead of panicking"
+    );
+    PreparedExecutionEnvironment::prepare(
+        1,
+        &shell,
+        None,
+        Path::new("."),
+        &PreparedShellProfileCache::default(),
+        None,
+    )
+    .unwrap();
 }

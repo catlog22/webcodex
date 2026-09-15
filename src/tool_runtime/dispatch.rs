@@ -204,6 +204,44 @@ pub(super) fn sparsify_failure_model_result_metadata(tool_name: &str, result: &m
     }
 }
 
+fn add_run_process_expectation_projection(
+    tool_name: &str,
+    expectation: &sessions::ToolCallExpectation,
+    result: &mut ToolResult,
+) {
+    if tool_name != "run_process" {
+        return;
+    }
+    if result.output.get("expectation_satisfied").is_some() {
+        return;
+    }
+    let Some(expectation_satisfied) = sessions::public_result_expectation_satisfied(
+        result.success,
+        expectation,
+        &result.output,
+        result.error.as_deref(),
+        None,
+    ) else {
+        return;
+    };
+    let Some(output) = result.output.as_object_mut() else {
+        return;
+    };
+    let execution_success = output.get("execution_state").and_then(Value::as_str)
+        == Some("completed")
+        && output.get("command_completed").and_then(Value::as_bool) == Some(true)
+        && output.get("command_ok").and_then(Value::as_bool) == Some(true)
+        && output.get("tool_failure").and_then(Value::as_bool) != Some(true);
+    output.insert(
+        "execution_success".to_string(),
+        Value::Bool(execution_success),
+    );
+    output.insert(
+        "expectation_satisfied".to_string(),
+        Value::Bool(expectation_satisfied),
+    );
+}
+
 enum SearchModelProjection {
     None,
     Batch {
@@ -897,6 +935,8 @@ impl ToolRuntime {
                 super::window_activity::ToolCallCorrelation::default(),
             );
         }
+        let immediate_tool_name = call.tool_name();
+        let immediate_expectation = recorder_metadata.expectation.clone();
         let mut correlation = super::window_activity::ToolCallCorrelation::default();
         // Edit usage telemetry retains only fixed safe classifications. For
         // apply_patch it captures the requested matching enum before the call is
@@ -917,6 +957,12 @@ impl ToolRuntime {
                 &mut result_projection,
             )
             .await;
+        // Early project/session/auth failures can return before the normal
+        add_run_process_expectation_projection(
+            immediate_tool_name,
+            &immediate_expectation,
+            &mut result,
+        );
         // Early project/session/auth failures can return before the normal
         // resolved-project sidecar hook. Preserve the main ToolResult while still
         // answering the explicit sidecar request conservatively: static material
@@ -1459,6 +1505,11 @@ impl ToolRuntime {
             )
             .await;
         }
+        add_run_process_expectation_projection(
+            tool_name,
+            &recorder_metadata.expectation,
+            &mut result,
+        );
         if let Some(context) = activity_context {
             self.activity.record(super::activity::ActivityRecord {
                 tool: context.tool,
@@ -1475,7 +1526,9 @@ impl ToolRuntime {
                 scope: super::activity::activity_scope_from_auth(auth),
             });
         }
-        if result.success && super::observations::is_meaningful_activity_tool(tool_name) {
+        if result.success
+            && webcodex_tool_contracts::runtime_tool_activity_interaction(tool_name).is_meaningful()
+        {
             if let Ok((principal_kind, principal_id)) =
                 super::session_context::runtime_observation_principal(auth)
             {
@@ -1901,6 +1954,30 @@ impl ToolRuntime {
                 self.associate_goal_workflow_session(auth, goal_id, session_id, idempotency_key)
                     .await
             }
+
+            ToolCall::WaitForAgentEvents {
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                events,
+                idempotency_key,
+            } => self.wait_for_agent_events(
+                auth,
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+                events,
+                idempotency_key,
+            ),
+
+            ToolCall::ReadAgentWait { wait_id } => self.read_agent_wait(auth, wait_id),
+
+            ToolCall::CancelAgentWait {
+                wait_id,
+                idempotency_key,
+            } => self.cancel_agent_wait(auth, wait_id, idempotency_key),
+
+            ToolCall::AgentWaitState { wait_id } => self.agent_wait_state(auth, wait_id),
 
             ToolCall::CreateAgentTask {
                 title,
@@ -2578,6 +2655,8 @@ mod structured_execution_sparse_projection_tests {
                 "recovery": {"kind": "inspect_output"}
             }),
         );
+        result.output["execution_success"] = json!(false);
+        result.output["expectation_satisfied"] = json!(true);
         sparsify_failure_model_result_metadata("run_process", &mut result);
 
         for omitted in [
@@ -2609,6 +2688,8 @@ mod structured_execution_sparse_projection_tests {
             "job_id",
             "observation_token",
             "recovery",
+            "execution_success",
+            "expectation_satisfied",
         ] {
             assert!(
                 result.output.get(retained).is_some(),

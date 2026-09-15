@@ -5,7 +5,7 @@ use super::helpers::{
     command_rejected_message, explicit_shell_dispatch_command, is_safe_job_id,
     project_relative_runner_cwd, resolve_runner_cwd, validate_raw_shell_command_length,
 };
-use super::tool_result::{RecoveryKind, RecoveryTool, ToolResult};
+use super::tool_result::{RecoveryKind, SuggestedToolCall, ToolResult};
 use super::{ExecutionPurpose, ExecutionShell, ToolRuntime};
 use crate::auth::AuthContext;
 use crate::runner_http::{command_preview, ShellJobStartMetadata, COMMAND_PREVIEW_MAX_CHARS};
@@ -646,18 +646,33 @@ pub(crate) fn agent_job_summary_value(job: &ShellJobInfo) -> Value {
     })
 }
 
+pub(crate) fn job_observation_continuation_semantics() -> Value {
+    super::ContinuationSemantics::new(
+        super::ContinuationKind::Observe,
+        super::ContinuationCarrier::ObservationToken,
+    )
+    .to_value()
+}
+
 pub(crate) fn observe_job_continuation(job_id: &str, observation_token: Option<&str>) -> Value {
     let mut item = json!({"job_id": job_id});
     if let Some(token) = observation_token.filter(|token| !token.is_empty()) {
         item["after_observation_token"] = json!(token);
     }
-    json!({
-        "tool": "observe_jobs",
-        "arguments": {
+    super::SuggestedToolCall::new(
+        "observe_jobs",
+        json!({
             "items": [item],
-            "wait_secs": 30,
-        },
-    })
+            "wait_secs": 60,
+            "wake_on": "terminal",
+        }),
+    )
+    .to_value()
+}
+
+fn list_jobs_recovery_suggested_call(project: Option<&str>) -> Value {
+    let arguments = project.map_or_else(|| json!({}), |project| json!({"project": project}));
+    SuggestedToolCall::new("list_jobs", arguments).to_value()
 }
 
 fn invalid_job_observation_result(error_kind: &str, message: String) -> ToolResult {
@@ -669,7 +684,7 @@ fn invalid_job_observation_result(error_kind: &str, message: String) -> ToolResu
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 fn unknown_job_observation_result(job_id: &str) -> ToolResult {
@@ -680,9 +695,10 @@ fn unknown_job_observation_result(job_id: &str) -> ToolResult {
             "failure_kind": "job_not_found",
             "job_id": job_id,
             "state_changed": false,
+            "suggested_call": list_jobs_recovery_suggested_call(None),
         }),
     )
-    .with_recovery(RecoveryKind::Reobserve, Some(RecoveryTool::ListJobs))
+    .with_recovery(RecoveryKind::Reobserve)
 }
 
 fn agent_job_log_error_result(job_id: &str, error: String) -> ToolResult {
@@ -712,7 +728,7 @@ fn confirmation_required_result(project: &str, job_id: &str) -> ToolResult {
             "command_started": false,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 fn job_not_found_result(project: &str, job_id: &str) -> ToolResult {
@@ -732,9 +748,10 @@ fn job_not_found_result(project: &str, job_id: &str) -> ToolResult {
             "final_status": Value::Null,
             "stop_effect": "not_found",
             "command_started": false,
+            "suggested_call": list_jobs_recovery_suggested_call(Some(project)),
         }),
     )
-    .with_recovery(RecoveryKind::Reobserve, Some(RecoveryTool::ListJobs))
+    .with_recovery(RecoveryKind::Reobserve)
 }
 
 fn job_project_mismatch_result(
@@ -764,7 +781,7 @@ fn job_project_mismatch_result(
             "command_started": false,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 fn job_stop_forbidden_result(
@@ -796,7 +813,7 @@ fn job_stop_forbidden_result(
             "command_started": false,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 fn job_session_unknown_warning() -> Value {
@@ -835,7 +852,7 @@ fn job_recovering_stop_result(project: &str, job: &ShellJobInfo) -> ToolResult {
             "command_started": false,
         }),
     )
-    .with_recovery(RecoveryKind::Wait, None)
+    .with_recovery(RecoveryKind::Wait)
 }
 
 fn ownership_basis_for_stop(
@@ -1137,6 +1154,7 @@ impl ToolRuntime {
                     "execution_state": "started",
                     "created_at": job.created_at,
                     "observation_token": job.observation_token,
+                    "continuation_semantics": job_observation_continuation_semantics(),
                     "last_update_seq": job.last_update_seq,
                     "stdout_tail": "",
                     "stderr_tail": "",
@@ -1407,6 +1425,7 @@ impl ToolRuntime {
                         job.recovery_reason_code.as_deref(),
                     ),
                     "observation_token": job.observation_token,
+                    "continuation_semantics": job_observation_continuation_semantics(),
                     "log_delta_status": wait.log_delta_status.as_str(),
                     "stdout_delta_reset": wait.stdout_delta_reset,
                     "stderr_delta_reset": wait.stderr_delta_reset,
@@ -1988,7 +2007,28 @@ mod recovery_projection_tests {
         let missing = job_not_found_result("agent:special:demo", "job-missing");
         assert_eq!(missing.output["failure_kind"], "job_not_found");
         assert_eq!(missing.output["recovery_kind"], "reobserve");
-        assert_eq!(missing.output["recovery_tool"], "list_jobs");
+        assert!(missing.output.get("recovery_tool").is_none());
+        assert_eq!(
+            missing.output["suggested_call"],
+            json!({"tool": "list_jobs", "arguments": {"project": "agent:special:demo"}})
+        );
+        let suggested = &missing.output["suggested_call"];
+        let parsed = crate::tool_runtime::ToolCall::from_tool_name(
+            suggested["tool"].as_str().unwrap(),
+            suggested["arguments"].clone(),
+        )
+        .expect("stop_job missing-identity recovery must parse");
+        match parsed {
+            crate::tool_runtime::ToolCall::ListJobs {
+                project,
+                session_id,
+                ..
+            } => {
+                assert_eq!(project.as_deref(), Some("agent:special:demo"));
+                assert!(session_id.is_none());
+            }
+            other => panic!("unexpected recovery call: {}", other.tool_name()),
+        }
 
         let mismatch =
             job_project_mismatch_result("agent:special:demo", "agent:special:other", "job-2");

@@ -11,7 +11,11 @@ import {
   renderSessionWindowCorrelationLinks,
   formatWindowDetailFields,
   renderWindowCards,
+  renderProjectWindowCards,
 } from "../dist/runtime_window.js";
+import {
+  formatProjectWindowStatusText,
+} from "../dist/runtime_navigation.js";
 
 function createMockElement(tag = "div") {
   const listeners = new Map();
@@ -168,10 +172,12 @@ test("renderWindowActivityRows renders activity cards with facts and trace copy"
 
     const activities = [
       {
-        tool_name: "read_file",
+        tool_name: "read_files",
         started_at_ms: 1700000000000,
         status: "success",
         project: "agent:runner-1:proj",
+        activity_presentation: "work",
+        activity_kind: "read",
         meaningful: true,
         service_ms: 45,
         next_call_gap_ms: 12,
@@ -184,6 +190,7 @@ test("renderWindowActivityRows renders activity cards with facts and trace copy"
       {
         method: "unknown_method",
         status: "failed",
+        activity_presentation: "transport",
         recorder_gap_session_id: "wc_sess_gap",
         response_streaming: true,
         window_transition_kind: "overlap",
@@ -202,11 +209,13 @@ test("renderWindowActivityRows renders activity cards with facts and trace copy"
 
     const first = container.children[0];
     assert.ok(first.className.includes("compact"));
-    assert.equal(first.querySelector("strong")?.textContent, "read_file");
+    assert.equal(first.querySelector("strong")?.textContent, "read_files");
 
     const chips = first.querySelectorAll(".chip").map((c) => c.textContent);
     assert.ok(chips.includes("success"));
     assert.ok(chips.includes("agent:runner-1:proj"));
+    assert.ok(chips.includes("work"));
+    assert.ok(chips.includes("read"));
     assert.ok(chips.includes("meaningful"));
     assert.ok(chips.includes("service 45 ms"));
     assert.ok(chips.includes("next gap 12 ms"));
@@ -222,6 +231,7 @@ test("renderWindowActivityRows renders activity cards with facts and trace copy"
     assert.ok(second.querySelector(".window-gap-note"));
     assert.equal(second.querySelector("strong")?.textContent, "unknown_method");
     const secondChips = second.querySelectorAll(".chip").map((c) => c.textContent);
+    assert.ok(secondChips.includes("transport"));
     assert.ok(secondChips.includes("streaming timing unavailable"));
     assert.ok(secondChips.includes("overlap from previous"));
   });
@@ -418,4 +428,83 @@ test("renderWindowCards populates container with window cards", () => {
     container.children[1].click();
     assert.equal(clicked, "w2");
   });
+});
+
+test("createWindowCard correctly renders 0 linked Sessions, active count, and last meaningful work", () => {
+  withMockDom(() => {
+    let clickedKey = "";
+    const card = createWindowCard(
+      {
+        client_window_key: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        active_count: 1,
+        source: "openai-session",
+        last_seen_at_ms: 9800,
+        last_tool_call_at_ms: 9500,
+        last_meaningful_activity_at_ms: 9000,
+        linked_session_count: 0,
+        recorder_gap_count: 0,
+      },
+      "",
+      (key) => {
+        clickedKey = key;
+      },
+      10000,
+      "en",
+    );
+
+    assert.ok(card);
+    assert.equal(card.className.includes("selected"), false);
+    assert.equal(card.getAttribute("aria-current"), null);
+    assert.equal(card.querySelector(".chip")?.textContent, "1 active");
+    assert.match(card.textContent, /Last WebCodex call/);
+    assert.match(card.textContent, /Last meaningful work/);
+    assert.match(card.textContent, /0 linked Sessions/);
+
+    card.click();
+    assert.equal(clickedKey, "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+  });
+});
+
+test("renderProjectWindowCards populates project-scoped window cards with inspector title", () => {
+  withMockDom(() => {
+    const container = document.createElement("div");
+    let inspectedKey = "";
+    const rows = [
+      {
+        client_window_key: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
+        active_count: 0,
+        source: "openai-session",
+        last_seen_at_ms: 9000,
+        last_meaningful_activity_at_ms: 9000,
+        linked_session_count: 0,
+      },
+    ];
+
+    renderProjectWindowCards(
+      container,
+      rows,
+      (k) => {
+        inspectedKey = k;
+      },
+      10000,
+      "en",
+    );
+
+    assert.equal(container.children.length, 1);
+    const card = container.children[0];
+    assert.equal(card.title, "Open Window inspector");
+    assert.equal(card.className.includes("selected"), false);
+    assert.equal(card.querySelector(".chip")?.textContent, "openai-session");
+    assert.match(card.textContent, /0 linked Sessions/);
+
+    card.click();
+    assert.equal(inspectedKey, "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
+  });
+});
+
+test("formatProjectWindowStatusText formats non-truncated and truncated status in en and zh-CN", () => {
+  assert.equal(formatProjectWindowStatusText(5, 5, false, "en"), "");
+  assert.equal(formatProjectWindowStatusText(5, 5, false, "zh-CN"), "");
+  assert.equal(formatProjectWindowStatusText(10, 25, true, "en"), "10 of 25 Windows · bounded");
+  assert.equal(formatProjectWindowStatusText(10, 25, true, "zh-CN"), "10 / 25 个窗口 · 有界");
 });

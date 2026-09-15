@@ -25,7 +25,7 @@ pub(crate) fn unknown_session_result(session_id: &str) -> ToolResult {
             "session_id": session_id,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 pub(crate) fn session_authority_denied_result(session_id: &str, tool_name: &str) -> ToolResult {
@@ -39,7 +39,7 @@ pub(crate) fn session_authority_denied_result(session_id: &str, tool_name: &str)
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 pub(crate) fn session_project_mismatch_result(
@@ -63,7 +63,7 @@ pub(crate) fn session_project_mismatch_result(
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 pub(crate) fn session_guard_denied_result(
@@ -89,7 +89,7 @@ pub(crate) fn session_guard_denied_result(
         ),
         output,
     )
-    .with_recovery(RecoveryKind::NoAction, None)
+    .with_recovery(RecoveryKind::NoAction)
 }
 
 /// Lifecycle denial for Closed workflow sessions (write/shell/mutation).
@@ -117,7 +117,7 @@ pub(crate) fn session_lifecycle_denied_result(
         format!("{error_kind}: {tool_name} blocked on {lifecycle} session"),
         output,
     )
-    .with_recovery(RecoveryKind::NoAction, None)
+    .with_recovery(RecoveryKind::NoAction)
 }
 
 pub(crate) fn session_message_error_result(
@@ -147,7 +147,7 @@ pub(crate) fn session_message_error_result(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::NotTodo => ToolResult::err_with_output(
             "session_message_not_todo",
             json!({
@@ -198,7 +198,7 @@ pub(crate) fn session_message_error_result(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::InvalidAssignmentFence => ToolResult::err_with_output(
             "invalid_assignment_fence",
             json!({
@@ -210,7 +210,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "read the exact assignment with get_session_assignment and pass its opaque assignment_fence unchanged",
             }),
         )
-        .with_recovery(RecoveryKind::FixInput, None),
+        .with_recovery(RecoveryKind::FixInput),
         sessions::SessionMessageError::AssignmentStale {
             current,
             fresh_assignment_fence,
@@ -227,7 +227,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "re-evaluate the returned current assignment; when fresh_assignment_fence is present it is the durable fence for exactly that returned state, otherwise call get_session_assignment again",
             }),
         )
-        .with_recovery(RecoveryKind::Reobserve, None),
+        .with_recovery(RecoveryKind::Reobserve),
         sessions::SessionMessageError::AssignmentHistoryLost { current } => ToolResult::err_with_output(
             "assignment_history_lost",
             json!({
@@ -240,7 +240,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "retained state cannot prove the full exact assignment; do not complete this todo from stale context",
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::AssignmentTooLarge {
             reply_count,
             max_replies,
@@ -259,7 +259,7 @@ pub(crate) fn session_message_error_result(
                 "retry_guidance": "the coordinator must consolidate or supersede this assignment before a fenced completion can be issued",
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::PersistenceUncertain => ToolResult::err_with_output(
             "completion_persistence_uncertain",
             json!({
@@ -271,7 +271,7 @@ pub(crate) fn session_message_error_result(
                 "retry_same_completion": true,
             }),
         )
-        .with_recovery(RecoveryKind::RetrySame, None),
+        .with_recovery(RecoveryKind::RetrySame),
         sessions::SessionMessageError::SessionClosed { lifecycle } => ToolResult::err_with_output(
             "session_closed: session message mutation blocked",
             json!({
@@ -280,7 +280,7 @@ pub(crate) fn session_message_error_result(
                 "lifecycle": lifecycle.as_str(),
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
         sessions::SessionMessageError::InvalidInput(message) => ToolResult::err_with_output(
             message.clone(),
             json!({
@@ -289,7 +289,7 @@ pub(crate) fn session_message_error_result(
                 "error": message,
             }),
         )
-        .with_recovery(RecoveryKind::FixInput, None),
+        .with_recovery(RecoveryKind::FixInput),
     }
 }
 
@@ -311,6 +311,24 @@ fn completion_persistence_uncertain_exposes_exact_retry_same_recovery() {
     assert_eq!(result.output["retry_same_completion"], true);
     assert_eq!(result.output["recovery_kind"], "retry_same");
     assert!(result.output.get("recovery_tool").is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn context_recovery_suggested_call_remains_parser_ready_and_non_authoritative() {
+    let suggested = context_recovery_suggested_call("wc_sess_test");
+    assert_eq!(suggested["tool"], "session_handoff_summary");
+    assert_eq!(suggested.as_object().unwrap().len(), 2);
+    assert!(suggested.get("authority").is_none());
+    let call = crate::tool_runtime::ToolCall::from_tool_name(
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
+    )
+    .expect("Session context recovery suggested_call must parse");
+    assert!(matches!(
+        call,
+        crate::tool_runtime::ToolCall::SessionHandoffSummary { .. }
+    ));
 }
 
 pub(crate) fn add_session_hint(
@@ -342,18 +360,44 @@ pub(crate) fn add_session_hint(
 }
 
 fn model_facing_recovery_event(event: &sessions::SessionEvent) -> Value {
-    json!({
-        "context_revision": event.context_revision,
-        "tool_name": event.tool_name,
-        "status": event.status,
-        "changed_paths": event.changed_paths,
-        "job_id": event.job_id,
-        "error_kind": event.error_kind,
-        "effect_evidence": event.effect_evidence,
-        "context_result": event.context_result_summary,
-        "execution_summary": event.validation_output_summary,
-    })
+    debug_assert!(
+        event.context_revision.is_some(),
+        "Context recovery events are selected by checkpoint revision"
+    );
+    let mut projected = serde_json::Map::new();
+    if let Some(context_revision) = event.context_revision {
+        projected.insert("context_revision".to_string(), json!(context_revision));
+    }
+    projected.insert(
+        "tool_name".to_string(),
+        Value::String(event.tool_name.clone()),
+    );
+    if let Some(status) = event.status.as_ref() {
+        projected.insert("status".to_string(), Value::String(status.clone()));
+    }
+    if !event.changed_paths.is_empty() {
+        projected.insert("changed_paths".to_string(), json!(event.changed_paths));
+    }
+    if let Some(job_id) = event.job_id.as_ref() {
+        projected.insert("job_id".to_string(), Value::String(job_id.clone()));
+    }
+    if let Some(error_kind) = event.error_kind.as_ref() {
+        projected.insert("error_kind".to_string(), Value::String(error_kind.clone()));
+    }
+    if let Some(effect_evidence) = event.effect_evidence.as_ref() {
+        projected.insert("effect_evidence".to_string(), json!(effect_evidence));
+    }
+    if let Some(context_result) = event.context_result_summary.as_ref() {
+        projected.insert("context_result".to_string(), context_result.clone());
+    }
+    if let Some(execution_summary) = event.validation_output_summary.as_ref() {
+        projected.insert("execution_summary".to_string(), execution_summary.clone());
+    }
+    Value::Object(projected)
 }
+
+#[cfg(test)]
+mod recovery_event_projection_tests;
 
 fn bounded_model_facing_recovery_events(
     recorded: &sessions::RecordedModelFacingToolCall,
@@ -378,12 +422,8 @@ fn bounded_model_facing_recovery_events(
 }
 
 fn context_recovery_suggested_call(session_id: &str) -> Value {
-    json!({
-        "tool": "session_handoff_summary",
-        "arguments": {
-            "session_id": session_id,
-        },
-    })
+    super::SuggestedToolCall::new("session_handoff_summary", json!({"session_id": session_id}))
+        .to_value()
 }
 
 /// A hint is sufficient to request recovery, never to certify model knowledge.
@@ -394,9 +434,6 @@ fn require_context_recovery(output: &mut Value, status: &str, session_id: &str) 
         .remove("session_context_revision");
     output["session_continuity"] = json!({
         "status": status,
-        "recovery_required": true,
-        "recovery_tool": "session_handoff_summary",
-        "recovery_session_id": session_id,
         "suggested_call": context_recovery_suggested_call(session_id),
     });
 }
@@ -537,9 +574,6 @@ pub(crate) fn add_session_context_continuity(
     if recorded.history_lost || omitted_count > 0 {
         output.remove("session_context_revision");
         let continuity = output.get_mut("session_continuity").unwrap();
-        continuity["recovery_required"] = json!(true);
-        continuity["recovery_tool"] = json!("session_handoff_summary");
-        continuity["recovery_session_id"] = json!(recorded.session_id);
         continuity["suggested_call"] = context_recovery_suggested_call(&recorded.session_id);
     }
     result.output = Value::Object(output);

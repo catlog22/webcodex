@@ -114,8 +114,7 @@ pub fn lsp_action_input_schema() -> Value {
 /// Consolidated validation surface. cargo_fmt/cargo_check/cargo_test/go_test
 /// execute validations (long runs hand off to the same-execution Job);
 /// summary reads the bounded validation history of one Session. Per-action
-/// defaults, clamp bounds, and conditional rules (for example cargo_fmt
-/// sync_wait_secs only with check=true) are enforced by the runtime, matching
+/// defaults and clamp bounds are enforced by the runtime, matching
 /// the legacy cargo_* / go_test / validation_summary tools.
 pub fn validate_action_input_schema() -> Value {
     let mut schema = json!({
@@ -167,6 +166,10 @@ pub fn validate_action_input_schema() -> Value {
                 "type": "string",
                 "description": "Optional cargo_test test-name filter."
             },
+            "lib": {
+                "type": "boolean",
+                "description": "Optional cargo_test: when true, include Cargo's --lib target selector. Omission and false have the same ordinary target-selection semantics."
+            },
             "packages": {
                 "type": "array",
                 "items": {"type": "string", "minLength": 1},
@@ -194,7 +197,7 @@ pub fn validate_action_input_schema() -> Value {
             "sync_wait_secs": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Optional bounded synchronous grace before same-execution Job handoff; never extends timeout_secs. cargo_fmt accepts it only with check=true."
+                "description": "Optional bounded synchronous grace before same-execution Job handoff; never extends timeout_secs. With cargo_fmt check=false it is accepted as inert compatibility input."
             },
             "limit": {
                 "type": "integer",
@@ -208,7 +211,7 @@ pub fn validate_action_input_schema() -> Value {
     schema["properties"][TOOL_RESULT_EXPECTATION_FIELD] = json!({
         "type": "string",
         "enum": ["success", "failure", "observe"],
-        "description": "Optional pre-execution validation-result expectation for the cargo/go actions. Omit (or use success) for the normal success-required path; failure is for negative tests that must reach a completed known failing validation result; observe accepts either. cargo_fmt accepts it only with check=true. The real validation ToolResult and process outcome remain unchanged."
+        "description": "Optional pre-execution validation-result expectation for the cargo/go actions. Omit (or use success) for the normal success-required path; failure is for negative tests that must reach a completed known failing validation result; observe accepts either. The real validation ToolResult and process outcome remain unchanged."
     });
     schema
 }

@@ -12,6 +12,10 @@ use super::model::{SessionEvent, SessionMessageKind, SessionRecord};
 use super::query::build_messages_summary;
 use super::util::{bound_chars, looks_like_secret_string};
 use webcodex_core::workflow_session_contract::is_safe_job_id;
+use webcodex_tool_contracts::{
+    lookup_tool_definition, runtime_tool_activity_semantics, ToolActivityKind,
+    ToolActivityPresentation,
+};
 
 #[derive(Clone, Copy)]
 pub struct ConsoleValidationHooks {
@@ -231,14 +235,15 @@ pub(super) fn build_list_item(
     // bounded execution snapshot observed when the tool returned. Job terminal
     // lifecycle does not write back into the Session event, so only an actually
     // unfinished correlated tool call is truthful current work here.
-    let current = interactions
-        .iter()
-        .rev()
-        .copied()
-        .find(|interaction| interaction.finish.is_none() && interaction.start.is_some());
+    let current = interactions.iter().rev().copied().find(|interaction| {
+        interaction.finish.is_none()
+            && interaction.start.is_some()
+            && interaction_is_primary_activity(interaction)
+    });
     let current_sequence = current.map(|interaction| interaction.sequence);
     let last = interactions.iter().rev().copied().find(|interaction| {
         interaction.finish.is_some()
+            && interaction_is_primary_activity(interaction)
             && Some(interaction.sequence) != current_sequence
             && interaction
                 .finish
@@ -274,6 +279,7 @@ pub(super) fn build_detail(
     let overview = build_overview(record, &interactions, true, validation);
     let mut ordered_activity = interactions
         .into_iter()
+        .filter(|interaction| interaction_is_primary_activity(interaction))
         .map(|interaction| OrderedActivity {
             activity: activity_from_interaction(interaction, project),
             ledger_sequence: Some(interaction.sequence),
@@ -355,11 +361,9 @@ fn build_overview(
         history_complete: !history_truncated,
         history_truncated,
     };
-    for interaction in interactions
-        .iter()
-        .copied()
-        .filter(|interaction| interaction.finish.is_some())
-    {
+    for interaction in interactions.iter().copied().filter(|interaction| {
+        interaction.finish.is_some() && interaction_is_work_activity(interaction)
+    }) {
         let evidence = interaction
             .finish
             .or(interaction.start)
@@ -1068,53 +1072,64 @@ fn looks_like_absolute_path(value: &str) -> bool {
 }
 
 fn semantic_kind(event: &SessionEvent) -> &'static str {
-    match event.tool_name.as_str() {
-        "read_files"
-        | "list_project_files"
-        | "list_project_tracked_files"
-        | "project_overview"
-        | "read_project_artifact"
-        | "read_project_artifact_metadata" => "Read",
-        "search_project_texts" => "Searched",
-        "lsp_status"
-        | "document_symbols"
-        | "document_diagnostics"
-        | "hover"
-        | "workspace_symbols"
-        | "goto_definition"
-        | "find_references"
-        | "call_hierarchy" => "Navigated",
-        "apply_text_edits"
-        | "apply_unified_diff"
-        | "write_project_file"
-        | "delete_project_files"
-        | "git_restore_paths"
-        | "discard_untracked"
-        | "workspace_checkpoint_restore" => "Edited",
-        "git_status"
-        | "git_diff_hunks"
-        | "git_review_summary"
-        | "git_log"
-        | "show_changes"
-        | "workspace_hygiene_check"
-        | "finish_coding_task" => "Reviewed",
-        "cargo_test" | "cargo_check" | "cargo_fmt" | "go_test" => "Tested",
-        "run_process"
-        | "run_script"
-        | "run_shell"
-        | "run_job"
-        | "open_session_shell"
-        | "session_shell_exec"
-        | "session_shell_status"
-        | "close_session_shell"
-        | "observe_jobs"
-        | "stop_job" => "Ran",
-        _ if event.write_like => "Edited",
-        _ if event.git_like || event.change_summary_like => "Reviewed",
-        _ if event.shell_like => "Ran",
-        _ if event.read_like => "Read",
-        _ => "Used",
+    if lookup_tool_definition(&event.tool_name).is_some() {
+        return semantic_kind_for_tool(&event.tool_name);
     }
+    // Durable Session ledgers can outlive a public tool name. For retired or
+    // otherwise unknown historical tools, retain the event-time classification
+    // facts that were persisted with the call instead of degrading everything
+    // to `Used`. Current runtime tools always resolve through ToolDefinition.
+    if event.write_like {
+        "Edited"
+    } else if event.git_like || event.change_summary_like {
+        "Reviewed"
+    } else if event.shell_like {
+        "Ran"
+    } else if event.read_like {
+        "Read"
+    } else {
+        "Used"
+    }
+}
+
+fn semantic_kind_for_tool(tool_name: &str) -> &'static str {
+    match runtime_tool_activity_semantics(tool_name).kind {
+        ToolActivityKind::Read => "Read",
+        ToolActivityKind::Search => "Searched",
+        ToolActivityKind::Navigate => "Navigated",
+        ToolActivityKind::Edit => "Edited",
+        ToolActivityKind::Run => "Ran",
+        ToolActivityKind::Test => "Tested",
+        ToolActivityKind::Review => "Reviewed",
+        ToolActivityKind::None => "Used",
+    }
+}
+
+fn activity_presentation_for_tool(tool_name: &str) -> ToolActivityPresentation {
+    runtime_tool_activity_semantics(tool_name).presentation
+}
+
+fn interaction_activity_presentation(
+    interaction: &Interaction<'_>,
+) -> Option<ToolActivityPresentation> {
+    interaction
+        .finish
+        .or(interaction.start)
+        .map(|event| activity_presentation_for_tool(&event.tool_name))
+}
+
+// Work and Support are user-legible activity. Transport evidence remains in
+// the raw Session ledger and validation aggregation but is not a primary
+// Workflow Session activity card.
+fn interaction_is_primary_activity(interaction: &Interaction<'_>) -> bool {
+    matches!(
+        interaction_activity_presentation(interaction),
+        Some(ToolActivityPresentation::Work | ToolActivityPresentation::Support)
+    )
+}
+
+fn interaction_is_work_activity(interaction: &Interaction<'_>) -> bool {
+    interaction_activity_presentation(interaction) == Some(ToolActivityPresentation::Work)
 }
 
 fn interaction_is_progress_metadata(event: &SessionEvent) -> bool {
@@ -1127,6 +1142,114 @@ fn interaction_is_progress_metadata(event: &SessionEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_kind_labels_follow_tool_definition_semantics() {
+        for (tool, expected) in [
+            ("read_files", "Read"),
+            ("search_project_texts", "Searched"),
+            ("lsp_status", "Navigated"),
+            ("apply_text_edits", "Edited"),
+            ("cargo_test", "Tested"),
+            ("run_process", "Ran"),
+            ("git_review_summary", "Reviewed"),
+            ("observe_jobs", "Used"),
+        ] {
+            assert_eq!(semantic_kind_for_tool(tool), expected, "{tool}");
+        }
+    }
+
+    #[test]
+    fn retired_tool_activity_uses_persisted_event_time_classification() {
+        let mut event = SessionEvent {
+            event_id: "legacy-event".to_string(),
+            call_id: None,
+            logical_invocation_id: None,
+            logical_invocation_role: None,
+            session_id: "wc_sess_legacy".to_string(),
+            kind: "tool_call_finished".to_string(),
+            context_revision: None,
+            context_result_summary: None,
+            timestamp: 1,
+            transport: "api".to_string(),
+            tool_name: "retired_tool".to_string(),
+            project: None,
+            resolved_project: None,
+            risk_class: "read".to_string(),
+            read_like: true,
+            write_like: false,
+            shell_like: false,
+            git_like: false,
+            change_summary_like: false,
+            diff_review_like: false,
+            started_at: Some(1),
+            finished_at: Some(1),
+            duration_ms: Some(0),
+            status: Some("succeeded".to_string()),
+            exit_code: None,
+            failure_kind: None,
+            error_kind: None,
+            expected_failure: None,
+            expected_failure_kind: None,
+            result_expectation: None,
+            accepted_exit_codes: Vec::new(),
+            assertion_name: None,
+            actual_failure_kind: None,
+            failure_expectation_result: None,
+            warning_kind: None,
+            session_project: None,
+            request_project: None,
+            error_message_summary: None,
+            changed_paths: Vec::new(),
+            observed_paths: Vec::new(),
+            job_id: None,
+            persistent_shell: None,
+            effect_evidence: None,
+            input_summary: None,
+            validation_output_summary: None,
+            permission: None,
+            instruction: None,
+            requested_mode: None,
+            previous_mode: None,
+            requested_guards: None,
+            previous_guards: None,
+            capability_changed: None,
+            context_refreshed: None,
+            execution_context: None,
+            previous_execution_context: None,
+            execution_context_changed: None,
+        };
+        assert_eq!(semantic_kind(&event), "Read");
+        event.read_like = false;
+        event.write_like = true;
+        assert_eq!(semantic_kind(&event), "Edited");
+        event.write_like = false;
+        event.git_like = true;
+        assert_eq!(semantic_kind(&event), "Reviewed");
+        event.git_like = false;
+        event.shell_like = true;
+        assert_eq!(semantic_kind(&event), "Ran");
+    }
+
+    #[test]
+    fn activity_presentation_keeps_work_support_and_transport_orthogonal() {
+        assert_eq!(
+            activity_presentation_for_tool("read_files"),
+            ToolActivityPresentation::Work
+        );
+        assert_eq!(
+            activity_presentation_for_tool("list_jobs"),
+            ToolActivityPresentation::Support
+        );
+        assert_eq!(
+            activity_presentation_for_tool("observe_jobs"),
+            ToolActivityPresentation::Transport
+        );
+        assert_eq!(
+            activity_presentation_for_tool("goal_plan_state"),
+            ToolActivityPresentation::Transport
+        );
+    }
 
     fn ordered(
         kind: &str,

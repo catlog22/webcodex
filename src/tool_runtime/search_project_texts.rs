@@ -239,6 +239,7 @@ fn failure_reason_code(result: &ToolResult) -> &'static str {
         }
         Some("search_timeout") => "timeout",
         Some("search_backend_feature_unavailable") => "search_backend_feature_unavailable",
+        Some("search_path_not_found") => "not_found",
         Some("search_execution_failed") => "search_execution_failed",
         Some("search_request_dropped") => "search_request_dropped",
         _ if result.output.get("format").and_then(Value::as_str)
@@ -255,6 +256,7 @@ fn batch_failure_stage(result: &ToolResult, broad_reason: &str) -> &'static str 
         Some("request_validation") => "request_validation",
         Some("backend_selection") => "backend_selection",
         Some("backend_protocol") => "backend_protocol",
+        Some("path_resolution") => "path_resolution",
         Some("backend_execution") => "backend_execution",
         Some("agent_request") => "agent_request",
         Some("agent_execution") => "agent_execution",
@@ -266,6 +268,7 @@ fn batch_failure_stage(result: &ToolResult, broad_reason: &str) -> &'static str 
             "invalid_pattern" | "invalid_path" | "invalid_glob" | "invalid_search_request" => {
                 "request_validation"
             }
+            "not_found" => "path_resolution",
             "search_backend_feature_unavailable" => "backend_selection",
             "search_request_dropped" => "agent_transport",
             "external_provider_error" => "provider",
@@ -282,6 +285,7 @@ fn batch_failure_detail_code(result: &ToolResult, broad_reason: &'static str) ->
         Some("invalid_path") => "invalid_path",
         Some("invalid_glob") => "invalid_glob",
         Some("invalid_search_request") => "invalid_search_request",
+        Some("not_found") => "not_found",
         Some("backend_feature_unavailable") => "backend_feature_unavailable",
         Some("backend_identity_missing") => "backend_identity_missing",
         Some("backend_identity_invalid") => "backend_identity_invalid",
@@ -649,6 +653,50 @@ mod tests {
     }
 
     #[test]
+    fn batch_projection_preserves_incomplete_count_truth_after_path_filtering() {
+        let options = SearchOptions::normalize(SearchRequest {
+            pattern: "needle".to_string(),
+            path: None,
+            limit: Some(10),
+            context_before: None,
+            context_after: None,
+            include_globs: None,
+            exclude_globs: None,
+            result_mode: Some(crate::tool_runtime::SearchResultMode::Count),
+            timeout_secs: None,
+        })
+        .unwrap();
+        let marker = "{\"webcodex_search\":{\"backend\":\"rg\",\"feature_unavailable\":false}}\n";
+        let stdout = format!("{marker}/private/absolute/secret.rs\u{0}2\n");
+        let single = crate::tool_runtime::files::search_project_text_output(
+            "agent:special:demo",
+            &options,
+            &stdout,
+            Some(0),
+            "",
+        );
+        assert!(single.success, "{:?}", single.error);
+
+        let item = batch_item(0, single);
+        let mut batch = ToolResult::ok(batch_output(
+            "agent:special:demo",
+            1,
+            vec![item],
+            false,
+            None,
+            None,
+        ));
+        super::super::dispatch::sparsify_search_batch_success_for_model(&[true], &mut batch);
+        let output = &batch.output["items"][0]["output"];
+        assert_eq!(output["count_complete"], false);
+        assert_eq!(output["total_matches"], Value::Null);
+        assert_eq!(output["files"], json!([]));
+        assert!(!serde_json::to_string(&batch)
+            .unwrap()
+            .contains("/private/absolute/secret.rs"));
+    }
+
+    #[test]
     fn complete_default_sparse_fit_is_not_preemptively_budget_truncated() {
         let payload_budget =
             DEFAULT_SEARCH_PROJECT_TEXTS_RESULT_BYTES - MODEL_RESULT_ENVELOPE_RESERVE_BYTES;
@@ -895,7 +943,11 @@ mod tests {
     }
 
     #[test]
-    fn search_result_budget_clamps_to_existing_hard_cap() {
+    fn search_result_budget_clamps_to_existing_hard_bounds() {
+        assert_eq!(
+            normalized_result_budget(Some(MIN_SEARCH_PROJECT_TEXTS_RESULT_BYTES / 2)),
+            MIN_SEARCH_PROJECT_TEXTS_RESULT_BYTES
+        );
         assert_eq!(
             normalized_result_budget(Some(MAX_SERIALIZED_OUTPUT_BYTES * 2)),
             MAX_SERIALIZED_OUTPUT_BYTES

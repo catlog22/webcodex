@@ -495,6 +495,7 @@ async fn long_run_shell_hands_off_same_job_once_and_status_log_stop_observe_it()
             }],
             40,
             None,
+            ObserveJobsWakeOn::Change,
             Some(&auth),
         )
         .await;
@@ -1363,15 +1364,7 @@ async fn model_facing_stop_job_stops_agent_job_with_same_session() {
         .await;
     assert!(run.success, "{:?}", run.error);
     let job_id = run.output["job_id"].as_str().unwrap().to_string();
-    assert_eq!(run.output["continuation"]["tool"], "observe_jobs");
-    assert_eq!(
-        run.output["continuation"]["arguments"]["items"][0]["job_id"],
-        job_id
-    );
-    assert_eq!(
-        run.output["continuation"]["arguments"]["items"][0]["after_observation_token"],
-        run.output["observation_token"]
-    );
+    assert_observe_job_continuation(&run.output);
 
     let result = runtime
         .dispatch_with_auth(
@@ -1721,7 +1714,28 @@ fn assert_unknown_job(result: ToolResult) {
     assert_eq!(result.output["failure_kind"], "job_not_found");
     assert_eq!(result.output["state_changed"], false);
     assert_eq!(result.output["recovery_kind"], "reobserve");
-    assert_eq!(result.output["recovery_tool"], "list_jobs");
+    assert!(result.output.get("recovery_tool").is_none());
+    assert_eq!(
+        result.output["suggested_call"],
+        json!({"tool": "list_jobs", "arguments": {}})
+    );
+    let suggested = &result.output["suggested_call"];
+    let parsed = ToolCall::from_tool_name(
+        suggested["tool"].as_str().unwrap(),
+        suggested["arguments"].clone(),
+    )
+    .expect("unknown Job recovery must parse");
+    match parsed {
+        ToolCall::ListJobs {
+            project,
+            session_id,
+            ..
+        } => {
+            assert!(project.is_none());
+            assert!(session_id.is_none());
+        }
+        other => panic!("unexpected recovery call: {}", other.tool_name()),
+    }
     assert!(
         result.error.unwrap_or_default().contains("unknown job"),
         "unauthorized job lookup should be hidden as unknown"
@@ -1752,6 +1766,7 @@ async fn agent_job_log_invalid_token_is_fix_input_not_unknown_job() {
     assert_eq!(result.output["state_changed"], false);
     assert_eq!(result.output["recovery_kind"], "fix_input");
     assert!(result.output.get("recovery_tool").is_none());
+    assert!(result.output.get("suggested_call").is_none());
     assert!(result.error.unwrap_or_default().contains("malformed"));
 }
 

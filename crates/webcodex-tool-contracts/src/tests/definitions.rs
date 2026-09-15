@@ -45,6 +45,88 @@ fn tool_definitions_cover_known_names_and_public_specs() {
 }
 
 #[test]
+fn tool_definitions_are_activity_semantics_ssot() {
+    use ToolActivityInteraction::{Meaningful, NonMeaningful};
+    use ToolActivityKind::{Edit, Navigate, None as NoKind, Read, Review, Run, Search, Test};
+    use ToolActivityPresentation::{Support, Transport, Work};
+
+    for (name, presentation, interaction, kind) in [
+        ("read_files", Work, Meaningful, Read),
+        ("search_project_texts", Work, Meaningful, Search),
+        ("apply_text_edits", Work, Meaningful, Edit),
+        ("run_process", Work, Meaningful, Run),
+        ("run_shell", Work, Meaningful, Run),
+        ("cargo_test", Work, Meaningful, Test),
+        ("cargo_check", Work, Meaningful, Test),
+        ("git_review_summary", Work, Meaningful, Review),
+        ("git_diff_hunks", Work, Meaningful, Review),
+        ("show_changes", Work, Meaningful, Review),
+        ("lsp_status", Work, Meaningful, Navigate),
+        ("finish_coding_task", Work, Meaningful, Review),
+        ("observe_jobs", Transport, Meaningful, NoKind),
+        ("list_jobs", Support, Meaningful, NoKind),
+        ("session_handoff_summary", Support, Meaningful, NoKind),
+        ("work_on_project", Support, Meaningful, NoKind),
+        ("validation_summary", Support, Meaningful, NoKind),
+        ("runtime_status", Support, NonMeaningful, NoKind),
+        ("tool_manifest", Support, NonMeaningful, NoKind),
+        ("goal_plan_state", Transport, NonMeaningful, NoKind),
+        ("agent_continuation_state", Transport, NonMeaningful, NoKind),
+    ] {
+        assert_eq!(
+            runtime_tool_activity_semantics(name),
+            ToolActivitySemantics {
+                presentation,
+                interaction,
+                kind,
+            },
+            "{name}"
+        );
+    }
+
+    for name in [
+        "runtime_status",
+        "list_tools",
+        "list_runners",
+        "list_projects",
+        "tool_manifest",
+        "read_tool_trace",
+        "goal_plan_state",
+        "work_result_state",
+        "agent_wait_state",
+        "agent_continuation_bind",
+        "agent_continuation_recover_endpoint",
+        "agent_continuation_state",
+        "agent_continuation_wake_acquire",
+        "agent_continuation_wake_prepare",
+        "agent_continuation_wake_finish",
+        "agent_continuation_unbind",
+    ] {
+        assert_eq!(
+            runtime_tool_activity_interaction(name),
+            NonMeaningful,
+            "legacy non-meaningful behavior changed for {name}"
+        );
+    }
+
+    assert_eq!(
+        runtime_tool_activity_semantics("unknown_open_world_tool"),
+        ToolActivitySemantics {
+            presentation: Work,
+            interaction: Meaningful,
+            kind: NoKind,
+        },
+        "unknown names must preserve the legacy conservative meaningful default"
+    );
+
+    let hidden = lookup_tool_definition("job_tail").expect("job_tail definition");
+    assert!(hidden.visibility.is_model_hidden());
+    let hidden_activity = hidden.activity_semantics();
+    assert_eq!(hidden_activity.presentation, Work);
+    assert_eq!(hidden_activity.interaction, Meaningful);
+}
+
+#[test]
 fn execution_selection_contract_is_canonical_closed_and_sparse() {
     use ToolExecutionContinuation::{ObserveJobs, SessionShell};
     use ToolExecutionForm::{
@@ -298,6 +380,63 @@ fn adaptive_runtime_direct_declarations_are_visible_ranked_and_unique() {
             definition.metadata.authority,
             ToolAuthorityPolicy::Require(expected_authority)
         );
+    }
+
+    let gpt_action_direct = gpt_action_direct_tool_definitions();
+    let expected_gpt_action_direct = derived
+        .iter()
+        .copied()
+        .filter(|definition| definition.supports_gpt_actions())
+        .map(|definition| definition.name)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        gpt_action_direct
+            .iter()
+            .map(|definition| definition.name)
+            .collect::<Vec<_>>(),
+        expected_gpt_action_direct,
+        "GPT Actions direct exposure must inherit Adaptive Direct ordering minus explicit protocol exceptions"
+    );
+    assert!(gpt_action_tool_supported("apply_patch"));
+    assert!(
+        !gpt_action_direct
+            .iter()
+            .any(|definition| definition.name == "apply_patch"),
+        "apply_patch stays GPT-Action-supported long-tail behind call_runtime_tool"
+    );
+    for name in [
+        "present_goal_plan",
+        "present_agent_continuation",
+        "present_work_result",
+        "export_project_artifact",
+        "rotate_agent_continuation_endpoint",
+    ] {
+        assert!(
+            !gpt_action_tool_supported(name),
+            "{name} depends on MCP-only presentation/resource semantics"
+        );
+    }
+
+    for definition in &gpt_action_direct {
+        let model_spec = definition
+            .model_spec
+            .expect("model-visible direct tool spec");
+        let action_description = definition
+            .gpt_action_description()
+            .expect("GPT Action description projection");
+        assert!(
+            action_description.chars().count() <= GPT_ACTION_DESCRIPTION_MAX_CHARS,
+            "{} GPT Action description exceeds {} characters",
+            definition.name,
+            GPT_ACTION_DESCRIPTION_MAX_CHARS
+        );
+        if model_spec.description.chars().count() > GPT_ACTION_DESCRIPTION_MAX_CHARS {
+            assert!(
+                model_spec.gpt_action_description.is_some(),
+                "{} needs an explicit short GPT Action presentation description",
+                definition.name
+            );
+        }
     }
 
     let observe_jobs = registered_tool_specs()

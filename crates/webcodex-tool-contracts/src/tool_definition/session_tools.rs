@@ -30,7 +30,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
         ),
-        "Unified Workflow Session lifecycle control surface. Actions: start (single project or ordered multi-workspace projects list), get, list, attach_project, detach_project, update_context, compact (distill session state into one Memory/knowhow entry), restore (from an exact checkpoint), summary, close. Every action names its session or project explicitly and authority is re-checked on every call; attached workspaces never inherit the canonical project authority.",
+        "Unified Workflow Session lifecycle. Actions: start (single or multi-workspace projects list), get, list, attach_project, detach_project, update_context, compact (distill to one Memory entry), restore (exact checkpoint), summary, close. Attached workspaces never inherit canonical project authority.",
         session_action_input_schema,
     ),
     model_spec(
@@ -54,7 +54,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
         ),
-        "Session-scoped todo records with revision CAS. Actions: create, list, get, claim (open -> in_progress with assignee), release (in_progress -> open), advance (to blocked or cancelled with note), complete (resolve with optional resolution). Todos are first-class Workflow Session state, distinct from free-form collaboration messages.",
+        "Session-scoped todo records with revision CAS. Actions: create, list, get, claim (-> in_progress with assignee), release (-> open), advance (to blocked/cancelled with note), complete (resolve). Todos are first-class Workflow Session state, distinct from free-form collaboration messages.",
         todo_action_input_schema,
     ),
 ];
@@ -84,7 +84,7 @@ pub(super) const CHECKPOINT_DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
         ),
-        "Unified workspace checkpoint control. Actions: create, list, show, restore (requires confirm=true; rewrites workspace state), delete (requires confirm=true). Consolidates the former workspace_checkpoint_* tools into one action surface; restore and delete remain explicit-confirm destructive operations.",
+        "Unified workspace checkpoint control. Actions: create, list, show, restore (requires confirm=true; rewrites workspace state), delete (requires confirm=true). Consolidates the former workspace_checkpoint_* tools; restore and delete remain explicit-confirm destructive operations.",
         checkpoint_action_input_schema,
     ),
 ];

@@ -132,7 +132,7 @@ pub fn git_diff_hunks_input_schema() -> Value {
         (
             "max_page_bytes",
             "integer",
-            "Raw producer page budget in bytes, independent of the final serialized model result. Defaults to 64 KiB and is bounded to 16..192 KiB so ordinary Runner result retention retains framing headroom.",
+            "Raw producer page budget in bytes, independent of the final serialized model result. Defaults to 64 KiB. Any recognized nonnegative integer is accepted and runtime-clamped to the fixed 16..192 KiB producer bounds so ordinary Runner result retention retains framing headroom.",
             false,
         ),
         (
@@ -156,14 +156,14 @@ pub fn git_diff_hunks_input_schema() -> Value {
         (
             "continuation",
             "string",
-            "Opaque continuation returned by a previous git_diff_hunks page. When continuing, repeat the exact original diff scope and paging inputs unchanged (base_commit/head_commit for committed mode, cached/worktree mode, paths, max_hunks, max_hunk_lines, and max_page_bytes); the token is scope-bound and does not reconstruct omitted request fields. Continuation recovers later records, never lines omitted from the current hunk.",
+            "Opaque continuation returned by git_diff_hunks. It may identify either a later-record page cursor or the next complete-line fragment of one exact hunk; token type is opaque and scope/fence-bound. Follow the returned parser-ready suggested_call and repeat its exact original effective scope/paging inputs unchanged (base_commit/head_commit for committed mode, cached/worktree mode, paths, max_hunks, max_hunk_lines, and max_page_bytes). Later-record and hunk-fragment continuations remain distinct identities.",
             false,
         ),
     ]));
-    schema["properties"]["max_page_bytes"]["minimum"] =
-        Value::from(webcodex_core::runtime_contract::MIN_GIT_DIFF_HUNKS_PAGE_BYTES);
-    schema["properties"]["max_page_bytes"]["maximum"] =
-        Value::from(webcodex_core::runtime_contract::MAX_GIT_DIFF_HUNKS_PAGE_BYTES);
+    // Negative byte budgets are not meaningful and cannot be represented by
+    // the runtime's usize input. Zero and other sub-minimum nonnegative values
+    // intentionally reach the authoritative runtime clamp.
+    schema["properties"]["max_page_bytes"]["minimum"] = Value::from(0);
     schema["properties"]["max_page_bytes"]["default"] =
         Value::from(webcodex_core::runtime_contract::DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES);
     for field in ["base_commit", "head_commit"] {
@@ -178,18 +178,21 @@ pub fn git_diff_hunks_input_schema() -> Value {
             "if": { "required": ["base_commit"] },
             "then": {
                 "required": ["head_commit"],
-                "not": { "required": ["cached"] }
+                "properties": { "cached": { "const": false } }
             }
         },
         {
             "if": { "required": ["head_commit"] },
             "then": {
                 "required": ["base_commit"],
-                "not": { "required": ["cached"] }
+                "properties": { "cached": { "const": false } }
             }
         },
         {
-            "if": { "required": ["cached"] },
+            "if": {
+                "required": ["cached"],
+                "properties": { "cached": { "const": true } }
+            },
             "then": {
                 "not": {
                     "anyOf": [

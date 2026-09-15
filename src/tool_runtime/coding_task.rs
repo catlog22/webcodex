@@ -141,7 +141,7 @@ fn invalid_project_source(message: impl Into<String>, fields: Value) -> ToolResu
     if let (Some(output), Some(fields)) = (output.as_object_mut(), fields.as_object()) {
         output.extend(fields.clone());
     }
-    ToolResult::err_with_output(message, output).with_recovery(RecoveryKind::FixInput, None)
+    ToolResult::err_with_output(message, output).with_recovery(RecoveryKind::FixInput)
 }
 
 #[cfg(test)]
@@ -245,7 +245,7 @@ fn registration_scope_denied(auth: Option<&AuthContext>, operation: &str) -> Opt
                     "state_changed": false,
                 }),
             )
-            .with_recovery(RecoveryKind::UserAction, None)
+            .with_recovery(RecoveryKind::UserAction)
         })
 }
 
@@ -3082,7 +3082,7 @@ fn finish_suggested_next_actions(output: &Value) -> Vec<String> {
         == Some(false)
     {
         if output
-            .pointer("/changes/show_changes/diff_review_handoff/tool")
+            .pointer("/changes/show_changes/diff_review_handoff/recovery/tool")
             .and_then(Value::as_str)
             == Some("git_diff_hunks")
         {
@@ -3187,7 +3187,9 @@ mod startup_runner_tests {
             "workspace": {"clean": false},
             "changes": {
                 "show_changes": {
-                    "diff_review_handoff": {"tool": "git_diff_hunks"}
+                    "diff_review_handoff": {
+                        "recovery": {"tool": "git_diff_hunks", "arguments": {}}
+                    }
                 }
             },
             "jobs": {"blocking_active_count": 0},
@@ -3200,7 +3202,7 @@ mod startup_runner_tests {
             .any(|action| action == "continue the diff review with git_diff_hunks"));
         assert!(
             crate::tool_runtime::tool_definition::is_adaptive_runtime_direct_tool(
-                output["changes"]["show_changes"]["diff_review_handoff"]["tool"]
+                output["changes"]["show_changes"]["diff_review_handoff"]["recovery"]["tool"]
                     .as_str()
                     .unwrap()
             )

@@ -34,7 +34,10 @@ pub(super) fn tool_supports_goal_plan_app(tool_name: &str) -> bool {
 /// App-only coordination tools may still declare the same resource association
 /// as a Host compatibility hint without exposing them to the model or granting authority.
 pub(super) fn tool_supports_agent_continuation_app(tool_name: &str) -> bool {
-    tool_name == "present_agent_continuation"
+    matches!(
+        tool_name,
+        "present_agent_continuation" | "wait_for_agent_events"
+    )
 }
 
 /// Bounded presentation projections retained for current milestone cards and for
@@ -366,8 +369,24 @@ fn observed_failure_presentation(item: &Value) -> Option<Value> {
     let job_id = item.get("job_id").and_then(bounded_text)?;
     let mut output = Map::new();
     output.insert("job_id".to_string(), Value::String(job_id));
-    for key in ["error_kind", "recovery_kind", "recovery_tool"] {
+    for key in ["error_kind", "recovery_kind"] {
         copy_bounded_text(item, &mut output, key);
+    }
+    if item
+        .get("suggested_call")
+        .and_then(Value::as_object)
+        .is_some_and(|call| {
+            call.get("tool").and_then(Value::as_str) == Some("list_jobs")
+                && call
+                    .get("arguments")
+                    .and_then(Value::as_object)
+                    .is_some_and(|arguments| arguments.is_empty())
+        })
+    {
+        output.insert(
+            "suggested_call".to_string(),
+            json!({"tool": "list_jobs", "arguments": {}}),
+        );
     }
     if item.get("error_kind").and_then(Value::as_str) == Some("unknown_job") {
         output.insert(

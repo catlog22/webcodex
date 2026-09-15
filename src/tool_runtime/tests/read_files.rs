@@ -61,23 +61,36 @@ fn read_files_input_schema_enforces_batch_and_item_bounds() {
         schema["properties"]["max_result_bytes"]["default"],
         64 * 1024
     );
-    assert_eq!(
-        schema["properties"]["max_result_bytes"]["maximum"],
-        512 * 1024
-    );
-    assert!(schema["properties"]["max_result_bytes"]["description"]
+    assert_eq!(schema["properties"]["max_result_bytes"]["minimum"], 0);
+    assert!(schema["properties"]["max_result_bytes"]
+        .get("maximum")
+        .is_none());
+    let budget_description = schema["properties"]["max_result_bytes"]["description"]
         .as_str()
-        .unwrap()
-        .contains("protocol overlays"));
+        .unwrap();
+    assert!(budget_description.contains("runtime-clamped"));
+    assert!(budget_description.contains("protocol overlays"));
     assert!(validates(&json!({
         "project": "demo",
         "items": [{"path": "a.rs"}],
         "max_result_bytes": 128 * 1024
     })));
+    for max_result_bytes in [0, 1, 512 * 1024 + 1, 1024 * 1024] {
+        assert!(validates(&json!({
+            "project": "demo",
+            "items": [{"path": "a.rs"}],
+            "max_result_bytes": max_result_bytes
+        })));
+    }
     assert!(!validates(&json!({
         "project": "demo",
         "items": [{"path": "a.rs"}],
-        "max_result_bytes": 512 * 1024 + 1
+        "max_result_bytes": -1
+    })));
+    assert!(!validates(&json!({
+        "project": "demo",
+        "items": [{"path": "a.rs"}],
+        "max_result_bytes": "65536"
     })));
     assert!(!validates(&json!({
         "project": "demo",
@@ -351,6 +364,11 @@ async fn read_file_dispatch_partial_success_keeps_full_range_cursor() {
     assert_eq!(continuation["kind"], "read_range");
     assert_eq!(continuation["safe_cursor"], true);
     assert_eq!(continuation["snapshot_stable"], false);
+    assert_eq!(continuation["continuation_semantics"]["kind"], "page");
+    assert_eq!(
+        continuation["continuation_semantics"]["carrier"],
+        "position"
+    );
     assert_eq!(
         continuation["source_sha256"],
         format!("{:x}", Sha256::digest(content.as_bytes()))

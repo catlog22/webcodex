@@ -707,6 +707,43 @@ async fn mcp_tools_call_writes_a_summary_action_audit_row() {
 }
 
 #[tokio::test]
+async fn observe_jobs_action_audit_remains_window_meaningful_transport() {
+    let config = test_config(Some("secret"));
+    let (_tmp, db) = test_db();
+    let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
+    let service = Service::new(build_test_router(config, db.clone(), runtime));
+
+    let mut response = TestClient::post("http://localhost/mcp")
+        .bearer_auth("secret")
+        .json(&json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "tools/call",
+            "params": {
+                "name": "observe_jobs",
+                "arguments": {"items": [{"job_id": "missing-job-for-activity-test"}]}
+            }
+        }))
+        .send(&service)
+        .await;
+    assert_eq!(response.status_code, Some(StatusCode::OK));
+    let body: Value = response.take_json().await.unwrap();
+    assert!(body.get("result").is_some(), "{body}");
+
+    let (operation, window_meaningful, continuity_eligible): (String, i64, Option<i64>) = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT operation, window_meaningful, window_continuity_eligible FROM action_events",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(operation, "observe_jobs");
+    assert_eq!(window_meaningful, 1);
+    assert_eq!(continuity_eligible, Some(1));
+}
+
+#[tokio::test]
 async fn mcp_pre_result_invalid_arguments_still_records_generic_attempt() {
     let config = test_config(Some("secret"));
     let (_tmp, db) = test_db();
@@ -1372,6 +1409,22 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     let runtime = Arc::new(test_runtime_with_surface(ModelSurface::FullOperatorRuntime));
     let service = Service::new(build_test_router(config, db.clone(), runtime.clone()));
 
+    fn assert_no_recovery_required(value: &Value) {
+        let serialized = serde_json::to_string(value).unwrap();
+        assert!(
+            !serialized.contains("\"recovery_required\""),
+            "model-facing Context projection retained duplicate recovery_required: {serialized}"
+        );
+    }
+
+    fn assert_no_context_checkpoint_continuation(value: &Value) {
+        let serialized = serde_json::to_string(value).unwrap();
+        assert!(
+            !serialized.contains("\"session_context_continuation\""),
+            "model-facing Context projection retained static session_context_continuation: {serialized}"
+        );
+    }
+
     let (status, session_body) = stateless_2026_tool_call(
         &service,
         "secret",
@@ -1422,6 +1475,7 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
         stateless_2026_tool_call(&service, "secret", 229, "start_session", exact_args, None).await;
     assert_eq!(status, StatusCode::OK, "{exact_body}");
     let exact = stateless_tool_output(&exact_body);
+    assert_no_context_checkpoint_continuation(&exact);
     assert_eq!(exact["session_context_revision"], 1);
     assert!(exact.get("session_continuity").is_none());
     assert!(exact.get("session_recovery").is_none());
@@ -1458,6 +1512,8 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
         stateless_2026_tool_call(&service, "secret", 231, "start_session", stale_args, None).await;
     assert_eq!(status, StatusCode::OK, "{stale_body}");
     let stale = stateless_tool_output(&stale_body);
+    assert_no_context_checkpoint_continuation(&stale);
+    assert_no_recovery_required(&stale);
     assert_eq!(stale["session_context_revision"], 2);
     assert_eq!(stale["session_continuity"]["status"], "behind");
     assert_eq!(stale["session_continuity"]["ack_revision"], 0);
@@ -1478,10 +1534,19 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
         stateless_2026_tool_call(&service, "secret", 232, "start_session", future_args, None).await;
     assert_eq!(status, StatusCode::OK, "{future_body}");
     let future = stateless_tool_output(&future_body);
+    assert_no_context_checkpoint_continuation(&future);
     assert!(future.get("session_context_revision").is_none());
     assert_eq!(future["session_continuity"]["status"], "invalid");
-    assert_eq!(future["session_continuity"]["recovery_required"], true);
+    assert_no_recovery_required(&future);
     assert!(future.get("session_recovery").is_none());
+    assert!(future["session_continuity"].get("recovery_tool").is_none());
+    assert!(future["session_continuity"]
+        .get("recovery_session_id")
+        .is_none());
+    assert_eq!(
+        future["session_continuity"]["suggested_call"],
+        json!({"tool": "session_handoff_summary", "arguments": {"session_id": session_id}})
+    );
 
     let missing_args =
         with_mcp_recording_session(json!({"title": "context checkpoint missing"}), &session_id);
@@ -1490,13 +1555,15 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
             .await;
     assert_eq!(status, StatusCode::OK, "{missing_body}");
     let missing = stateless_tool_output(&missing_body);
+    assert_no_context_checkpoint_continuation(&missing);
+    assert_no_recovery_required(&missing);
     assert!(missing.get("session_context_revision").is_none());
     assert_eq!(missing["session_continuity"]["status"], "unacknowledged");
     assert!(missing.get("session_recovery").is_none());
-    assert_eq!(
-        missing["session_continuity"]["recovery_tool"],
-        "session_handoff_summary"
-    );
+    assert!(missing["session_continuity"].get("recovery_tool").is_none());
+    assert!(missing["session_continuity"]
+        .get("recovery_session_id")
+        .is_none());
     assert_eq!(
         missing["session_continuity"]["suggested_call"],
         json!({
@@ -1518,6 +1585,8 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     .await;
     assert_eq!(status, StatusCode::OK, "{recovered_body}");
     let recovered = stateless_tool_output(&recovered_body);
+    assert_no_context_checkpoint_continuation(&recovered);
+    assert_no_recovery_required(&recovered);
     assert_eq!(recovered["session_context_revision"], 4);
     assert_eq!(recovered["session_continuity"]["status"], "recovered");
     assert!(recovered["validation"].is_object());
@@ -1546,7 +1615,9 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
         assert_eq!(status, StatusCode::OK, "{body}");
         let output = stateless_tool_output(&body);
         assert!(output.get("session_context_revision").is_none());
-        assert_eq!(output["session_continuity"]["recovery_required"], true);
+        assert_no_context_checkpoint_continuation(&output);
+        assert_no_recovery_required(&output);
+        assert!(output["session_continuity"]["suggested_call"].is_object());
         assert!(output.get("session_recovery").is_none());
     }
 
@@ -1564,10 +1635,10 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     assert_eq!(status, StatusCode::OK, "{body}");
     let output = stateless_tool_output(&body);
     assert!(output.get("session_context_revision").is_none());
-    assert_eq!(
-        output["session_continuity"]["recovery_session_id"],
-        other.session_id
-    );
+    assert!(output["session_continuity"].get("recovery_tool").is_none());
+    assert!(output["session_continuity"]
+        .get("recovery_session_id")
+        .is_none());
     assert_eq!(
         output["session_continuity"]["suggested_call"]["arguments"]["session_id"],
         other.session_id
@@ -1592,6 +1663,7 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     .await;
     assert_eq!(status, StatusCode::OK, "{after_missing_body}");
     let after_missing = stateless_tool_output(&after_missing_body);
+    assert_no_recovery_required(&after_missing);
     assert_eq!(after_missing["session_context_revision"], 5);
     assert!(after_missing.get("session_continuity").is_none());
     assert!(after_missing.get("session_recovery").is_none());
@@ -1610,6 +1682,8 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     .await;
     assert_eq!(status, StatusCode::OK, "{malformed_body}");
     let malformed = stateless_tool_output(&malformed_body);
+    assert_no_context_checkpoint_continuation(&malformed);
+    assert_no_recovery_required(&malformed);
     assert!(
         malformed["session_id"].is_string(),
         "business Session creation must execute"
@@ -1617,6 +1691,16 @@ async fn http_mcp_2026_session_context_revision_recovers_missing_stale_and_inval
     assert_eq!(malformed["session_continuity"]["status"], "invalid");
     assert!(malformed.get("session_context_revision").is_none());
     assert!(malformed.get("session_recovery").is_none());
+    assert!(malformed["session_continuity"]
+        .get("recovery_tool")
+        .is_none());
+    assert!(malformed["session_continuity"]
+        .get("recovery_session_id")
+        .is_none());
+    assert_eq!(
+        malformed["session_continuity"]["suggested_call"],
+        json!({"tool": "session_handoff_summary", "arguments": {"session_id": session_id}})
+    );
     assert_eq!(runtime.sessions.context_revision(&session_id), Some(6));
 
     let audit = serde_json::to_string(

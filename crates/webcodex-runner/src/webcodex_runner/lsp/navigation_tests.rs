@@ -1,7 +1,5 @@
-use super::navigation::{handle_lsp_request, is_lsp_request_kind};
-use super::position::MAX_LSP_DOCUMENT_BYTES;
-use super::supervisor::{LspCommand, LspServerKind, LspSupervisor, LspSupervisorConfig};
-use super::test_support::{fake_server_path, wait_until};
+use super::adapter::{handle_lsp_request, is_lsp_request_kind};
+use super::navigation_test_support::{fake_server_path, wait_until};
 use crate::lsp_bridge::{
     parse_runner_lsp_result_envelope, CallHierarchyDirection, RunnerLspPayload, RunnerLspRequest,
     AGENT_LSP_REQUEST_KIND, MAX_CALL_HIERARCHY_CALL_ENTRIES_INSPECTED_PER_RPC,
@@ -17,6 +15,9 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::process::Command;
 use std::time::{Duration, Instant};
+use webcodex_lsp::{
+    LspCommand, LspServerKind, LspSupervisor, LspSupervisorConfig, MAX_LSP_DOCUMENT_BYTES,
+};
 
 /// Minimal agent shell request carrying a typed LSP payload.
 fn shell_lsp_request(payload: RunnerLspPayload) -> RunnerRequest {
@@ -58,12 +59,11 @@ struct NavFixture {
     marker: PathBuf,
     supervisor: LspSupervisor,
     policy: RunnerPolicy,
+    request_timeout: Duration,
 }
 
 impl NavFixture {
-    fn new(scenario: &str) -> Self {
-        let temp = tempfile::tempdir().unwrap();
-        let root = temp.path().join("project");
+    fn populate_demo_project(root: &Path) {
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
             root.join("Cargo.toml"),
@@ -82,7 +82,23 @@ impl NavFixture {
             other.push_str(&format!("// other {i}\n"));
         }
         fs::write(root.join("src/other.rs"), other).unwrap();
-        Self::finish(temp, root, scenario, LspServerKind::RustAnalyzer)
+    }
+
+    fn new(scenario: &str) -> Self {
+        Self::with_request_timeout(scenario, Duration::from_secs(3))
+    }
+
+    fn with_request_timeout(scenario: &str, request_timeout: Duration) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        Self::populate_demo_project(&root);
+        Self::finish(
+            temp,
+            root,
+            scenario,
+            LspServerKind::RustAnalyzer,
+            request_timeout,
+        )
     }
 
     /// Fixture for any language: writes the given project-relative files
@@ -98,13 +114,19 @@ impl NavFixture {
             }
             fs::write(path, body).unwrap();
         }
-        Self::finish(temp, root, scenario, kind)
+        Self::finish(temp, root, scenario, kind, Duration::from_secs(3))
     }
 
     /// Shared wiring: register the project, start a fake server under `kind`,
     /// and build the fixture. The fake server is language-agnostic, so the
     /// language behavior under test comes from the profile registry.
-    fn finish(temp: tempfile::TempDir, root: PathBuf, scenario: &str, kind: LspServerKind) -> Self {
+    fn finish(
+        temp: tempfile::TempDir,
+        root: PathBuf,
+        scenario: &str,
+        kind: LspServerKind,
+        request_timeout: Duration,
+    ) -> Self {
         let project_registry_dir = temp.path().join("project-registry");
         fs::create_dir_all(&project_registry_dir).unwrap();
         fs::write(
@@ -123,7 +145,7 @@ impl NavFixture {
                     .arg(marker.as_os_str())
                     .arg(exit_marker.as_os_str()),
             )]),
-            request_timeout: Duration::from_secs(3),
+            request_timeout,
             initialize_timeout: Duration::from_secs(3),
             shutdown_timeout: Duration::from_millis(500),
             ..LspSupervisorConfig::default()
@@ -140,6 +162,7 @@ impl NavFixture {
             marker,
             supervisor,
             policy,
+            request_timeout,
         }
     }
 
@@ -1090,7 +1113,9 @@ fn cold_workspace_symbols_waits_for_quiescent_readiness_before_dispatch() {
 #[test]
 fn rust_workspace_symbols_can_outlive_the_ordinary_request_timeout() {
     let _serial = super::serialize_fake_lsp_test();
-    let fixture = NavFixture::new("workspace_slow_success");
+    let ordinary_timeout = Duration::from_millis(250);
+    let fixture = NavFixture::with_request_timeout("workspace_slow_success", ordinary_timeout);
+    let started = Instant::now();
     let result = fixture.request_with_timeout(
         RunnerLspPayload {
             project_id: "demo".into(),
@@ -1101,7 +1126,13 @@ fn rust_workspace_symbols_can_outlive_the_ordinary_request_timeout() {
         },
         5,
     );
+    let elapsed = started.elapsed();
     assert_eq!(result["success"], true, "{result}");
+    assert!(
+        elapsed >= fixture.request_timeout,
+        "symbol request should outlive ordinary timeout ({:?}): {elapsed:?}",
+        fixture.request_timeout
+    );
     let marker = fs::read_to_string(&fixture.marker).unwrap();
     assert!(marker.contains("workspace-request"), "{marker}");
 }
@@ -1109,7 +1140,7 @@ fn rust_workspace_symbols_can_outlive_the_ordinary_request_timeout() {
 #[test]
 fn rust_workspace_symbol_timeout_remains_bounded_by_the_operation_deadline() {
     let _serial = super::serialize_fake_lsp_test();
-    let fixture = NavFixture::new("workspace_slow_success");
+    let fixture = NavFixture::new("workspace_operation_deadline");
     let started = Instant::now();
     let result = fixture.request_with_timeout(
         RunnerLspPayload {

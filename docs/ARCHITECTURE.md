@@ -155,13 +155,18 @@ MCP / OpenAPI / Runtime HTTP --> ToolRuntime --+--> Project resolution --> Runne
 Runtime Console -----------------------> canonical Server HTTP/kernel paths above
 ```
 
-- `route_metadata` — canonical HTTP route identity, security/surface metadata,
-  and OpenAPI exposure. Public Action operation policy is bound directly to its
-  route; Connector routes bind canonical capability identities. Handler mounting
-  stays explicit in the HTTP modules.
-- `runtime_http` — REST runtime routes.
-- `mcp` — the MCP adapter and surface selection.
-- `openapi` — the GPT Actions schema.
+- `route_metadata` — canonical HTTP route identity plus security/surface metadata.
+  Legacy REST routes and the one dynamic GPT Action adapter remain ordinary HTTP
+  routes; generic GPT Action operation identity is no longer stored here.
+  Connector routes still bind canonical Connector capability identities.
+- `runtime_http` — REST runtime routes plus the shared `/api/actions/{tool_name}`
+  adapter. The Action adapter performs transport decoding/admission only and then
+  enters the same ToolRuntime kernel as the canonical runtime path.
+- `mcp` — the primary model-facing adapter and model-surface selection.
+- `openapi` — the generic GPT Actions compatibility projector. It derives direct
+  operations from the canonical Adaptive Runtime direct rank, removes only explicit
+  protocol-incompatible `ToolDefinition` exceptions, and adds `call_runtime_tool`
+  for the supported long tail. Project Connector OpenAPI remains capability-based.
 - `connector_runtime` — the canonical project-bound coding path.
 - `tool_runtime` — protocol-independent tool parsing, dispatch, project
   resolution, registry metadata, sessions, handoff, hygiene, files, Git,
@@ -198,6 +203,26 @@ Static definitions retain their worst-case discovery policy. Trusted recording
 Session provenance is supported, while generic invocation continuity metadata
 receives no specialized semantics. Adding another heterogeneous gateway extends
 this closed dispatch boundary without adding a concrete Kernel policy branch.
+
+### Model-facing tool contract ergonomics
+
+Model-facing tools follow one shared design rule: be strict where meaning,
+authority, identity/fences, retry safety, privacy, or effect truth changes, and be
+tolerant where a recognized parameter only controls bounded presentation or
+resource budgets. Server-known harmless normalization should not consume another
+model turn. Unknown or ambiguous semantic input still fails closed.
+
+Successful projections should foreground sparse business truth; failures should
+be structured and decision-complete. Follow-up calls use one parser-ready
+`{tool, arguments}` representation when the producer can prove the next action,
+while continuation, refinement, failure recovery, and Session context ACK remain
+separate semantic lanes. Duplicate aliases and compatibility projections are not
+kept without a named consumer.
+
+The standing detailed guidance is
+[`agent/tool-contract-guidelines.md`](agent/tool-contract-guidelines.md). Tool
+surface pruning and generalized composition are intentionally downstream of this
+contract/friction cleanup so low usage is not confused with poor ergonomics.
 
 ### Tool audit and privacy policy
 
@@ -265,7 +290,7 @@ The current layers are:
 - **leaf** — `webcodex-core`, `webcodex-process`, `webcodex-computer`, and
   `webcodex-admin`; these do not depend on another workspace package.
 - **domain** — Runner config/registry, Store, Workspace, Workflow Session,
-  Tool contracts, Validation, and Persistent Shell ownership.
+  Tool contracts, Validation, Persistent Shell, and native LSP ownership.
 - **runtime** — `webcodex-runner` and `webcodex-tool-runtime-contracts`.
 - **application** — `webcodex-connector-runtime`, which composes the domain
   crates needed by the project-bound Connector path.
@@ -281,6 +306,8 @@ update rather than silently changing the architecture.
 ## Further reading
 
 - [Resource model and architecture quality exploration](architecture/resource-model-and-quality-review.md) — source-grounded review and staged proposals; not a runtime contract
+- [Model-facing tool contract guidelines](agent/tool-contract-guidelines.md) — turn-economy, normalization, truthfulness, recovery, and compatibility policy
+- [Tool composition research and development plan](architecture/tool-composition-research.md) — later-stage round-trip composition research after primitive contract friction is reduced
 - [Durable Agent runtime and asynchronous work](architecture/durable-agent-runtime.md) — persistent Agent identity and planned asynchronous Agent work
 - [Durable Agent/Conversation/Wake contract](architecture/durable-agent-conversation.md) — current communication implementation
 - [CLI](CLI.md) — commands and terminology

@@ -7,6 +7,7 @@
 
 mod action_tools;
 mod agent_tasks;
+mod agent_waits;
 mod artifacts;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoints;
@@ -57,6 +58,7 @@ pub use super::tool_policy::{
     adaptive_runtime_direct_tool_definitions, exploration_tool_names,
     is_adaptive_runtime_direct_tool, is_model_visible_tool_name, lookup_tool_definition,
     model_visible_tool_definitions, model_visible_tool_names_csv, runtime_tool_accepts_context_ack,
+    runtime_tool_activity_interaction, runtime_tool_activity_semantics,
     runtime_tool_advances_context_checkpoint, runtime_tool_approval_policy,
     runtime_tool_captures_validation_output, runtime_tool_category,
     runtime_tool_effect_annotations, runtime_tool_execution_contract,
@@ -275,6 +277,19 @@ pub type ToolInputSchemaFactory = fn() -> serde_json::Value;
 pub struct ToolModelSpecDeclaration {
     pub description: &'static str,
     pub input_schema: ToolInputSchemaFactory,
+    /// Optional GPT Actions presentation copy. Canonical/MCP descriptions stay
+    /// unchanged; this exists only when the Action importer's 300-character
+    /// operation-description ceiling needs a deliberately shorter rendering.
+    pub gpt_action_description: Option<&'static str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolGptActionExposure {
+    /// Follow the canonical Adaptive Runtime surface automatically.
+    Inherit,
+    /// This tool depends on MCP-only protocol semantics and must not be exposed
+    /// directly or through the GPT Actions gateway.
+    Unsupported,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,11 +298,15 @@ pub struct ToolModelSurfaceDeclaration {
     /// surface. `None` is the default and means a model-visible runtime tool
     /// belongs to the adaptive long tail behind `call_runtime_tool`.
     pub adaptive_runtime_direct_rank: Option<u16>,
+    /// GPT Actions inherits Adaptive Runtime unless a concrete protocol
+    /// incompatibility is declared on the canonical ToolDefinition.
+    pub gpt_action_exposure: ToolGptActionExposure,
 }
 
 impl ToolModelSurfaceDeclaration {
     const DEFAULT: Self = Self {
         adaptive_runtime_direct_rank: None,
+        gpt_action_exposure: ToolGptActionExposure::Inherit,
     };
 }
 
@@ -811,6 +830,91 @@ pub enum ToolOperatorExtensionFamily {
     TraceDiagnostics,
 }
 
+/// User-facing Activity presentation. This is observability metadata only: it
+/// grants no authority and must not be used as a Project-visibility shortcut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolActivityPresentation {
+    Work,
+    Support,
+    Transport,
+}
+
+impl ToolActivityPresentation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Work => "work",
+            Self::Support => "support",
+            Self::Transport => "transport",
+        }
+    }
+}
+
+/// Whether one tool call is a meaningful model/environment interaction for
+/// Window cadence, runtime freshness, recorder-gap, and Goal liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolActivityInteraction {
+    Meaningful,
+    NonMeaningful,
+}
+
+impl ToolActivityInteraction {
+    pub const fn is_meaningful(self) -> bool {
+        matches!(self, Self::Meaningful)
+    }
+}
+
+/// Canonical semantic kind projected into human-facing Activity surfaces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolActivityKind {
+    Read,
+    Search,
+    Navigate,
+    Edit,
+    Run,
+    Test,
+    Review,
+    None,
+}
+
+impl ToolActivityKind {
+    pub const fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::Read => Some("read"),
+            Self::Search => Some("search"),
+            Self::Navigate => Some("navigate"),
+            Self::Edit => Some("edit"),
+            Self::Run => Some("run"),
+            Self::Test => Some("test"),
+            Self::Review => Some("review"),
+            Self::None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolActivityPolicy {
+    pub presentation: ToolActivityPresentation,
+    pub interaction: ToolActivityInteraction,
+    /// Narrow escape hatch for a pre-existing display fact that cannot be
+    /// recovered from the other canonical ToolDefinition evidence.
+    pub kind_override: Option<ToolActivityKind>,
+}
+
+impl ToolActivityPolicy {
+    const DEFAULT: Self = Self {
+        presentation: ToolActivityPresentation::Work,
+        interaction: ToolActivityInteraction::Meaningful,
+        kind_override: None,
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolActivitySemantics {
+    pub presentation: ToolActivityPresentation,
+    pub interaction: ToolActivityInteraction,
+    pub kind: ToolActivityKind,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ToolDefinition {
     pub name: &'static str,
@@ -824,6 +928,7 @@ pub struct ToolDefinition {
     pub category: &'static str,
     pub metadata: ToolMetadata,
     pub policy: ToolDefinitionPolicy,
+    pub activity: ToolActivityPolicy,
     pub session_evidence: ToolSessionEvidencePolicy,
     /// Runner capability/owner requirement before dispatch reaches a Runner-backed
     /// Project. `None` means the tool is not Runner-dispatched or enforces its
@@ -844,9 +949,42 @@ impl ToolDefinition {
         self.execution = Some(execution);
         self
     }
+
+    /// Override only GPT Actions presentation text. This never changes the
+    /// canonical ToolSpec schema, semantic contract, authority, or MCP copy.
+    pub const fn with_gpt_action_description(mut self, description: &'static str) -> Self {
+        if let Some(mut model_spec) = self.model_spec {
+            model_spec.gpt_action_description = Some(description);
+            self.model_spec = Some(model_spec);
+        }
+        self
+    }
+
+    /// Mark a canonical model-visible tool as incompatible with GPT Actions
+    /// transport while leaving every other model/runtime surface unchanged.
+    pub const fn with_gpt_action_unsupported(mut self) -> Self {
+        self.model_surface.gpt_action_exposure = ToolGptActionExposure::Unsupported;
+        self
+    }
+
+    pub const fn with_activity(
+        mut self,
+        presentation: ToolActivityPresentation,
+        interaction: ToolActivityInteraction,
+    ) -> Self {
+        self.activity.presentation = presentation;
+        self.activity.interaction = interaction;
+        self
+    }
+
+    pub const fn with_activity_kind(mut self, kind: ToolActivityKind) -> Self {
+        self.activity.kind_override = Some(kind);
+        self
+    }
 }
 
 pub const TOOL_CATEGORY_AGENT_TASK: &str = "agent_task";
+pub const TOOL_CATEGORY_AGENT_WAIT: &str = "agent_wait";
 pub const TOOL_CATEGORY_ARTIFACT: &str = "artifact";
 pub const TOOL_CATEGORY_CHECKPOINT: &str = "checkpoint";
 pub const TOOL_CATEGORY_CODING_AGENT: &str = "coding_agent";
@@ -1001,6 +1139,7 @@ const fn def(
             shell_like,
         ),
         policy: ToolDefinitionPolicy::DEFAULT,
+        activity: ToolActivityPolicy::DEFAULT,
         session_evidence,
         runner_capability,
     }
@@ -1015,6 +1154,7 @@ const fn model_spec(
         model_spec: Some(ToolModelSpecDeclaration {
             description,
             input_schema,
+            gpt_action_description: None,
         }),
         ..definition
     }
@@ -1024,6 +1164,7 @@ const fn adaptive_runtime_direct(definition: ToolDefinition, rank: u16) -> ToolD
     ToolDefinition {
         model_surface: ToolModelSurfaceDeclaration {
             adaptive_runtime_direct_rank: Some(rank),
+            ..definition.model_surface
         },
         ..definition
     }
@@ -1137,6 +1278,7 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     communication::DEFINITIONS,
     goals::DEFINITIONS,
     agent_tasks::DEFINITIONS,
+    agent_waits::DEFINITIONS,
     memory::DEFINITIONS,
     skills::DEFINITIONS,
     hygiene::DEFINITIONS,
@@ -1187,6 +1329,10 @@ const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[context_reobservable(model_spe
         false,
         false,
         ToolSessionEvidencePolicy::NONE,
+    )
+    .with_activity(
+        ToolActivityPresentation::Support,
+        ToolActivityInteraction::NonMeaningful,
     ),
     "List runtime tools. Full output includes schemas and may be large; use summary_only with category, features, or limit for bounded GPT Action discovery.",
     list_tools_input_schema,

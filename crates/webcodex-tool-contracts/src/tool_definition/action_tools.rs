@@ -39,7 +39,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
             false,
             super::ToolSessionEvidencePolicy::NONE,
         ),
-        "Unified read-only LSP navigation. Actions: status (Runner language-server availability), document_symbols, document_diagnostics (one file), hover, goto_definition, find_references, call_hierarchy (one 1-based position), workspace_symbols (query). Consolidates the former lsp_* tools into one action surface; never starts a server, runs checks, or executes project code.",
+        "Unified read-only LSP navigation. Actions: status, document_symbols, document_diagnostics, hover, goto_definition, find_references, call_hierarchy (one 1-based position), workspace_symbols (query). Consolidates the former lsp_* tools; never starts a server, runs checks, or executes project code.",
         lsp_action_input_schema,
     )),
     adaptive_runtime_direct(
@@ -65,7 +65,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Unified structured validation. Actions: cargo_fmt (ensure-format by default; check=true is pure read-only), cargo_check, cargo_test (scoped flags, executed-test proof), go_test, summary (bounded validation history of one explicit Session). Long validations keep the same execution and return a Job for observation; sync_wait_secs bounds only the synchronous grace. Consolidates the former cargo_*/go_test tools plus validation_summary into one action surface.",
+            "Unified structured validation. Actions: cargo_fmt (check=true read-only), cargo_check, cargo_test (executed-test proof), go_test, summary (bounded history of one Session). Long runs return a Job; sync_wait_secs bounds the synchronous grace. Consolidates cargo_*/go_test/validation_summary.",
             validate_action_input_schema,
         )
         .with_execution(super::ToolExecutionContract::new(
@@ -106,7 +106,7 @@ pub(super) const DEFINITIONS: &[ToolDefinition] = &[
                 false,
                 super::ToolSessionEvidencePolicy::NONE,
             ),
-            "Unified durable Goal control. Actions: create (idempotency-keyed), get, present_plan (sparse read-only MCP App card), list (paged), update (revision CAS plus idempotency key; title/objective/lifecycle/terminal_reason), associate_agent_task and associate_workflow_session (bounded correlations that never grant target-domain authority). Consolidates the former goal tools into one action surface.",
+            "Unified durable Goal control. Actions: create (idempotency-keyed), get, present_plan (read-only App card), list, update (revision CAS plus idempotency key), associate_agent_task, associate_workflow_session (bounded correlations, no target-domain authority). Consolidates the former goal tools.",
             goal_action_input_schema,
         ),
         COMMUNICATION_MANAGE_SCOPES,

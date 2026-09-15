@@ -34,7 +34,7 @@ fn agent_task_store_unavailable() -> ToolResult {
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::UserAction, None)
+    .with_recovery(RecoveryKind::UserAction)
 }
 
 fn agent_task_recovery_kind(
@@ -101,7 +101,7 @@ fn agent_task_error(
             "state_changed": false,
         }),
     )
-    .with_recovery(recovery, None)
+    .with_recovery(recovery)
 }
 
 fn serialized_task_success<T: Serialize>(value: T) -> ToolResult {
@@ -114,7 +114,7 @@ fn serialized_task_success<T: Serialize>(value: T) -> ToolResult {
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::NoAction, None),
+        .with_recovery(RecoveryKind::NoAction),
     }
 }
 
@@ -174,7 +174,7 @@ fn coding_run_observation(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::Reconcile, None)
+        .with_recovery(RecoveryKind::Reconcile)
     })?;
     Ok(AgentTaskCodingRunObservation {
         run_id: run.run_id.clone(),
@@ -291,7 +291,7 @@ fn coding_run_failure_result(
             "state_changed": false,
         }),
     )
-    .with_recovery(failure.recovery, None)
+    .with_recovery(failure.recovery)
 }
 
 fn coding_run_terminal_result(run: &CodingAgentRunSnapshot) -> String {
@@ -389,7 +389,7 @@ impl ToolRuntime {
                     "state_changed": false,
                 }),
             )
-            .with_recovery(RecoveryKind::FixInput, None);
+            .with_recovery(RecoveryKind::FixInput);
         }
         let limit = limit.min(MAX_AGENT_TASK_LIST_LIMIT);
         match db.list_agent_tasks(&principal, assignee_agent_id.as_deref(), offset, limit) {
@@ -554,7 +554,7 @@ impl ToolRuntime {
                     "state_changed": false,
                 }),
             )
-            .with_recovery(RecoveryKind::FixInput, None);
+            .with_recovery(RecoveryKind::FixInput);
         }
         let binding_intent_fingerprint =
             coding_run_binding_fingerprint(&task_id, &attempt_id, &prepared);
@@ -728,6 +728,13 @@ impl ToolRuntime {
                         controller.schedule_agent(&mutation.attempt.assignee_agent_id);
                     }
                 }
+                if mutation.state_changed {
+                    if let Some(controller) = self.agent_continuations.as_ref() {
+                        for agent_id in &mutation.wait_target_agent_ids {
+                            controller.schedule_agent(agent_id);
+                        }
+                    }
+                }
                 let mut output =
                     coding_run_binding_projection(&mutation.binding, mutation.state_changed, false);
                 if let Some(object) = output.as_object_mut() {
@@ -766,7 +773,7 @@ impl ToolRuntime {
                     "state_changed": false,
                 }),
             )
-            .with_recovery(RecoveryKind::FixInput, None);
+            .with_recovery(RecoveryKind::FixInput);
         }
         let principal = match task_principal(auth) {
             Ok(principal) => principal,
@@ -819,7 +826,7 @@ impl ToolRuntime {
                         "state_changed": false,
                     }),
                 )
-                .with_recovery(RecoveryKind::FixInput, None)
+                .with_recovery(RecoveryKind::FixInput)
             }
         };
         let Some(db) = self.communication_db.as_ref() else {
@@ -841,6 +848,13 @@ impl ToolRuntime {
                 if result.state_changed && result.attention_event_count > 0 {
                     if let Some(controller) = self.agent_continuations.as_ref() {
                         controller.schedule_agent(&assignee_agent_id);
+                    }
+                }
+                if result.state_changed {
+                    if let Some(controller) = self.agent_continuations.as_ref() {
+                        for agent_id in &result.wait_target_agent_ids {
+                            controller.schedule_agent(agent_id);
+                        }
                     }
                 }
                 serialized_task_success(result)

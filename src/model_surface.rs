@@ -35,6 +35,33 @@ pub(crate) const TOOL_SURFACE_AVAILABILITY_GATEWAY: &str = "gateway";
 pub(crate) const TOOL_SURFACE_AVAILABILITY_UNAVAILABLE: &str = "unavailable";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdaptiveRuntimeGatewayTargetRoute {
+    Gateway,
+    Direct,
+    Recursive,
+    Unknown,
+}
+
+/// Protocol-neutral routing for one ordinary canonical Adaptive Runtime tool.
+/// This classifies only model-surface availability: adapters may further reject
+/// transport-incompatible tools, while kernel scope/authority/permission checks
+/// remain final and unchanged.
+pub(crate) fn adaptive_runtime_gateway_target_route(
+    target: &str,
+) -> AdaptiveRuntimeGatewayTargetRoute {
+    if target == ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME {
+        return AdaptiveRuntimeGatewayTargetRoute::Recursive;
+    }
+    match ModelSurface::AdaptiveRuntime.runtime_tool_invocation_route(target) {
+        (TOOL_SURFACE_AVAILABILITY_DIRECT, None) => AdaptiveRuntimeGatewayTargetRoute::Direct,
+        (TOOL_SURFACE_AVAILABILITY_GATEWAY, Some(ADAPTIVE_RUNTIME_GATEWAY_TOOL_NAME)) => {
+            AdaptiveRuntimeGatewayTargetRoute::Gateway
+        }
+        _ => AdaptiveRuntimeGatewayTargetRoute::Unknown,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeExposure {
     Runtime(ModelSurface),
     ProjectConnector,
@@ -343,6 +370,7 @@ mod tests {
         "present_agent_continuation",
         "rotate_agent_continuation_endpoint",
         "runtime_status",
+        "wait_for_agent_events",
         "plugin_tool",
         "tool_manifest",
         "search_project_texts",
@@ -388,16 +416,20 @@ mod tests {
                 "session_hint.suggested_next_tool",
                 "session_discussion_summary",
             ),
-            ("observe_jobs", "recovery_tool", "list_jobs"),
+            ("observe_jobs", "items[].suggested_call.tool", "list_jobs"),
             (
                 "run_process",
-                "session_continuity.recovery_tool",
+                "session_continuity.suggested_call.tool",
                 "session_handoff_summary",
             ),
-            ("show_changes", "diff_review_handoff.tool", "git_diff_hunks"),
+            (
+                "show_changes",
+                "diff_review_handoff.recovery.tool",
+                "git_diff_hunks",
+            ),
             (
                 "finish_coding_task",
-                "changes.show_changes.diff_review_handoff.tool",
+                "changes.show_changes.diff_review_handoff.recovery.tool",
                 "git_diff_hunks",
             ),
         ] {

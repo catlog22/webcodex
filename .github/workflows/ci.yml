@@ -211,12 +211,13 @@ jobs:
           - shard: server
             packages: "-p webcodex"
           - shard: runner
-            packages: "-p webcodex-runner"
+            packages: "-p webcodex-runner -p webcodex-lsp --features runner-real-process-tests"
           - shard: workspace-crates
             packages: >-
               --workspace
               --exclude webcodex
               --exclude webcodex-runner
+              --exclude webcodex-lsp
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -243,6 +244,8 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Check MCP App DOM and message-order contracts
+        run: node --test src/mcp_tests/*.test.mjs
       - name: Ensure Python tooling test dependencies
         run: |
           if ! command -v rg >/dev/null 2>&1; then
@@ -385,7 +388,7 @@ jobs:
       - name: Check macOS workspace production surfaces
         run: cargo check --locked --workspace
       - name: Run native macOS Runner and Computer tests
-        run: cargo test --locked -p webcodex-runner -p webcodex-computer
+        run: cargo test --locked -p webcodex-runner -p webcodex-lsp -p webcodex-computer --features runner-real-process-tests
 
   test-macos-desktop:
     needs: changes
@@ -588,7 +591,7 @@ jobs:
         # Even two concurrent test functions can starve bounded startup/timeout windows
         # on loaded Windows hosts. Serialize test functions; concurrency exercised
         # inside each individual test remains unchanged.
-        run: cargo test --locked -p webcodex-runner -p webcodex-computer -- --test-threads=1
+        run: cargo test --locked -p webcodex-runner -p webcodex-lsp -p webcodex-computer --features runner-real-process-tests -- --test-threads=1
 
   test-windows-package:
     needs: changes

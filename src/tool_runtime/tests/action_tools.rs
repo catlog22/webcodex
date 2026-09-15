@@ -109,13 +109,27 @@ fn validate_rejects_result_expectation_on_summary_at_parse() {
 }
 
 #[test]
-fn validate_cargo_fmt_sync_wait_still_requires_check_true() {
+fn validate_cargo_fmt_sync_wait_is_inert_compat_input_without_check_true() {
+    // Mirrors the legacy cargo_fmt surface after the sync_wait_secs check=true
+    // gate was retired: mutating cargo_fmt accepts sync_wait_secs as inert
+    // compatibility input, and zero remains invalid in every mode.
+    for args in [
+        json!({"action": "cargo_fmt", "project": "agent:oe:a", "sync_wait_secs": 5}),
+        json!({"action": "cargo_fmt", "project": "agent:oe:a", "check": false, "sync_wait_secs": 5}),
+    ] {
+        let parsed =
+            ToolCall::from_tool_name("validate", args).unwrap_or_else(|err| panic!("{err}"));
+        assert!(matches!(
+            parsed,
+            ToolCall::Validate(ValidateToolCall::CargoFmt { .. })
+        ));
+    }
     let err = ToolCall::from_tool_name(
         "validate",
-        json!({"action": "cargo_fmt", "project": "agent:oe:a", "sync_wait_secs": 5}),
+        json!({"action": "cargo_fmt", "project": "agent:oe:a", "sync_wait_secs": 0}),
     )
     .unwrap_err();
-    assert!(err.contains("check=true"), "{err}");
+    assert!(err.contains("sync_wait_secs"), "{err}");
     let parsed = ToolCall::from_tool_name(
         "validate",
         json!({

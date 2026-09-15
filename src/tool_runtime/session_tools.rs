@@ -638,6 +638,10 @@ impl ToolRuntime {
                 "session_id": session_id,
                 "messages": observation.messages,
                 "observation_token": observation.observation_token,
+                "continuation_semantics": super::ContinuationSemantics::new(
+                    super::ContinuationKind::Observe,
+                    super::ContinuationCarrier::ObservationToken,
+                ).to_value(),
                 "changed": observation.changed,
                 "wait_outcome": observation.wait_outcome,
                 "waited_ms": observation.waited_ms,
@@ -767,7 +771,7 @@ fn invalid_session_message_observation_request(session_id: &str, message: &str) 
             "state_changed": false,
         }),
     )
-    .with_recovery(RecoveryKind::FixInput, None)
+    .with_recovery(RecoveryKind::FixInput)
 }
 
 fn session_message_observation_error_result(
@@ -790,7 +794,7 @@ fn session_message_observation_error_result(
                 "state_changed": false,
             }),
         )
-        .with_recovery(RecoveryKind::FixInput, None),
+        .with_recovery(RecoveryKind::FixInput),
         sessions::SessionMessageObservationError::InvalidObservationState => {
             ToolResult::err_with_output(
                 "invalid_message_observation_state",
@@ -800,7 +804,7 @@ fn session_message_observation_error_result(
                     "state_changed": false,
                 }),
             )
-            .with_recovery(RecoveryKind::NoAction, None)
+            .with_recovery(RecoveryKind::NoAction)
         }
     }
 }

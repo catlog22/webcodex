@@ -186,18 +186,19 @@ fn tool_specs_describe_default_coding_loop_preferences() {
     let git_diff_hunks_desc = git_diff_hunks.description.to_lowercase();
     for phrase in [
         "targeted/paged",
-        "scope-bound",
-        "replay",
-        "scope",
-        "paging inputs",
-        "later records",
+        "scope/fence-bound",
         "max_page_bytes",
         "raw producer page",
         "512 kib",
         "final model-facing",
-        "hunk_line_limit",
-        "larger max_hunk_lines",
-        "narrower paths",
+        "next complete-line fragment",
+        "parser-ready suggested_call",
+        "next_continuation",
+        "recovery.continuation",
+        "later-record only",
+        "recovery.omitted_lines",
+        "bounded refinement",
+        "exact hunk-fragment token",
     ] {
         assert!(
             git_diff_hunks_desc.contains(phrase),
@@ -210,16 +211,18 @@ fn tool_specs_describe_default_coding_loop_preferences() {
         .expect("git_diff_hunks continuation description")
         .to_lowercase();
     for phrase in [
-        "repeat the exact original",
+        "later-record page cursor",
+        "next complete-line fragment",
+        "scope/fence-bound",
+        "parser-ready suggested_call",
+        "exact original effective scope/paging inputs",
         "base_commit/head_commit",
         "cached/worktree mode",
         "paths",
         "max_hunks",
         "max_hunk_lines",
         "max_page_bytes",
-        "later records",
-        "scope-bound",
-        "does not reconstruct",
+        "later-record and hunk-fragment continuations remain distinct identities",
     ] {
         assert!(
             continuation_desc.contains(phrase),
@@ -605,6 +608,7 @@ fn model_preference_upper_bounds_are_clamped_by_runtime_not_rejected_by_schema()
         ("workspace_symbols", &["limit"]),
         ("goto_definition", &["limit"]),
         ("find_references", &["limit"]),
+        ("call_hierarchy", &["limit"]),
         ("computer_list_windows", &["limit"]),
         ("computer_list_displays", &["limit"]),
         ("computer_list_applications", &["limit"]),
@@ -636,6 +640,26 @@ fn model_preference_upper_bounds_are_clamped_by_runtime_not_rejected_by_schema()
             );
         }
     }
+}
+
+#[test]
+fn call_hierarchy_schema_keeps_traversal_strict_and_result_budget_clamped() {
+    let specs = registered_tool_specs();
+    let spec = spec_named(&specs, "call_hierarchy");
+    let properties = spec.input_schema["properties"].as_object().unwrap();
+
+    assert_eq!(properties["depth"]["minimum"], 1);
+    assert_eq!(properties["depth"]["maximum"], 2);
+    assert_eq!(properties["depth"]["default"], 1);
+
+    assert_eq!(properties["limit"]["minimum"], 1);
+    assert!(properties["limit"].get("maximum").is_none());
+    assert_eq!(properties["limit"]["default"], 50);
+    let description = properties["limit"]["description"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(description.contains("above 100"), "{description}");
+    assert!(description.contains("clamped to 100"), "{description}");
 }
 
 #[test]
@@ -902,5 +926,30 @@ fn session_tool_specs_describe_explicit_targeting() {
             !names.contains(&removed),
             "removed Session tool leaked into specs: {removed}"
         );
+    }
+}
+
+#[test]
+fn observe_jobs_wake_policy_schema_is_closed_and_compatible() {
+    let specs = registered_tool_specs();
+    let spec = specs
+        .iter()
+        .find(|spec| spec.name == "observe_jobs")
+        .unwrap();
+    let wake = &spec.input_schema["properties"]["wake_on"];
+    assert_eq!(wake["enum"], serde_json::json!(["change", "terminal"]));
+    assert_eq!(wake["default"], "change");
+    assert!(!spec.input_schema["required"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("wake_on")));
+    for phrase in [
+        "No token",
+        "no wait_secs",
+        "wake_on=change",
+        "wake_on=terminal",
+        "changed=true",
+    ] {
+        assert!(spec.description.contains(phrase), "missing {phrase}");
     }
 }
