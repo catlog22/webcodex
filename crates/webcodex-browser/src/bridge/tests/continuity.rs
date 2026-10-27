@@ -13,6 +13,12 @@ fn external_document_replacement_and_collector_recovery_preserve_lease() {
         while let Ok(command) = protocol::read_blocking(&mut stream, MAX_RESPONSE, false) {
             let method = command["request"]["method"].as_str().unwrap();
             lock(&observed).push(method.to_string());
+            // 析构发送的单向 detach 没有等待响应的路由，夹具收到后结束，
+            // 避免与 BridgeServer 同时关闭套接字时再写入响应。
+            if method == "detach" && command["channel"] == 0 {
+                assert_eq!(command["request"]["id"], 0);
+                break;
+            }
             let result = match method {
                 "Page.navigate" | "Page.reload" => {
                     document += 1;

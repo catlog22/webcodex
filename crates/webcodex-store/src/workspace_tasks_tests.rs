@@ -68,6 +68,21 @@ fn tasks_persist_and_fence_workspace_identity_retries_and_concurrent_edits() {
     assert_eq!(updated.revision, 2);
     assert_eq!(updated.status, WorkspaceTaskStatus::Done);
     assert_eq!(updated.completion_summary, "Validated and finished");
+    for revision in [0, i64::MAX as u64, u64::MAX] {
+        let mut invalid = update();
+        invalid.expected_revision = revision;
+        assert_eq!(
+            db.update_workspace_task(project, "root-a", invalid)
+                .unwrap_err()
+                .code,
+            "workspace_task_revision_invalid"
+        );
+    }
+    assert_eq!(
+        db.read_workspace_task(project, "root-a", &task.task_id)
+            .unwrap(),
+        updated
+    );
     assert_eq!(
         db.update_workspace_task(project, "root-a", update())
             .unwrap_err()

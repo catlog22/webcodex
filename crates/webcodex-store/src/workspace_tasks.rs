@@ -61,6 +61,7 @@ fn status_text(status: WorkspaceTaskStatus) -> &'static str {
 }
 
 fn task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceTask> {
+    let revision: i64 = row.get(5)?;
     let status: String = row.get(4)?;
     let status = match status.as_str() {
         "open" => WorkspaceTaskStatus::Open,
@@ -75,7 +76,8 @@ fn task_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceTask> {
         title: row.get(2)?,
         description: row.get(3)?,
         status,
-        revision: row.get(5)?,
+        revision: u64::try_from(revision)
+            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(5, revision))?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
         completion_summary: row.get(8)?,
@@ -199,7 +201,7 @@ impl Database {
                     project,
                     root,
                     query.status.map(status_text),
-                    limit + 1,
+                    limit as i64 + 1,
                     offset,
                     query.query
                 ],
@@ -222,7 +224,13 @@ impl Database {
             .map_err(storage_error)?;
         let next_offset = (tasks.len() > limit).then(|| (offset as usize).saturating_add(limit));
         tasks.truncate(limit);
-        let total = conn.query_row("SELECT COUNT(*) FROM workspace_tasks WHERE project=?1 AND root_fingerprint=?2 AND (?3 IS NULL OR status=?3) AND (?4 IS NULL OR instr(title, ?4)>0)", params![project, root, query.status.map(status_text), query.query], |row| row.get::<_, usize>(0)).map_err(storage_error)?;
+        let total = conn.query_row("SELECT COUNT(*) FROM workspace_tasks WHERE project=?1 AND root_fingerprint=?2 AND (?3 IS NULL OR status=?3) AND (?4 IS NULL OR instr(title, ?4)>0)", params![project, root, query.status.map(status_text), query.query], |row| row.get::<_, i64>(0)).map_err(storage_error)?;
+        let total = usize::try_from(total).map_err(|_| {
+            error(
+                "workspace_task_storage_unavailable",
+                "Workspace task count cannot be represented",
+            )
+        })?;
         Ok(WorkspaceTaskPage {
             tasks,
             total,
@@ -261,6 +269,15 @@ impl Database {
     ) -> Result<WorkspaceTask, WorkspaceTaskError> {
         validate_scope(project, root)?;
         validate_content(&update.title, &update.description)?;
+        let expected_revision = i64::try_from(update.expected_revision)
+            .ok()
+            .filter(|revision| *revision > 0 && *revision < i64::MAX)
+            .ok_or_else(|| {
+                error(
+                    "workspace_task_revision_invalid",
+                    "Revision is outside SQLite's supported update range",
+                )
+            })?;
         if update.completion_summary.chars().count() > 2000
             || update.completion_summary.len() > 8000
             || update
@@ -287,7 +304,7 @@ impl Database {
                 "The task changed; read it again before editing",
             ));
         }
-        tx.execute("UPDATE workspace_tasks SET title=?1, description=?2, status=?3, revision=revision+1, updated_at=?4, completion_summary=?7 WHERE task_id=?5 AND revision=?6", params![update.title.trim(), update.description, status_text(update.status), chrono::Utc::now().timestamp(), update.task_id, update.expected_revision, update.completion_summary]).map_err(storage_error)?;
+        tx.execute("UPDATE workspace_tasks SET title=?1, description=?2, status=?3, revision=revision+1, updated_at=?4, completion_summary=?7 WHERE task_id=?5 AND revision=?6", params![update.title.trim(), update.description, status_text(update.status), chrono::Utc::now().timestamp(), update.task_id, expected_revision, update.completion_summary]).map_err(storage_error)?;
         let task = tx
             .query_row(
                 &format!("SELECT {COLUMNS} FROM workspace_tasks WHERE task_id=?1"),
