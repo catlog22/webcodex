@@ -432,6 +432,7 @@ impl ToolCall {
 
     pub fn tool_name(&self) -> &'static str {
         match self {
+            Self::CompleteWorkspaceTask { .. } => "complete_workspace_task",
             Self::ListTools { .. } => "list_tools",
             Self::StartSession { .. } => "start_session",
             Self::WorkOnProject { .. } => "work_on_project",
@@ -793,7 +794,8 @@ impl ToolCall {
 
     pub fn project(&self) -> Option<&str> {
         match self {
-            Self::ListSessions { project, .. }
+            Self::CompleteWorkspaceTask { project, .. }
+            | Self::ListSessions { project, .. }
             | Self::RecordExternalObservation { project, .. }
             | Self::ListExternalObservations { project, .. } => Some(project),
             #[cfg(feature = "experimental-code-mode")]

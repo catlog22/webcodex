@@ -29,6 +29,7 @@ mod window_activity;
 mod window_collaboration;
 mod window_history_benchmark;
 mod window_visibility;
+mod workspace_tasks;
 
 fn project(id: &str, private_path: &str) -> RunnerProjectSummary {
     RunnerProjectSummary {

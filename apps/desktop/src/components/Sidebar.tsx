@@ -12,10 +12,10 @@ import { AppearanceControls } from "../../../../frontend/src/ui/AppearanceContro
 import { BrandMark } from "../../../../frontend/src/ui/BrandMark";
 import { ActionIcon, Menu, Tooltip } from "@mantine/core";
 import { Languages } from "lucide-react";
-export type Navigation = "home" | "projects" | "connection" | "extensions" | "activity" | "settings" | "console";
-export const NAVIGATION: Navigation[] = ["home", "projects", "activity", "connection", "extensions", "settings", "console"];
+export type Navigation = "home" | "projects" | "connection" | "extensions" | "activity" | "settings" | "console" | "tasks";
+export const NAVIGATION: Navigation[] = ["home", "projects", "activity", "connection", "extensions", "settings", "console", "tasks"];
 const NAVIGATION_GROUPS: Array<{ label: "nav.work" | "nav.configure"; items: Navigation[] }> = [
-  { label: "nav.work", items: ["home", "projects", "activity", "console"] },
+  { label: "nav.work", items: ["home", "projects", "tasks", "activity", "console"] },
   { label: "nav.configure", items: ["connection", "extensions", "settings"] },
 ];
 export function Sidebar({ state, navigation, setNavigation }: { state: DesktopState; navigation: Navigation; setNavigation: (page: Navigation) => void }) {
@@ -40,7 +40,7 @@ export function Sidebar({ state, navigation, setNavigation }: { state: DesktopSt
               <span className="nav-group-label">{t(group.label)}</span>
               {group.items.map((item) => {
                 const index = NAVIGATION.indexOf(item);
-                const label = item === "connection" ? c("connections") : item === "console" ? p("runtimeConsole") : t(`nav.${item}`);
+                const label = item === "tasks" ? p("workspaceTasks") : item === "connection" ? c("connections") : item === "console" ? p("runtimeConsole") : t(`nav.${item}`);
                 return <button
                   key={item}
                   className={navigation === item ? "active" : ""}

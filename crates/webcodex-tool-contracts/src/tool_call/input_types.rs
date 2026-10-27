@@ -5,6 +5,7 @@ pub enum WebcodexResourceKind {
     File,
     Goal,
     Artifact,
+    WorkspaceTask,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]

@@ -219,3 +219,16 @@ fn source_fence_capacity_does_not_evict_active_writers() {
     writer.finish(&noop());
     assert!(registry.capture("p").unwrap().quiescent);
 }
+
+#[test]
+fn workspace_task_completion_is_not_a_source_mutation() {
+    let call = crate::tool_runtime::ToolCall::from_tool_name(
+        "complete_workspace_task",
+        serde_json::json!({
+            "project":"agent:r:p", "task_id":"wc_wtask_test", "expected_revision":1,
+            "expected_root_fingerprint":"root", "completion_summary":"Work report only",
+        }),
+    )
+    .unwrap();
+    assert!(!observes_potential_mutation(&call));
+}

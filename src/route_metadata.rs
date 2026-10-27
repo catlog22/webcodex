@@ -97,6 +97,7 @@ pub(crate) enum RouteId {
     RuntimeConsoleGoals,
     RuntimeConsoleGoal,
     RuntimeConsoleExtensions,
+    RuntimeConsoleWorkspaceTasks,
     RuntimeConsoleInstruction,
     RuntimeConsoleProjectGit,
     RuntimeConsolePluginReload,

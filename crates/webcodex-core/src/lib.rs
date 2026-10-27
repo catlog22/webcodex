@@ -45,6 +45,7 @@ pub mod ssh_resource;
 pub mod task_outputs;
 pub mod validation_bridge;
 pub mod validation_evidence;
+pub mod workspace_task;
 
 #[cfg(test)]
 mod validation_evidence_tests;

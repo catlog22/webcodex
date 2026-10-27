@@ -6,6 +6,20 @@
     deny_unknown_fields
 )]
 pub enum ToolCall {
+    /// 写回工作区待办的完成总结；不会执行代码或证明验证已通过。
+    CompleteWorkspaceTask {
+        #[schemars(length(min = 1, max = 512))]
+        project: String,
+        #[schemars(length(min = 1, max = 128))]
+        task_id: String,
+        #[schemars(range(min = 1))]
+        expected_revision: u64,
+        #[schemars(length(min = 1, max = 256))]
+        expected_root_fingerprint: String,
+        #[schemars(length(min = 1, max = 2000))]
+        completion_summary: String,
+    },
+
     /// List registered tool runtime tools.
     ListTools {
         /// Optional read_tool_manifest category filter such as artifact, edit, session, git, or runtime.
@@ -2035,7 +2049,7 @@ pub enum ToolCall {
         session_id: Option<String>,
     },
 
-    /// Search bounded authorized resources. File and artifact searches require an explicit project;
+    /// Search bounded authorized resources. File, workspace_task and artifact searches require an explicit project;
     /// artifact search additionally requires an exact retained Workflow Session.
     SearchWebcodexResources {
         /// Project discovery only: Runner filter before paging.

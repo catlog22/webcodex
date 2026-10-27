@@ -160,3 +160,13 @@ A Full Runtime consists of the Server, Runner, and the Runner's observed Project
 Desktop restart resumes the saved Server/Runner identity and Connections without registering a Project. Concrete Runtime Projects appear when model-driven work resolves a workspace path. A complete online Runner inventory is authoritative for those registrations; Desktop may reconcile stale display history, but the normal Desktop UI does not mutate Project registration state.
 
 Project directories, Git files, and Runner policy remain separate concerns: lazy Project registration creates or reuses runtime identity for an already-authorized path and does not broaden `allowed_roots`.
+
+## Workspace tasks
+
+Open **Workspace tasks** in the sidebar and explicitly choose a registered workspace.
+Create a task with its title and instructions, or open a task to edit its content
+and status. Marking a task done requires a completion summary. Changes use the
+observed revision; if another client edits it, your draft is kept and you must
+reopen the latest task before saving. Tasks are shared with authorized CLI/MCP
+callers and do not run automatically. See [CLI workspace tasks](CLI.md#workspace-tasks)
+for command examples and remote completion writeback.

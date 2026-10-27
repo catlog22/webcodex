@@ -192,3 +192,14 @@ mod tests {
         assert_eq!(catalog(Ok(json!({"skills":[]})))["available"], true);
     }
 }
+
+#[handler]
+pub(super) async fn workspace_tasks(req: &mut Request, depot: &mut Depot) -> ConsoleResult {
+    let (runtime, auth) = prepared(req, depot).await?;
+    let request: webcodex_core::workspace_task::WorkspaceTaskRequest =
+        parse_console_json(req).await?;
+    Ok(Json(
+        serde_json::to_value(runtime.workspace_task_request(request, Some(&auth)).await)
+            .map_err(|_| RuntimeConsoleError::Internal)?,
+    ))
+}

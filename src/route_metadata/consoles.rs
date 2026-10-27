@@ -67,6 +67,15 @@ pub(super) const PUBLIC_WEB_ROUTES: &[RouteSpec] = &[
 // Runtime Console routes use ordinary delegated runtime/project/session scopes.
 pub(super) const ROUTES: &[RouteSpec] = &[
     route(
+        RuntimeConsoleWorkspaceTasks,
+        Post,
+        "/api/runtime-console/workspace-tasks",
+        Require(SCOPE_PROJECT_READ),
+        RuntimeConsole,
+        Other,
+        AuthMiddleware,
+    ),
+    route(
         RuntimeConsoleExtensions,
         Post,
         "/api/runtime-console/extensions",

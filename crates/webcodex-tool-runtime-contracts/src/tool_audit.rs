@@ -122,6 +122,18 @@ pub trait ToolCallAuditProjection {
 impl ToolCallAuditProjection for ToolCall {
     fn session_log_arguments(&self) -> Value {
         match self {
+            Self::CompleteWorkspaceTask {
+                project,
+                task_id,
+                expected_revision,
+                completion_summary,
+                ..
+            } => serde_json::json!({
+                "project": project,
+                "task_id": task_id,
+                "expected_revision": expected_revision,
+                "summary_bytes": completion_summary.len(),
+            }),
             Self::OpenWebcodexWorkbench { .. } => serde_json::json!({"workbench_open":true}),
             Self::SearchWebcodexResources {
                 kind,

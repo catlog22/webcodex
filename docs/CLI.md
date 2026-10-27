@@ -489,3 +489,43 @@ are preserved and reported as `tunnel_legacy_owner_unverifiable`: they contain n
 identity, so even risk acknowledgment cannot prove that no old executor remains alive.
 They require separate operator reconciliation; this command does not silently migrate or
 remove them. No credential or public execution scope is added.
+
+## Workspace tasks
+
+`webcodex task` records workspace todos on the selected Server. It never starts
+execution, creates an Agent Task, or completes a Workflow Session. Tasks are
+visible to callers authorized for the same exact Project/root identity;
+mutations additionally require Project write permission. The Desktop **Workspace
+tasks** page uses the same records for viewing, creating, editing and completion.
+
+```bash
+webcodex task add --workspace . --title "Investigate the build" --description-file task.txt --idempotency-key build-investigation-1 --json
+webcodex task list --workspace . --json
+webcodex task show --workspace . --task-id <task-id> --json
+webcodex task update --workspace . --task-id <task-id> --expected-revision 1 --status in_progress
+webcodex task complete --workspace . --task-id <task-id> --expected-revision 2 --summary-file summary.txt
+```
+
+Connection defaults come from the selected Runner `--profile` (default `default`);
+use `--config`, `--server-url`, `--client-id` and `--token-file` as needed.
+`--workspace` defaults to the current local directory and resolves an existing
+registration; it does not register or execute a Project. For an exact remote
+workspace use `--project agent:<runner>:<project>` instead of `--workspace`.
+Credentials are read from files, never passed as command-line token values.
+Description/summary file input accepts `-` for bounded UTF-8 stdin.
+
+States are `open`, `in_progress`, `done`, and `cancelled`. Completing requires a
+non-empty `completion_summary` (at most 2,000 characters/8,000 UTF-8 bytes), retained
+by `task show` and JSON output. Descriptions are limited to 8,000 characters/32,000
+UTF-8 bytes. Lists support `--query`, `--status`, `--offset`, and `--limit` (up to
+50), with a returned `next_offset`; each workspace retains at most 1,000 tasks.
+Reuse the same add idempotency key and content after an uncertain response.
+Editing/completion requires the observed revision; conflicts require a fresh
+read, and replacing a workspace root cannot retarget old task requests.
+
+MCP discovery reuses `search_webcodex_resources(kind="workspace_task", project=...)`;
+`read_webcodex_resource(uri=...)` returns current task content and the root fence.
+Use `complete_workspace_task` with that exact Project, task ID, revision, root
+fingerprint and completion summary to write back the result. It is discovered
+through `read_tool_manifest` and normally called through `call_runtime_tool`.
+A completion summary is a work report, not execution or validation proof.
