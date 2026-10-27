@@ -2,12 +2,10 @@ use super::agent_attention::{
     attention_events_for_attempt, AGENT_ATTENTION_EVENT_KIND_AGENT_TASK_TERMINAL,
 };
 use super::agent_task::{AgentTaskState, NewAgentTask};
-use super::agent_wake::{AgentWakeState, AGENT_WAKE_ID_PREFIX, WAKE_TRIGGER_ATTENTION_EVENT};
-use super::communication::{
-    CommunicationPrincipal, NewAgentEndpoint, NewAgentIdentity,
-    COMMUNICATION_PRINCIPAL_DIGEST_PREFIX,
-};
+use super::agent_wake::{AgentWakeState, WAKE_TRIGGER_ATTENTION_EVENT};
+use super::communication::{NewAgentEndpoint, NewAgentIdentity};
 use super::goal::{GoalCorrelationKind, GoalLifecycle, GoalPatch, NewGoal, MAX_GOAL_CORRELATIONS};
+use super::store_primitives::{CommunicationPrincipal, COMMUNICATION_PRINCIPAL_DIGEST_PREFIX};
 use super::Database;
 use rusqlite::params;
 
@@ -83,12 +81,26 @@ fn create_goal_and_link(
     key: &str,
     now: i64,
 ) -> String {
+    create_goal_and_link_with_controller(db, owner, task_id, None, key, now)
+}
+
+fn create_goal_and_link_with_controller(
+    db: &Database,
+    owner: &CommunicationPrincipal,
+    task_id: &str,
+    controller_agent_id: Option<&str>,
+    key: &str,
+    now: i64,
+) -> String {
     let goal_id = db
         .create_goal_at(
             owner,
             NewGoal {
+                completion_conditions: Vec::new(),
+                steps: Vec::new(),
                 title: format!("Goal {key}"),
                 objective: "Keep high-level intent separate from task execution truth.".to_string(),
+                controller_agent_id: controller_agent_id.map(str::to_string),
                 idempotency_key: format!("goal-{key}"),
             },
             now,
@@ -205,10 +217,16 @@ fn correlated_success_is_atomic_replay_safe_and_never_mutates_goal() {
     let event = &first_events[0];
     assert_eq!(event.kind, AGENT_ATTENTION_EVENT_KIND_AGENT_TASK_TERMINAL);
     assert_eq!(event.goal_id, goal_id);
-    assert_eq!(event.task_id, task_id);
-    assert_eq!(event.task_attempt_id, attempt_id);
+    assert_eq!(event.task_id(), Some(task_id.as_str()));
+    assert_eq!(event.task_attempt_id(), Some(attempt_id.as_str()));
     assert_eq!(event.target_agent_id, assignee);
-    assert_eq!(event.terminal_task_state, AgentTaskState::Succeeded);
+    assert!(matches!(
+        event.source,
+        super::agent_attention::AgentAttentionSource::AgentTaskTerminal {
+            terminal_task_state: AgentTaskState::Succeeded,
+            ..
+        }
+    ));
     let wake_id = wake_id_for_event(&db, &event.event_id);
     let wake = db.agent_wake(&wake_id).unwrap().unwrap();
     assert_eq!(wake.trigger_kind, WAKE_TRIGGER_ATTENTION_EVENT);
@@ -301,6 +319,227 @@ fn correlated_success_is_atomic_replay_safe_and_never_mutates_goal() {
 }
 
 #[test]
+fn explicit_controller_equal_worker_routes_one_replay_safe_attention() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("controller-equal-worker.db")).unwrap();
+    let owner = principal('a');
+    let worker = create_agent(&db, &owner, "equal-controller-worker");
+    let (task_id, attempt_id, fence) =
+        create_task_and_attempt(&db, &owner, &worker, "equal-controller", T0);
+    create_goal_and_link_with_controller(
+        &db,
+        &owner,
+        &task_id,
+        Some(&worker),
+        "equal-controller",
+        T0 + 2,
+    );
+
+    let completed = db
+        .complete_agent_task_attempt_at(
+            &owner,
+            &task_id,
+            &attempt_id,
+            &worker,
+            &fence,
+            1,
+            AgentTaskState::Succeeded,
+            Some("equal controller result"),
+            None,
+            "complete-equal-controller",
+            T0 + 4,
+        )
+        .unwrap();
+    assert_eq!(completed.attention_event_count, 1);
+    assert_eq!(completed.attention_target_agent_ids, vec![worker.clone()]);
+    let first = events(&db, &attempt_id);
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].target_agent_id, worker);
+    assert_eq!(attention_wake_count(&db, &attempt_id), 1);
+
+    let replay = db
+        .complete_agent_task_attempt_at(
+            &owner,
+            &task_id,
+            &attempt_id,
+            &worker,
+            &fence,
+            1,
+            AgentTaskState::Succeeded,
+            Some("equal controller result"),
+            None,
+            "complete-equal-controller",
+            T0 + 5,
+        )
+        .unwrap();
+    assert!(replay.replayed);
+    assert_eq!(replay.attention_event_count, 0);
+    assert!(replay.attention_target_agent_ids.is_empty());
+    assert_eq!(events(&db, &attempt_id), first);
+    assert_eq!(attention_wake_count(&db, &attempt_id), 1);
+}
+
+#[test]
+fn explicit_controller_routes_worker_terminal_and_historical_wake_does_not_retarget() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("controller-route.db")).unwrap();
+    let owner = principal('b');
+    let worker = create_agent(&db, &owner, "route-worker");
+    let controller = create_agent(&db, &owner, "route-controller");
+    let replacement = create_agent(&db, &owner, "route-replacement");
+    let (task_id, attempt_id, fence) =
+        create_task_and_attempt(&db, &owner, &worker, "controller-route", T0);
+    let goal_id = create_goal_and_link_with_controller(
+        &db,
+        &owner,
+        &task_id,
+        Some(&controller),
+        "controller-route",
+        T0 + 2,
+    );
+
+    let completed = db
+        .complete_agent_task_attempt_at(
+            &owner,
+            &task_id,
+            &attempt_id,
+            &worker,
+            &fence,
+            1,
+            AgentTaskState::Succeeded,
+            Some("worker terminal result"),
+            None,
+            "complete-controller-route",
+            T0 + 4,
+        )
+        .unwrap();
+    assert_eq!(completed.attention_event_count, 1);
+    assert_eq!(
+        completed.attention_target_agent_ids,
+        vec![controller.clone()]
+    );
+    let emitted = events(&db, &attempt_id);
+    assert_eq!(emitted.len(), 1);
+    assert_eq!(emitted[0].target_agent_id, controller);
+    assert_ne!(emitted[0].target_agent_id, worker);
+    let wake_id = wake_id_for_event(&db, &emitted[0].event_id);
+    assert_eq!(
+        db.agent_wake(&wake_id).unwrap().unwrap().target_agent_id,
+        controller
+    );
+
+    let changed = db
+        .update_goal_at(
+            &owner,
+            &goal_id,
+            2,
+            GoalPatch {
+                controller_agent_id: Some(replacement.clone()),
+                ..GoalPatch::default()
+            },
+            "replace-controller-after-terminal-event",
+            T0 + 5,
+        )
+        .unwrap();
+    assert_eq!(changed.goal.summary.revision, 3);
+    assert_eq!(
+        changed.goal.controller_agent_id.as_deref(),
+        Some(replacement.as_str())
+    );
+    assert_eq!(events(&db, &attempt_id)[0].target_agent_id, controller);
+    assert_eq!(attention_wake_count(&db, &attempt_id), 1);
+
+    for (agent_id, suffix) in [(&worker, "worker"), (&replacement, "replacement")] {
+        let endpoint = db
+            .attach_agent_endpoint(
+                &owner,
+                NewAgentEndpoint {
+                    agent_id: agent_id.clone(),
+                    host: "ChatGPT".to_string(),
+                    client_attachment_id: Some(format!("route-{suffix}-window")),
+                    wake_capable: true,
+                    idempotency_key: format!("route-{suffix}-endpoint"),
+                },
+            )
+            .unwrap()
+            .endpoint;
+        assert!(db
+            .claim_next_agent_wake(
+                &owner,
+                agent_id,
+                &endpoint.endpoint_id,
+                endpoint.controller_generation,
+                "mcp_app",
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    let endpoint = db
+        .attach_agent_endpoint(
+            &owner,
+            NewAgentEndpoint {
+                agent_id: controller.clone(),
+                host: "ChatGPT".to_string(),
+                client_attachment_id: Some("route-controller-window".to_string()),
+                wake_capable: true,
+                idempotency_key: "route-controller-endpoint".to_string(),
+            },
+        )
+        .unwrap()
+        .endpoint;
+    let claim = db
+        .claim_next_agent_wake(
+            &owner,
+            &controller,
+            &endpoint.endpoint_id,
+            endpoint.controller_generation,
+            "mcp_app",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.wake.wake_id, wake_id);
+    let prepared = db
+        .prepare_agent_wake_dispatch(
+            &owner,
+            &controller,
+            &endpoint.endpoint_id,
+            endpoint.controller_generation,
+            &wake_id,
+            &claim.attempt.attempt_id,
+            &claim.claim_fence,
+            &claim.consume_token,
+        )
+        .unwrap();
+    assert!(prepared
+        .envelope
+        .resume_hint
+        .contains(&format!("agent_id={controller}")));
+    assert!(prepared.envelope.resume_hint.contains(&goal_id));
+    assert!(prepared.envelope.resume_hint.contains("get_goal(goal_id)"));
+    assert!(prepared
+        .envelope
+        .resume_hint
+        .contains("read_agent_task(task_id)"));
+    assert!(prepared
+        .envelope
+        .resume_hint
+        .contains("explicit next Goal decision"));
+    assert!(!prepared
+        .envelope
+        .resume_hint
+        .contains("grants no Goal, Task, Project, Runner"));
+    assert_eq!(
+        db.read_goal(&owner, &goal_id)
+            .unwrap()
+            .controller_agent_id
+            .as_deref(),
+        Some(replacement.as_str())
+    );
+    assert_eq!(attention_wake_count(&db, &attempt_id), 1);
+}
+
+#[test]
 fn failed_task_fans_out_to_every_active_goal_and_survives_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("multi-goal.db");
@@ -321,6 +560,8 @@ fn failed_task_fans_out_to_every_active_goal_and_survives_reopen() {
                 GoalPatch {
                     title: None,
                     objective: None,
+                    completion_conditions: None,
+                    controller_agent_id: None,
                     lifecycle: Some(GoalLifecycle::Completed),
                     terminal_reason: Some(
                         "Completed independently before Task terminalized".to_string(),
@@ -348,11 +589,16 @@ fn failed_task_fans_out_to_every_active_goal_and_survives_reopen() {
             )
             .unwrap();
         assert_eq!(completed.attention_event_count, 2);
+        assert_eq!(completed.attention_target_agent_ids, vec![assignee.clone()]);
         let emitted = events(&db, &attempt_id);
         assert_eq!(emitted.len(), 2);
-        assert!(emitted
-            .iter()
-            .all(|event| event.terminal_task_state == AgentTaskState::Failed));
+        assert!(emitted.iter().all(|event| matches!(
+            event.source,
+            super::agent_attention::AgentAttentionSource::AgentTaskTerminal {
+                terminal_task_state: AgentTaskState::Failed,
+                ..
+            }
+        )));
         let emitted_goals = emitted
             .iter()
             .map(|event| event.goal_id.clone())
@@ -509,9 +755,17 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
     let db = Database::open(&temp.path().join("carrier.db")).unwrap();
     let owner = principal('7');
     let assignee = create_agent(&db, &owner, "carrier-worker");
+    let controller = create_agent(&db, &owner, "carrier-controller");
     let (task_id, attempt_id, fence) =
         create_task_and_attempt(&db, &owner, &assignee, "carrier", T0);
-    let goal_id = create_goal_and_link(&db, &owner, &task_id, "carrier", T0 + 2);
+    let goal_id = create_goal_and_link_with_controller(
+        &db,
+        &owner,
+        &task_id,
+        Some(&controller),
+        "carrier",
+        T0 + 2,
+    );
     db.complete_agent_task_attempt_at(
         &owner,
         &task_id,
@@ -527,6 +781,7 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
     )
     .unwrap();
     let event = events(&db, &attempt_id).pop().unwrap();
+    assert_eq!(event.target_agent_id, controller);
     let wake_id = wake_id_for_event(&db, &event.event_id);
 
     let terminal_goal = db
@@ -537,6 +792,8 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
             GoalPatch {
                 title: None,
                 objective: None,
+                completion_conditions: None,
+                controller_agent_id: None,
                 lifecycle: Some(GoalLifecycle::Completed),
                 terminal_reason: Some("Another turn completed the Goal first".to_string()),
             },
@@ -553,7 +810,7 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
         .attach_agent_endpoint(
             &owner,
             NewAgentEndpoint {
-                agent_id: assignee.clone(),
+                agent_id: controller.clone(),
                 host: "ChatGPT".to_string(),
                 client_attachment_id: Some("attention-carrier".to_string()),
                 wake_capable: true,
@@ -565,7 +822,7 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
     let claim = db
         .claim_next_agent_wake(
             &owner,
-            &assignee,
+            &controller,
             &endpoint.endpoint_id,
             endpoint.controller_generation,
             "mcp_app",
@@ -578,7 +835,7 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
     let prepared = db
         .prepare_agent_wake_dispatch(
             &owner,
-            &assignee,
+            &controller,
             &endpoint.endpoint_id,
             endpoint.controller_generation,
             &wake_id,
@@ -596,7 +853,7 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
     assert!(prepared
         .envelope
         .resume_hint
-        .contains(&format!("agent_id={assignee}")));
+        .contains(&format!("agent_id={controller}")));
     assert!(prepared
         .envelope
         .resume_hint
@@ -617,27 +874,32 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
         .envelope
         .resume_hint
         .contains("terminal_task_state=succeeded"));
+    let hint = &prepared.envelope.resume_hint;
     for required_semantic in [
-        "already dispatched by the Endpoint continuation carrier",
-        "OMIT activation_idempotency_key",
-        "Require the returned Wake to remain attention_event",
-        "Do not call start_agent_task_endpoint_continuation",
-        "consume this exact Wake",
-        "does not require a TaskAttempt lease or heartbeat",
-        "independently get_goal(goal_id) and read_agent_task(task_id)",
-        "grants no Goal, Task, Project, Runner, filesystem, Conversation, or Workflow Session authority",
-        "make an explicit Goal decision",
-        "Never repeat a terminal Task",
-        "does not auto-complete Goals or auto-create successor Tasks",
-        "report the actual decision/result/blocker",
+        "bootstrap_agent_conversation",
+        "consume_agent_wake",
+        "get_goal(goal_id)",
+        "read_agent_task(task_id)",
+        "explicit next Goal decision",
+        "Never rerun the terminal Task",
+        "reopen a terminal Goal",
     ] {
-        assert!(prepared.envelope.resume_hint.contains(required_semantic));
+        assert!(hint.contains(required_semantic));
     }
-    assert!(!prepared
-        .envelope
-        .resume_hint
-        .contains("heartbeat_agent_task_attempt"));
-    assert!(prepared.envelope.resume_hint.len() < 2_000);
+    for removed_prose in [
+        "already dispatched by the Endpoint continuation carrier",
+        "never infer or retarget identities",
+        "grants no Goal, Task, Project, Runner",
+        "does not auto-complete Goals",
+    ] {
+        assert!(!hint.contains(removed_prose));
+    }
+    assert!(!hint.contains("heartbeat_agent_task_attempt"));
+    assert!(
+        hint.chars().count() <= 1_200,
+        "Goal attention hint too long: {}",
+        hint.chars().count()
+    );
     assert!(!prepared
         .envelope
         .resume_hint
@@ -646,7 +908,7 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
     let bootstrap = db
         .bootstrap_agent_conversation(
             &owner,
-            &assignee,
+            &controller,
             &endpoint.endpoint_id,
             endpoint.controller_generation,
             None,
@@ -663,7 +925,7 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
         Some(attempt_id.as_str())
     );
 
-    let bogus_event_id = format!("wc_attention_event_{}", "f".repeat(32));
+    let bogus_event_id = "wc_attention_event_________________".to_string();
     db.conn_for_tests()
         .execute(
             "UPDATE wc_agent_wakes SET source_event_id = ?2 WHERE wake_id = ?1",
@@ -673,7 +935,7 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
     assert_eq!(
         db.bootstrap_agent_conversation(
             &owner,
-            &assignee,
+            &controller,
             &endpoint.endpoint_id,
             endpoint.controller_generation,
             None,
@@ -701,7 +963,7 @@ fn terminal_attention_uses_continuation_without_requiring_live_task_attempt() {
     let consumed = db
         .consume_agent_wake(
             &owner,
-            &assignee,
+            &controller,
             &endpoint.endpoint_id,
             endpoint.controller_generation,
             &wake_id,
@@ -752,9 +1014,12 @@ fn active_goal_fanout_is_bounded_before_completion_and_maximum_fanout_is_determi
         .create_goal_at(
             &owner,
             NewGoal {
+                completion_conditions: Vec::new(),
+                steps: Vec::new(),
                 title: "Fanout overflow".to_string(),
                 objective: "Must fail before creating an unbounded terminal attention fanout."
                     .to_string(),
+                controller_agent_id: None,
                 idempotency_key: "goal-fanout-overflow".to_string(),
             },
             T0 + 1_000,
@@ -825,104 +1090,106 @@ fn active_goal_fanout_is_bounded_before_completion_and_maximum_fanout_is_determi
 }
 
 #[test]
-fn legacy_wake_schema_migration_preserves_existing_task_wake() {
+fn goal_workflow_attention_reopen_preserves_task_fact_and_exact_wake_carrier() {
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("legacy-wake.db");
-    let owner = principal('8');
-    let legacy_wake_id = format!("{AGENT_WAKE_ID_PREFIX}{}", "a".repeat(32));
-    let (assignee, task_id, attempt_id) = {
-        let db = Database::open(&path).unwrap();
-        let assignee = create_agent(&db, &owner, "legacy-worker");
-        let (task_id, attempt_id, _fence) =
-            create_task_and_attempt(&db, &owner, &assignee, "legacy", T0);
-        let conn = db.conn_for_tests();
-        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute_batch(
-            "DROP TABLE wc_agent_wake_attempts;
-             DROP TABLE wc_agent_wakes;
-             CREATE TABLE wc_agent_wakes (
-                wake_id TEXT PRIMARY KEY,
-                target_agent_id TEXT NOT NULL,
-                trigger_kind TEXT NOT NULL,
-                first_triggering_delivery_id TEXT,
-                latest_triggering_delivery_id TEXT,
-                latest_conversation_id TEXT,
-                latest_message_id TEXT,
-                inbox_high_watermark INTEGER,
-                queued_delivery_count_snapshot INTEGER,
-                source_task_id TEXT,
-                source_task_attempt_id TEXT,
-                state TEXT NOT NULL,
-                revision INTEGER NOT NULL,
-                created_at_unix_ms INTEGER NOT NULL,
-                updated_at_unix_ms INTEGER NOT NULL,
-                claimed_attempt_id TEXT,
-                claimed_endpoint_id TEXT,
-                claimed_controller_generation INTEGER,
-                claim_lease_expires_at_unix_ms INTEGER,
-                consumed_at_unix_ms INTEGER,
-                consumed_by_endpoint_id TEXT,
-                consumed_controller_generation INTEGER
-             );
-             CREATE TABLE wc_agent_wake_attempts (
-                attempt_id TEXT PRIMARY KEY,
-                wake_id TEXT NOT NULL,
-                endpoint_id TEXT NOT NULL,
-                controller_generation INTEGER NOT NULL,
-                adapter_kind TEXT NOT NULL,
-                state TEXT NOT NULL,
-                claim_fence_hash TEXT NOT NULL,
-                consume_token_hash TEXT NOT NULL,
-                claimed_at_unix_ms INTEGER NOT NULL,
-                claim_lease_expires_at_unix_ms INTEGER NOT NULL,
-                prepared_at_unix_ms INTEGER,
-                delivered_at_unix_ms INTEGER,
-                delivery_unknown_at_unix_ms INTEGER,
-                revoked_at_unix_ms INTEGER,
-                consumed_at_unix_ms INTEGER
-             );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO wc_agent_wakes (
-                wake_id, target_agent_id, trigger_kind,
-                first_triggering_delivery_id, latest_triggering_delivery_id,
-                latest_conversation_id, latest_message_id,
-                inbox_high_watermark, queued_delivery_count_snapshot,
-                source_task_id, source_task_attempt_id,
-                state, revision, created_at_unix_ms, updated_at_unix_ms,
-                claimed_attempt_id, claimed_endpoint_id,
-                claimed_controller_generation, claim_lease_expires_at_unix_ms,
-                consumed_at_unix_ms, consumed_by_endpoint_id,
-                consumed_controller_generation
-             ) VALUES (?1, ?2, 'agent_task_attempt', NULL, NULL, NULL, NULL, NULL, NULL,
-                       ?3, ?4, 'pending', 1, ?5, ?5, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
-            params![legacy_wake_id, assignee, task_id, attempt_id, T0 + 2],
-        )
-        .unwrap();
-        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
-        drop(conn);
-        (assignee, task_id, attempt_id)
-    };
-
+    let path = temp.path().join("attention-goal-workflow-reopen.db");
+    let db = Database::open(&path).unwrap();
+    let owner = principal('a');
+    let worker = create_agent(&db, &owner, "migration-worker");
+    let (task_id, attempt_id, fence) =
+        create_task_and_attempt(&db, &owner, &worker, "migration", T0);
+    let goal_id = create_goal_and_link(&db, &owner, &task_id, "migration", T0 + 2);
+    db.complete_agent_task_attempt_at(
+        &owner,
+        &task_id,
+        &attempt_id,
+        &worker,
+        &fence,
+        1,
+        AgentTaskState::Succeeded,
+        Some("done"),
+        None,
+        "migration-complete",
+        T0 + 3,
+    )
+    .unwrap();
+    let original_event = events(&db, &attempt_id).remove(0);
+    let original_wake = wake_id_for_event(&db, &original_event.event_id);
+    drop(db);
     let reopened = Database::open(&path).unwrap();
-    let wake = reopened.agent_wake(&legacy_wake_id).unwrap().unwrap();
-    assert_eq!(wake.target_agent_id, assignee);
-    assert_eq!(wake.trigger_kind, "agent_task_attempt");
-    assert_eq!(wake.source_task_id.as_deref(), Some(task_id.as_str()));
+    assert_eq!(events(&reopened, &attempt_id), vec![original_event.clone()]);
     assert_eq!(
-        wake.source_task_attempt_id.as_deref(),
-        Some(attempt_id.as_str())
+        wake_id_for_event(&reopened, &original_event.event_id),
+        original_wake
     );
-    assert_eq!(wake.source_event_id, None);
-    assert_eq!(wake.state, AgentWakeState::Pending);
-    let has_source_event: bool = reopened
-        .conn_for_tests()
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('wc_agent_wakes') WHERE name = 'source_event_id')",
-            [],
-            |row| row.get(0),
+    assert_eq!(attention_wake_count(&reopened, &attempt_id), 1);
+    assert_eq!(
+        reopened
+            .read_goal(&owner, &goal_id)
+            .unwrap()
+            .summary
+            .lifecycle,
+        GoalLifecycle::Active
+    );
+    assert_eq!(
+        reopened
+            .conn_for_tests()
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap(),
+        0
+    );
+    let endpoint = reopened
+        .attach_agent_endpoint(
+            &owner,
+            NewAgentEndpoint {
+                agent_id: worker.clone(),
+                host: "test".into(),
+                client_attachment_id: Some("migration-carrier".into()),
+                wake_capable: true,
+                idempotency_key: "migration-endpoint".into(),
+            },
+        )
+        .unwrap()
+        .endpoint;
+    let claim = reopened
+        .claim_next_agent_wake(
+            &owner,
+            &worker,
+            &endpoint.endpoint_id,
+            endpoint.controller_generation,
+            "mcp_app",
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(claim.wake.wake_id, original_wake);
+    let prepared = reopened
+        .prepare_agent_wake_dispatch(
+            &owner,
+            &worker,
+            &endpoint.endpoint_id,
+            endpoint.controller_generation,
+            &original_wake,
+            &claim.attempt.attempt_id,
+            &claim.claim_fence,
+            &claim.consume_token,
         )
         .unwrap();
-    assert!(has_source_event);
+    assert!(prepared.envelope.resume_hint.contains(&task_id));
+    assert!(prepared.envelope.resume_hint.contains(&goal_id));
+    assert_eq!(
+        reopened
+            .consume_agent_wake(
+                &owner,
+                &worker,
+                &endpoint.endpoint_id,
+                endpoint.controller_generation,
+                &original_wake,
+                &claim.consume_token
+            )
+            .unwrap()
+            .state,
+        AgentWakeState::Consumed
+    );
 }

@@ -13,6 +13,7 @@ async fn register_with_connection(
     registry
         .register_streaming_session(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 process_started_at: None,
                 build: None,
                 job_concurrency_limit: None,
@@ -200,20 +201,10 @@ async fn stale_connection_poll_cannot_steal_new_request() {
     // Start an async job (queued -> agent_queued only on dispatch).
     let job = registry
         .start_job(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
-                cwd: None,
-                command: Some("sleep 1".to_string()),
-                timeout_secs: Some(1),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("oe", "sleep 1", Some(1)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -364,6 +355,7 @@ async fn stale_connection_runtime_metadata_does_not_overwrite_current() {
         registry
             .register_streaming_session(
                 RunnerRegisterRequest {
+                    computer_session_availability: None,
                     process_started_at: None,
                     build: None,
                     job_concurrency_limit: None,
@@ -528,20 +520,10 @@ async fn stale_connection_disconnect_cleanup_is_noop_for_current_lease() {
     register_with_connection(&registry, "oe", "inst-x", "conn-a").await;
     let job = registry
         .start_job(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("oe", "sleep 10", Some(10)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -602,6 +584,7 @@ async fn late_result_on_stale_connection_is_accepted_without_refreshing_liveness
     let (request_id, rx) = registry
         .enqueue_run(
             ShellRunRequest {
+                login: false,
                 client_id: "oe".to_string(),
                 cwd: None,
                 command: "echo hi".to_string(),
@@ -646,6 +629,8 @@ async fn late_result_on_stale_connection_is_accepted_without_refreshing_liveness
                 exit_code: Some(0),
                 stdout: Some("hi".to_string()),
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             }
@@ -668,6 +653,7 @@ async fn late_result_on_stale_connection_is_accepted_without_refreshing_liveness
     let (_new_request_id, _new_rx) = registry
         .enqueue_run(
             ShellRunRequest {
+                login: false,
                 client_id: "oe".to_string(),
                 cwd: None,
                 command: "echo two".to_string(),
@@ -719,20 +705,10 @@ async fn late_job_update_on_stale_connection_is_accepted_without_refreshing_live
     register_with_connection(&registry, "oe", "inst-x", "conn-a").await;
     let job = registry
         .start_job(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("oe", "sleep 10", Some(10)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -770,14 +746,15 @@ async fn late_job_update_on_stale_connection_is_accepted_without_refreshing_live
                 status: "running".to_string(),
                 stdout_chunk: None,
                 stderr_chunk: None,
-                stdout_tail: None,
-                stderr_tail: None,
                 log_snapshot: None,
                 exit_code: None,
                 duration_ms: None,
                 error: None,
                 command_execution_state: None,
                 validation_progress: None,
+                test_count_evidence: None,
+                format_mutation: None,
+                build_artifacts: None,
                 activity: None,
                 finished: false,
             },
@@ -813,14 +790,15 @@ async fn late_job_update_on_stale_connection_is_accepted_without_refreshing_live
             status: "completed".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(1),
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: true,
         })

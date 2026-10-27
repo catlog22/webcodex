@@ -146,11 +146,13 @@ fn create_agent(
 ) -> String {
     let result = runtime.create_agent_identity(
         None,
-        handle.to_string(),
-        display_name.to_string(),
-        Some(description.to_string()),
-        vec![label.to_string()],
-        key.to_string(),
+        webcodex_tool_contracts::CreateAgentIdentityInput {
+            handle: handle.to_string(),
+            display_name: display_name.to_string(),
+            description: Some(description.to_string()),
+            specialty_labels: vec![label.to_string()],
+            idempotency_key: key.to_string(),
+        },
     );
     assert!(result.success, "{:?}", result.output);
     result.output["agent"]["agent_id"]
@@ -162,10 +164,12 @@ fn create_agent(
 fn attach(runtime: &ToolRuntime, agent_id: &str, key: &str) -> (String, i64) {
     let result = runtime.attach_agent_endpoint(
         None,
-        agent_id.to_string(),
-        "Deterministic Host".to_string(),
-        Some(format!("attachment-{key}")),
-        key.to_string(),
+        webcodex_tool_contracts::RotateAgentContinuationEndpointInput {
+            agent_id: agent_id.to_string(),
+            host: "Deterministic Host".to_string(),
+            client_attachment_id: Some(format!("attachment-{key}")),
+            idempotency_key: key.to_string(),
+        },
     );
     assert!(result.success, "{:?}", result.output);
     assert_eq!(result.output["endpoint"]["wake_capable"], false);
@@ -183,9 +187,11 @@ fn attach(runtime: &ToolRuntime, agent_id: &str, key: &str) -> (String, i64) {
 fn create_conversation(runtime: &ToolRuntime, agent_a: &str, agent_b: &str, key: &str) -> String {
     let result = runtime.create_conversation(
         None,
-        Some("Natural durable conversation".to_string()),
-        vec![agent_a.to_string(), agent_b.to_string()],
-        key.to_string(),
+        webcodex_tool_contracts::CreateConversationInput {
+            title: Some("Natural durable conversation".to_string()),
+            agent_ids: vec![agent_a.to_string(), agent_b.to_string()],
+            idempotency_key: key.to_string(),
+        },
     );
     assert!(result.success, "{:?}", result.output);
     result.output["conversation"]["conversation"]["conversation_id"]
@@ -209,16 +215,18 @@ fn post_as_agent(
 ) -> Value {
     let result = runtime.post_conversation_message(
         None,
-        conversation_id.to_string(),
-        body.to_string(),
-        Some(author_agent_id.to_string()),
-        Some(endpoint_id.to_string()),
-        Some(controller_generation),
-        Some(vec![recipient_agent_id.to_string()]),
-        None,
-        idempotency_key.map(ToOwned::to_owned),
-        wake_reply_id.map(ToOwned::to_owned),
-        reply_operation_index,
+        webcodex_tool_contracts::PostConversationMessageInput {
+            conversation_id: conversation_id.to_string(),
+            body: body.to_string(),
+            author_agent_id: Some(author_agent_id.to_string()),
+            endpoint_id: Some(endpoint_id.to_string()),
+            expected_controller_generation: Some(controller_generation),
+            recipient_agent_ids: Some(vec![recipient_agent_id.to_string()]),
+            reply_to: None,
+            idempotency_key: idempotency_key.map(ToOwned::to_owned),
+            wake_reply_id: wake_reply_id.map(ToOwned::to_owned),
+            reply_operation_index: reply_operation_index,
+        },
     );
     assert!(result.success, "{:?}", result.output);
     result.output
@@ -284,7 +292,10 @@ fn bind_mcp_app(
     endpoint_id: &str,
     generation: i64,
 ) -> String {
-    let binding_id = format!("wc_host_binding_{}", uuid::Uuid::new_v4().simple());
+    let binding_id = format!(
+        "wc_host_binding_{}",
+        webcodex_core::compact::random_suffix::<16>()
+    );
     let result = runtime.agent_continuation_bind(
         None,
         agent_id.to_string(),
@@ -294,6 +305,21 @@ fn bind_mcp_app(
     );
     assert!(result.success, "{:?}", result.output);
     binding_id
+}
+
+fn listed_agent(runtime: &ToolRuntime, agent_id: &str) -> Value {
+    let result = runtime.list_agent_identities(
+        None,
+        webcodex_tool_contracts::ListAgentIdentitiesInput {
+            agent_id: Some(agent_id.to_string()),
+            offset: None,
+            limit: None,
+        },
+    );
+    assert!(result.success, "{:?}", result.output);
+    let agents = result.output["agents"].as_array().unwrap();
+    assert_eq!(agents.len(), 1);
+    agents[0].clone()
 }
 
 fn acquire_mcp_app(
@@ -576,6 +602,194 @@ fn natural_agent_message_dispatches_once_and_burst_remains_bounded_and_private()
 }
 
 #[test]
+fn model_workflow_confirmation_policy_never_creates_binding_readiness_or_changes_endpoint_state() {
+    use crate::model_workflow::ModelWorkflowPolicy;
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(&temp.path().join("confirmation.db")).unwrap());
+    let runtime = runtime_with_db(db.clone());
+    let agent = create_agent(
+        &runtime,
+        "confirmation",
+        "Confirmation",
+        "description",
+        "label",
+        "confirmation-agent",
+    );
+    let (endpoint, generation) = attach(&runtime, &agent, "confirmation-endpoint");
+    let declared = ModelWorkflowPolicy::from_values(None, Some("unattended")).unwrap();
+    let unbound = runtime.clone().with_model_workflow_policy(declared);
+    assert_eq!(
+        listed_agent(&unbound, &agent)["production_auto_resume_available"],
+        false
+    );
+    bind_mcp_app(&runtime, &agent, &endpoint, generation);
+    assert_eq!(
+        listed_agent(&runtime, &agent)["production_auto_resume_available"],
+        false,
+        "a message-capable binding alone cannot prove confirmation-free continuation"
+    );
+    let fingerprint = endpoint_recovery_fingerprint(&db, &endpoint);
+    for goal in ["on_demand", "preferred"] {
+        for mode in ["unknown", "user_confirmed", "unattended"] {
+            let configured = runtime.clone().with_model_workflow_policy(
+                ModelWorkflowPolicy::from_values(Some(goal), Some(mode)).unwrap(),
+            );
+            assert_eq!(
+                listed_agent(&configured, &agent)["production_auto_resume_available"],
+                mode == "unattended"
+            );
+            let status = configured
+                .agent_continuations
+                .as_ref()
+                .unwrap()
+                .binding_status(&agent, &endpoint, generation);
+            assert!(
+                status.adapter_registered,
+                "policy does not withdraw the message channel"
+            );
+            assert_eq!(
+                status.production_auto_resume_available,
+                mode == "unattended"
+            );
+            assert_eq!(endpoint_recovery_fingerprint(&db, &endpoint), fingerprint);
+        }
+    }
+    // Builder order cannot lose the declared policy; a new controller still has
+    // no live binding and must not inherit readiness from another runtime.
+    let before_store = ToolRuntime::new_for_tests()
+        .with_model_workflow_policy(declared)
+        .with_communication_database(db);
+    assert_eq!(before_store.model_workflow_policy, declared);
+    assert!(
+        !before_store
+            .agent_continuations
+            .as_ref()
+            .unwrap()
+            .binding_status(&agent, &endpoint, generation)
+            .production_auto_resume_available
+    );
+}
+
+#[test]
+fn agent_listing_projects_only_current_production_continuation_readiness() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(&temp.path().join("readiness.db")).unwrap());
+    // This fixture models a separately declared unattended deployment, not API presence.
+    let runtime = runtime_with_db(db.clone()).with_model_workflow_policy(
+        crate::model_workflow::ModelWorkflowPolicy::from_values(None, Some("unattended")).unwrap(),
+    );
+
+    let ready = create_agent(
+        &runtime,
+        "ready",
+        "Ready Agent",
+        "ready description",
+        "ready-label",
+        "readiness-ready-agent",
+    );
+    let (ready_endpoint, ready_generation) = attach(&runtime, &ready, "readiness-ready-endpoint");
+    let unbound = listed_agent(&runtime, &ready);
+    assert_eq!(unbound["active_endpoint_count"], 1);
+    assert_eq!(unbound["production_auto_resume_available"], false);
+
+    bind_mcp_app(&runtime, &ready, &ready_endpoint, ready_generation);
+    let bound = listed_agent(&runtime, &ready);
+    assert_eq!(bound["active_endpoint_count"], 1);
+    assert_eq!(bound["production_auto_resume_available"], true);
+
+    let other = create_agent(
+        &runtime,
+        "other",
+        "Other Agent",
+        "other description",
+        "other-label",
+        "readiness-other-agent",
+    );
+    let (_other_endpoint, _other_generation) = attach(&runtime, &other, "readiness-other-endpoint");
+    let other_listing = listed_agent(&runtime, &other);
+    assert_eq!(other_listing["active_endpoint_count"], 1);
+    assert_eq!(
+        other_listing["production_auto_resume_available"], false,
+        "another Agent's process-local Host binding must never cross-wire readiness"
+    );
+
+    let detached = create_agent(
+        &runtime,
+        "detached",
+        "Detached Agent",
+        "detached description",
+        "detached-label",
+        "readiness-detached-agent",
+    );
+    let (detached_endpoint, detached_generation) =
+        attach(&runtime, &detached, "readiness-detached-endpoint");
+    bind_mcp_app(&runtime, &detached, &detached_endpoint, detached_generation);
+    assert_eq!(
+        listed_agent(&runtime, &detached)["production_auto_resume_available"],
+        true
+    );
+    let detached_result = runtime.detach_agent_endpoint(
+        None,
+        webcodex_tool_contracts::DetachAgentEndpointInput {
+            endpoint_id: detached_endpoint.clone(),
+        },
+    );
+    assert!(detached_result.success, "{:?}", detached_result.output);
+    let detached_listing = listed_agent(&runtime, &detached);
+    assert_eq!(detached_listing["active_endpoint_count"], 0);
+    assert_eq!(detached_listing["production_auto_resume_available"], false);
+
+    let expired = create_agent(
+        &runtime,
+        "expired",
+        "Expired Agent",
+        "expired description",
+        "expired-label",
+        "readiness-expired-agent",
+    );
+    let (expired_endpoint, expired_generation) =
+        attach(&runtime, &expired, "readiness-expired-endpoint");
+    bind_mcp_app(&runtime, &expired, &expired_endpoint, expired_generation);
+    db.conn_for_tests()
+        .execute(
+            "UPDATE wc_agent_endpoints SET lease_expires_at_unix_ms = 0 WHERE endpoint_id = ?1",
+            [&expired_endpoint],
+        )
+        .unwrap();
+    let expired_listing = listed_agent(&runtime, &expired);
+    assert_eq!(expired_listing["active_endpoint_count"], 0);
+    assert_eq!(
+        expired_listing["production_auto_resume_available"], false,
+        "an expired durable Endpoint must fail closed even while its local binding still exists"
+    );
+
+    let stale = create_agent(
+        &runtime,
+        "stale",
+        "Stale Agent",
+        "stale description",
+        "stale-label",
+        "readiness-stale-agent",
+    );
+    let (stale_endpoint, stale_generation) = attach(&runtime, &stale, "readiness-stale-endpoint");
+    bind_mcp_app(&runtime, &stale, &stale_endpoint, stale_generation);
+    db.conn_for_tests()
+        .execute(
+            "UPDATE wc_agent_identities
+             SET current_controller_generation = current_controller_generation + 1
+             WHERE agent_id = ?1",
+            [&stale],
+        )
+        .unwrap();
+    let stale_listing = listed_agent(&runtime, &stale);
+    assert_eq!(stale_listing["active_endpoint_count"], 0);
+    assert_eq!(
+        stale_listing["production_auto_resume_available"], false,
+        "a stale generation must not remain continuation-ready"
+    );
+}
+
+#[test]
 fn offline_restart_and_replacement_dispatch_the_same_logical_wake() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("restart.db");
@@ -631,11 +845,19 @@ fn offline_restart_and_replacement_dispatch_the_same_logical_wake() {
     drop(runtime);
     drop(db);
     let reopened = Arc::new(Database::open(&path).unwrap());
-    let ownership = crate::server_instance::ServerInstanceGuard::acquire(&reopened).unwrap();
+    let ownership = crate::ServerInstanceGuard::acquire(&reopened).unwrap();
     reopened
         .recover_agent_wakes_for_server_takeover(&ownership, chrono::Utc::now().timestamp_millis())
         .unwrap();
-    let runtime = runtime_with_db(reopened.clone());
+    let runtime = runtime_with_db(reopened.clone()).with_model_workflow_policy(
+        crate::model_workflow::ModelWorkflowPolicy::from_values(None, Some("unattended")).unwrap(),
+    );
+    let restart_listing = listed_agent(&runtime, &agent_b);
+    assert_eq!(restart_listing["active_endpoint_count"], 1);
+    assert_eq!(
+        restart_listing["production_auto_resume_available"], false,
+        "Server restart must drop process-local continuation readiness"
+    );
     let bootstrap = runtime.bootstrap_agent_conversation(
         None,
         agent_b.clone(),
@@ -669,7 +891,7 @@ fn offline_restart_and_replacement_dispatch_the_same_logical_wake() {
         old_process_registration.output["error_kind"], "endpoint_not_attached_in_process",
         "a successor process cannot assume a pre-restart Host callback survived"
     );
-    let wrong_binding = format!("wc_host_binding_{}", "b".repeat(32));
+    let wrong_binding = "wc_host_binding_u7u7u7u7u7u7u7u7u7u7uw".to_string();
     let wrong_state = runtime.agent_continuation_state(
         None,
         agent_b.clone(),
@@ -733,6 +955,11 @@ fn offline_restart_and_replacement_dispatch_the_same_logical_wake() {
         old_app_registration.output
     );
     assert_eq!(
+        listed_agent(&runtime, &agent_b)["production_auto_resume_available"],
+        true,
+        "successful Host rebind must restore continuation readiness"
+    );
+    assert_eq!(
         old_app_registration.output["agent_continuation"]["host_binding"]["bound"],
         true,
         "the exact fingerprint-proven View may recreate only its MCP App process-local binding after takeover"
@@ -791,10 +1018,12 @@ fn offline_restart_and_replacement_dispatch_the_same_logical_wake() {
     );
     let replayed_old = runtime.attach_agent_endpoint(
         None,
-        agent_b.clone(),
-        "Deterministic Host".to_string(),
-        Some("attachment-restart-endpoint-b".to_string()),
-        "restart-endpoint-b".to_string(),
+        webcodex_tool_contracts::RotateAgentContinuationEndpointInput {
+            agent_id: agent_b.clone(),
+            host: "Deterministic Host".to_string(),
+            client_attachment_id: Some("attachment-restart-endpoint-b".to_string()),
+            idempotency_key: "restart-endpoint-b".to_string(),
+        },
     );
     assert!(replayed_old.success, "{:?}", replayed_old.output);
     assert_eq!(replayed_old.output["replayed"], true);
@@ -829,6 +1058,173 @@ fn offline_restart_and_replacement_dispatch_the_same_logical_wake() {
         bootstrap.output["host_binding"]["adapter_registered"], true,
         "a rejected stale registration must not dislodge the current binding"
     );
+}
+
+#[test]
+fn late_first_chatgpt_mount_recovers_only_from_attaching_host_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(&temp.path().join("late-first-chatgpt.db")).unwrap());
+    let runtime = runtime_with_db(db.clone());
+    let agent = create_agent(
+        &runtime,
+        "late-first-chatgpt",
+        "Late first ChatGPT mount",
+        "test only",
+        "continuation",
+        "late-first-agent",
+    );
+    let origin = crate::client_window::ClientWindow::from_opaque(
+        "openai-session",
+        "late-first-mount-chatgpt-session",
+    )
+    .unwrap();
+    let different = crate::client_window::ClientWindow::from_opaque(
+        "openai-session",
+        "a-different-chatgpt-session",
+    )
+    .unwrap();
+    let created = runtime.attach_agent_endpoint_for_window(
+        None,
+        Some(&origin),
+        webcodex_tool_contracts::RotateAgentContinuationEndpointInput {
+            agent_id: agent.clone(),
+            host: "ChatGPT".into(),
+            client_attachment_id: Some("late-first-view".into()),
+            idempotency_key: "late-first-endpoint".into(),
+        },
+    );
+    assert!(created.success, "{:?}", created.output);
+    assert_eq!(created.output["endpoint"]["wake_capable"], false);
+    let endpoint = created.output["endpoint"]["endpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let generation = created.output["endpoint"]["controller_generation"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(generation, 1);
+    assert_eq!(
+        endpoint_client_window_key(&db, &endpoint).as_deref(),
+        Some(origin.key()),
+    );
+    assert!(endpoint_recovery_fingerprint(&db, &endpoint).is_none());
+    let card =
+        runtime.present_agent_continuation(None, agent.clone(), endpoint.clone(), generation);
+    assert!(card.success, "{:?}", card.output);
+    assert_eq!(
+        card.output["agent_continuation"]["host_binding"]["bound"],
+        false
+    );
+    assert_eq!(
+        endpoint_recovery_fingerprint(&db, &endpoint),
+        None,
+        "presentation must not create a live binding or dispatch",
+    );
+
+    // The Host defers its very first iframe mount past the 120-second lease.
+    db.conn_for_tests()
+        .execute(
+            "UPDATE wc_agent_endpoints SET lease_expires_at_unix_ms = 0
+         WHERE endpoint_id = ?1",
+            [&endpoint],
+        )
+        .unwrap();
+    let foreign = runtime.agent_continuation_recover_endpoint_for_window(
+        None,
+        Some(&different),
+        agent.clone(),
+        endpoint.clone(),
+        generation,
+        "wc_host_binding_IiIiIiIiIiIiIiIiIiIiIg".into(),
+    );
+    assert!(!foreign.success);
+    assert_eq!(foreign.output["error_kind"], "host_binding_stale");
+    let recovered = runtime.agent_continuation_recover_endpoint_for_window(
+        None,
+        Some(&origin),
+        agent.clone(),
+        endpoint.clone(),
+        generation,
+        "wc_host_binding_MzMzMzMzMzMzMzMzMzMzMw".into(),
+    );
+    assert!(recovered.success, "{:?}", recovered.output);
+    assert_eq!(
+        recovered.output["endpoint_recovery"]["kind"],
+        "endpoint_replaced"
+    );
+    assert_eq!(recovered.output["state_changed"], true);
+    let successor = recovered.output["endpoint_recovery"]["replacement"]["endpoint_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let next_generation = recovered.output["endpoint_recovery"]["replacement"]
+        ["controller_generation"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(next_generation, generation + 1);
+    assert_eq!(
+        recovered.output["agent_continuation"]["host_binding"]["bound"], false,
+        "recovery cannot register a Host carrier or wake a model",
+    );
+    assert_eq!(
+        endpoint_client_window_key(&db, &successor).as_deref(),
+        Some(origin.key()),
+    );
+
+    // Only the same canonical Window may mount the recovered Endpoint.
+    let denied = runtime.agent_continuation_bind_for_window(
+        None,
+        Some(&different),
+        agent.clone(),
+        successor.clone(),
+        next_generation,
+        "wc_host_binding_EREREREREREREREREREREQ".into(),
+    );
+    assert!(!denied.success);
+    assert_eq!(denied.output["error_kind"], "host_binding_stale");
+    let accepted = runtime.agent_continuation_bind_for_window(
+        None,
+        Some(&origin),
+        agent,
+        successor,
+        next_generation,
+        "wc_host_binding_EREREREREREREREREREREQ".into(),
+    );
+    assert!(accepted.success, "{:?}", accepted.output);
+    assert_eq!(
+        accepted.output["agent_continuation"]["host_binding"]["bound"],
+        true
+    );
+}
+
+#[test]
+fn non_chatgpt_window_at_attachment_keeps_inert_legacy_behavior() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(Database::open(&temp.path().join("non-host-window.db")).unwrap());
+    let runtime = runtime_with_db(db.clone());
+    let agent = create_agent(
+        &runtime,
+        "non-host-window",
+        "Non-host",
+        "test only",
+        "legacy",
+        "non-host-agent",
+    );
+    let arbitrary = crate::client_window::ClientWindow::for_test("not-chatgpt");
+    let result = runtime.attach_agent_endpoint_for_window(
+        None,
+        Some(&arbitrary),
+        webcodex_tool_contracts::RotateAgentContinuationEndpointInput {
+            agent_id: agent,
+            host: "Desktop".into(),
+            client_attachment_id: None,
+            idempotency_key: "non-host-attach".into(),
+        },
+    );
+    assert!(result.success, "{:?}", result.output);
+    let endpoint = result.output["endpoint"]["endpoint_id"].as_str().unwrap();
+    assert!(endpoint_client_window_key(&db, endpoint).is_none());
+    assert_eq!(result.output["endpoint"]["wake_capable"], false);
 }
 
 #[test]
@@ -874,7 +1270,7 @@ fn mcp_app_restart_recovery_fingerprint_fences_replaced_and_unbound_views() {
     drop(runtime);
     drop(db);
     let reopened = Arc::new(Database::open(&path).unwrap());
-    let ownership = crate::server_instance::ServerInstanceGuard::acquire(&reopened).unwrap();
+    let ownership = crate::ServerInstanceGuard::acquire(&reopened).unwrap();
     reopened
         .recover_agent_wakes_for_server_takeover(&ownership, chrono::Utc::now().timestamp_millis())
         .unwrap();
@@ -893,7 +1289,7 @@ fn mcp_app_restart_recovery_fingerprint_fences_replaced_and_unbound_views() {
     );
     assert!(!stale_a.success);
     assert_eq!(stale_a.output["error_kind"], "host_binding_stale");
-    let wrong_view = format!("wc_host_binding_{}", "f".repeat(32));
+    let wrong_view = "wc_host_binding______________________w".to_string();
     let wrong = runtime.agent_continuation_state(
         None,
         agent.clone(),
@@ -951,7 +1347,7 @@ fn mcp_app_restart_recovery_fingerprint_fences_replaced_and_unbound_views() {
     drop(reopened);
 
     let reopened = Arc::new(Database::open(&path).unwrap());
-    let ownership = crate::server_instance::ServerInstanceGuard::acquire(&reopened).unwrap();
+    let ownership = crate::ServerInstanceGuard::acquire(&reopened).unwrap();
     reopened
         .recover_agent_wakes_for_server_takeover(&ownership, chrono::Utc::now().timestamp_millis())
         .unwrap();
@@ -986,7 +1382,7 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
     let (endpoint, generation) = attach(&runtime, &agent, "restart-refresh-endpoint");
     let window_a = crate::client_window::ClientWindow::for_test("refresh-window-a");
     let window_b = crate::client_window::ClientWindow::for_test("refresh-window-b");
-    let mut old_binding = format!("wc_host_binding_{}", "a".repeat(32));
+    let mut old_binding = "wc_host_binding_qqqqqqqqqqqqqqqqqqqqqg".to_string();
     let initial = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_a),
@@ -1029,14 +1425,14 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
         agent.clone(),
         endpoint.clone(),
         generation,
-        format!("wc_host_binding_{}", "9".repeat(32)),
+        "wc_host_binding_mZmZmZmZmZmZmZmZmZmZmQ".to_string(),
     );
     assert!(!same_process_stale.success);
     assert_eq!(
         same_process_stale.output["error_kind"],
         "host_binding_stale"
     );
-    old_binding = format!("wc_host_binding_{}", "1".repeat(32));
+    old_binding = "wc_host_binding_EREREREREREREREREREREQ".to_string();
     let same_process_refresh = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_a),
@@ -1055,7 +1451,7 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
     drop(runtime);
     drop(db);
     let reopened = Arc::new(Database::open(&path).unwrap());
-    let ownership = crate::server_instance::ServerInstanceGuard::acquire(&reopened).unwrap();
+    let ownership = crate::ServerInstanceGuard::acquire(&reopened).unwrap();
     reopened
         .recover_agent_wakes_for_server_takeover(&ownership, chrono::Utc::now().timestamp_millis())
         .unwrap();
@@ -1143,7 +1539,7 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
         "endpoint_not_attached_in_process"
     );
 
-    let refreshed_binding = format!("wc_host_binding_{}", "b".repeat(32));
+    let refreshed_binding = "wc_host_binding_u7u7u7u7u7u7u7u7u7u7uw".to_string();
     let refreshed = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_a),
@@ -1167,7 +1563,7 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
         foreign_window_state.output["error_kind"],
         "host_binding_stale"
     );
-    let foreign_window_binding = format!("wc_host_binding_{}", "c".repeat(32));
+    let foreign_window_binding = "wc_host_binding_zMzMzMzMzMzMzMzMzMzMzA".to_string();
     let foreign_window_bind = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_b),
@@ -1199,7 +1595,7 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
 
     // Missing Window metadata does not get the Window-continuity path. With the
     // fingerprint cleared by unbind, a new iframe fence remains stale.
-    let no_window_binding = format!("wc_host_binding_{}", "d".repeat(32));
+    let no_window_binding = "wc_host_binding_3d3d3d3d3d3d3d3d3d3d3Q".to_string();
     let no_window = runtime.agent_continuation_bind(
         None,
         agent.clone(),
@@ -1221,7 +1617,7 @@ fn mcp_app_restart_refresh_recovers_only_same_client_window_without_attachment_s
         agent,
         endpoint,
         generation,
-        format!("wc_host_binding_{}", "e".repeat(32)),
+        "wc_host_binding_7u7u7u7u7u7u7u7u7u7u7g".to_string(),
     );
     assert!(!expired.success);
     assert_eq!(expired.output["error_kind"], "endpoint_expired");
@@ -1259,7 +1655,7 @@ fn mcp_app_expired_endpoint_replacement_recovers_same_window_card_and_pending_wa
     );
     let window_a = crate::client_window::ClientWindow::for_test("expired-recovery-window-a");
     let window_b = crate::client_window::ClientWindow::for_test("expired-recovery-window-b");
-    let old_binding = format!("wc_host_binding_{}", "1".repeat(32));
+    let old_binding = "wc_host_binding_EREREREREREREREREREREQ".to_string();
     let bound = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_a),
@@ -1348,14 +1744,14 @@ fn mcp_app_expired_endpoint_replacement_recovers_same_window_card_and_pending_wa
         receiver.clone(),
         endpoint.clone(),
         generation,
-        format!("wc_host_binding_{}", "2".repeat(32)),
+        "wc_host_binding_IiIiIiIiIiIiIiIiIiIiIg".to_string(),
     );
     assert!(!foreign_window.success);
     assert_eq!(foreign_window.output["error_kind"], "host_binding_stale");
 
     // Reopening/refreshing the original Conversation creates a new iframe fence,
     // but the Host sideband still proves the same canonical Window.
-    let refreshed_binding = format!("wc_host_binding_{}", "3".repeat(32));
+    let refreshed_binding = "wc_host_binding_MzMzMzMzMzMzMzMzMzMzMw".to_string();
     let recovered = runtime.agent_continuation_recover_endpoint_for_window(
         None,
         Some(&window_a),
@@ -1439,7 +1835,7 @@ fn mcp_app_expired_endpoint_replacement_recovers_same_window_card_and_pending_wa
         receiver.clone(),
         endpoint.clone(),
         generation,
-        format!("wc_host_binding_{}", "4".repeat(32)),
+        "wc_host_binding_RERERERERERERERERERERA".to_string(),
     );
     assert!(!replay_from_other_window.success);
     assert_eq!(
@@ -1447,7 +1843,7 @@ fn mcp_app_expired_endpoint_replacement_recovers_same_window_card_and_pending_wa
         "communication_idempotency_conflict"
     );
 
-    let new_binding = format!("wc_host_binding_{}", "5".repeat(32));
+    let new_binding = "wc_host_binding_VVVVVVVVVVVVVVVVVVVVVQ".to_string();
     let rebound = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window_a),
@@ -1551,7 +1947,7 @@ fn mcp_app_expired_endpoint_replacement_replays_across_server_restart_without_ex
     );
     let (endpoint, generation) = attach(&runtime, &agent, "expired-restart-endpoint");
     let window = crate::client_window::ClientWindow::for_test("expired-restart-window");
-    let first_binding = format!("wc_host_binding_{}", "6".repeat(32));
+    let first_binding = "wc_host_binding_ZmZmZmZmZmZmZmZmZmZmZg".to_string();
     let bound = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window),
@@ -1583,7 +1979,7 @@ fn mcp_app_expired_endpoint_replacement_replays_across_server_restart_without_ex
     // the dedicated recovery operation, but it grants no ordinary Host binding.
     let reopened = Arc::new(Database::open(&path).unwrap());
     {
-        let ownership = crate::server_instance::ServerInstanceGuard::acquire(&reopened).unwrap();
+        let ownership = crate::ServerInstanceGuard::acquire(&reopened).unwrap();
         reopened
             .recover_agent_wakes_for_server_takeover(
                 &ownership,
@@ -1592,7 +1988,7 @@ fn mcp_app_expired_endpoint_replacement_replays_across_server_restart_without_ex
             .unwrap();
     }
     let runtime = runtime_with_db(reopened.clone());
-    let recovery_binding = format!("wc_host_binding_{}", "7".repeat(32));
+    let recovery_binding = "wc_host_binding_d3d3d3d3d3d3d3d3d3d3dw".to_string();
     let recovered = runtime.agent_continuation_recover_endpoint_for_window(
         None,
         Some(&window),
@@ -1619,7 +2015,7 @@ fn mcp_app_expired_endpoint_replacement_replays_across_server_restart_without_ex
     // same E2/g2, never E3/g3, and the same Window may then bind E2 normally.
     let reopened = Arc::new(Database::open(&path).unwrap());
     {
-        let ownership = crate::server_instance::ServerInstanceGuard::acquire(&reopened).unwrap();
+        let ownership = crate::ServerInstanceGuard::acquire(&reopened).unwrap();
         reopened
             .recover_agent_wakes_for_server_takeover(
                 &ownership,
@@ -1634,7 +2030,7 @@ fn mcp_app_expired_endpoint_replacement_replays_across_server_restart_without_ex
         agent.clone(),
         endpoint,
         generation,
-        format!("wc_host_binding_{}", "8".repeat(32)),
+        "wc_host_binding_iIiIiIiIiIiIiIiIiIiIiA".to_string(),
     );
     assert!(replay.success, "{:?}", replay.output);
     assert_eq!(replay.output["replayed"], true);
@@ -1662,7 +2058,7 @@ fn mcp_app_expired_endpoint_replacement_replays_across_server_restart_without_ex
         stale_push.output["error_kind"],
         "endpoint_not_attached_in_process"
     );
-    let binding = format!("wc_host_binding_{}", "9".repeat(32));
+    let binding = "wc_host_binding_mZmZmZmZmZmZmZmZmZmZmQ".to_string();
     let rebound = runtime.agent_continuation_bind_for_window(
         None,
         Some(&window),
@@ -1725,7 +2121,7 @@ fn push_replacement_clears_mcp_app_restart_recovery_provenance() {
     drop(runtime);
     drop(db);
     let reopened = Arc::new(Database::open(&path).unwrap());
-    let ownership = crate::server_instance::ServerInstanceGuard::acquire(&reopened).unwrap();
+    let ownership = crate::ServerInstanceGuard::acquire(&reopened).unwrap();
     reopened
         .recover_agent_wakes_for_server_takeover(&ownership, chrono::Utc::now().timestamp_millis())
         .unwrap();
@@ -1757,9 +2153,12 @@ fn mcp_app_restart_recovery_never_bypasses_endpoint_lifecycle() {
         &detached.receiver_endpoint,
         detached.receiver_generation,
     );
-    let detached_result = detached
-        .runtime
-        .detach_agent_endpoint(None, detached.receiver_endpoint.clone());
+    let detached_result = detached.runtime.detach_agent_endpoint(
+        None,
+        webcodex_tool_contracts::DetachAgentEndpointInput {
+            endpoint_id: detached.receiver_endpoint.clone(),
+        },
+    );
     assert!(detached_result.success, "{:?}", detached_result.output);
     assert!(endpoint_recovery_fingerprint(&detached.db, &detached.receiver_endpoint).is_none());
     let detached_state = detached.runtime.agent_continuation_state(
@@ -1863,7 +2262,7 @@ fn mcp_app_restart_recovery_preserves_prepared_delivery_unknown_without_redispat
     drop(runtime);
     drop(db);
     let reopened = Arc::new(Database::open(&path).unwrap());
-    let ownership = crate::server_instance::ServerInstanceGuard::acquire(&reopened).unwrap();
+    let ownership = crate::ServerInstanceGuard::acquire(&reopened).unwrap();
     reopened
         .recover_agent_wakes_for_server_takeover(&ownership, chrono::Utc::now().timestamp_millis())
         .unwrap();
@@ -1966,16 +2365,18 @@ fn wake_derived_reply_identity_closes_response_loss_without_merging_consumption(
     assert!(pending_bootstrap.output["reply_replay"].is_null());
     let pending_reply = runtime.post_conversation_message(
         None,
-        conversation_id.clone(),
-        "must activate before using Wake reply identity".to_string(),
-        Some(agent_b.clone()),
-        Some(endpoint_b.clone()),
-        Some(generation_b),
-        Some(vec![agent_a.clone()]),
-        None,
-        None,
-        Some(wake_id.clone()),
-        Some(0),
+        webcodex_tool_contracts::PostConversationMessageInput {
+            conversation_id: conversation_id.clone(),
+            body: "must activate before using Wake reply identity".to_string(),
+            author_agent_id: Some(agent_b.clone()),
+            endpoint_id: Some(endpoint_b.clone()),
+            expected_controller_generation: Some(generation_b),
+            recipient_agent_ids: Some(vec![agent_a.clone()]),
+            reply_to: None,
+            idempotency_key: None,
+            wake_reply_id: Some(wake_id.clone()),
+            reply_operation_index: Some(0),
+        },
     );
     assert!(!pending_reply.success);
     assert_eq!(pending_reply.output["error_kind"], "wake_not_dispatched");
@@ -2041,16 +2442,18 @@ fn wake_derived_reply_identity_closes_response_loss_without_merging_consumption(
 
     let changed = runtime.post_conversation_message(
         None,
-        conversation_id.clone(),
-        "changed replay must conflict".to_string(),
-        Some(agent_b.clone()),
-        Some(replacement_endpoint_b.clone()),
-        Some(replacement_generation_b),
-        Some(vec![agent_a.clone()]),
-        None,
-        None,
-        Some(wake_id.clone()),
-        Some(0),
+        webcodex_tool_contracts::PostConversationMessageInput {
+            conversation_id: conversation_id.clone(),
+            body: "changed replay must conflict".to_string(),
+            author_agent_id: Some(agent_b.clone()),
+            endpoint_id: Some(replacement_endpoint_b.clone()),
+            expected_controller_generation: Some(replacement_generation_b),
+            recipient_agent_ids: Some(vec![agent_a.clone()]),
+            reply_to: None,
+            idempotency_key: None,
+            wake_reply_id: Some(wake_id.clone()),
+            reply_operation_index: Some(0),
+        },
     );
     assert!(!changed.success);
     assert_eq!(
@@ -2071,10 +2474,12 @@ fn wake_derived_reply_identity_closes_response_loss_without_merging_consumption(
         .unwrap();
     let consumed = runtime.consume_agent_deliveries(
         None,
-        agent_b.clone(),
-        replacement_endpoint_b,
-        replacement_generation_b,
-        vec![delivery_id],
+        webcodex_tool_contracts::ConsumeAgentDeliveriesInput {
+            agent_id: agent_b.clone(),
+            endpoint_id: replacement_endpoint_b,
+            expected_controller_generation: replacement_generation_b,
+            delivery_ids: vec![delivery_id],
+        },
     );
     assert!(consumed.success);
     assert_eq!(
@@ -2116,7 +2521,7 @@ fn replacing_push_with_mcp_app_orders_same_generation_host_carriers() {
             receiver,
             endpoint,
             generation,
-            format!("wc_host_binding_{}", "b".repeat(32)),
+            "wc_host_binding_u7u7u7u7u7u7u7u7u7u7uw".to_string(),
         );
         tx.send(result).unwrap();
     });
@@ -2146,7 +2551,7 @@ fn replacing_push_with_mcp_app_orders_same_generation_host_carriers() {
         "replacing a carrier after its dispatch accepted path must preserve conservative post-fence uncertainty"
     );
 
-    let binding_id = format!("wc_host_binding_{}", "b".repeat(32));
+    let binding_id = "wc_host_binding_u7u7u7u7u7u7u7u7u7u7uw".to_string();
     let acquired = acquire_mcp_app(
         &fixture.runtime,
         &fixture.receiver,
@@ -2338,7 +2743,7 @@ fn mcp_app_view_replacement_fences_pre_and_post_dispatch_without_second_lifecycl
 }
 
 #[test]
-fn mcp_app_state_heartbeat_never_renews_consumed_a4b_task_attempt() {
+fn mcp_app_dispatch_grace_then_consume_promotes_and_polling_never_slides() {
     let fixture = mcp_continuation_fixture("mcp-a4b-lease-independence");
     let created = fixture.runtime.create_agent_task(
         None,
@@ -2420,14 +2825,38 @@ fn mcp_app_state_heartbeat_never_renews_consumed_a4b_task_attempt() {
         fixture.receiver_generation,
         binding.clone(),
         wake_id.clone(),
-        wake_attempt_id,
+        wake_attempt_id.clone(),
         "dispatch_accepted".to_string(),
     );
     assert!(host_ack.success, "{:?}", host_ack.output);
+    let dispatch_grace_lease = task_attempt_lease_expires_at(&fixture.db, &task_attempt_id);
+    assert!(
+        dispatch_grace_lease > pre_takeover_lease,
+        "first accepted Host dispatch must establish the bounded scheduling grace"
+    );
+    let host_ack_replay = fixture.runtime.agent_continuation_wake_finish(
+        None,
+        fixture.receiver.clone(),
+        fixture.receiver_endpoint.clone(),
+        fixture.receiver_generation,
+        binding.clone(),
+        wake_id.clone(),
+        wake_attempt_id,
+        "dispatch_accepted".to_string(),
+    );
+    assert!(host_ack_replay.success, "{:?}", host_ack_replay.output);
+    let pre_consume_poll = fixture.runtime.agent_continuation_state(
+        None,
+        fixture.receiver.clone(),
+        fixture.receiver_endpoint.clone(),
+        fixture.receiver_generation,
+        binding.clone(),
+    );
+    assert!(pre_consume_poll.success, "{:?}", pre_consume_poll.output);
     assert_eq!(
         task_attempt_lease_expires_at(&fixture.db, &task_attempt_id),
-        pre_takeover_lease,
-        "Host ui/message acceptance is delivery evidence only and must not renew TaskAttempt"
+        dispatch_grace_lease,
+        "dispatch replay and MCP App state/Endpoint heartbeat must not slide scheduling grace"
     );
 
     let consumed = fixture.runtime.consume_agent_wake(
@@ -2441,8 +2870,8 @@ fn mcp_app_state_heartbeat_never_renews_consumed_a4b_task_attempt() {
     assert!(consumed.success, "{:?}", consumed.output);
     let active_turn_lease = task_attempt_lease_expires_at(&fixture.db, &task_attempt_id);
     assert!(
-        active_turn_lease > pre_takeover_lease,
-        "first exact Task-origin Wake consume must establish the bounded active-turn reservation"
+        active_turn_lease > dispatch_grace_lease,
+        "first exact Task-origin Wake consume must promote scheduling grace to the bounded active-turn reservation"
     );
 
     for poll in 0..4 {
@@ -2464,6 +2893,120 @@ fn mcp_app_state_heartbeat_never_renews_consumed_a4b_task_attempt() {
             "MCP App state/Endpoint heartbeat must never slide the TaskAttempt active-turn lease"
         );
     }
+}
+
+#[test]
+fn mcp_app_delivery_unknown_gets_same_one_shot_dispatch_grace() {
+    let fixture = mcp_continuation_fixture("mcp-a4b-unknown-grace");
+    let created = fixture.runtime.create_agent_task(
+        None,
+        "A4b unknown grace".to_string(),
+        "Prove delivery uncertainty reserves Host scheduling without proving takeover.".to_string(),
+        Some(fixture.receiver.clone()),
+        None,
+        None,
+        None,
+        "mcp-a4b-unknown-task".to_string(),
+    );
+    assert!(created.success, "{:?}", created.output);
+    let task_id = created.output["task"]["summary"]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let started = fixture.runtime.start_agent_task_attempt(
+        None,
+        task_id.clone(),
+        fixture.receiver.clone(),
+        "mcp-a4b-unknown-attempt".to_string(),
+    );
+    assert!(started.success, "{:?}", started.output);
+    let task_attempt_id = started.output["attempt"]["attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let attempt_fence = started.output["attempt_fence"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let attempt_controller_generation = started.output["attempt"]["attempt_controller_generation"]
+        .as_i64()
+        .unwrap();
+    let execution = fixture.runtime.start_agent_task_endpoint_continuation(
+        None,
+        task_id,
+        task_attempt_id.clone(),
+        fixture.receiver.clone(),
+        attempt_fence,
+        attempt_controller_generation,
+    );
+    assert!(execution.success, "{:?}", execution.output);
+    let wake_id = execution.output["execution"]["wake_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let binding = bind_mcp_app(
+        &fixture.runtime,
+        &fixture.receiver,
+        &fixture.receiver_endpoint,
+        fixture.receiver_generation,
+    );
+    let acquired = acquire_mcp_app(
+        &fixture.runtime,
+        &fixture.receiver,
+        &fixture.receiver_endpoint,
+        fixture.receiver_generation,
+        &binding,
+    );
+    let wake_attempt_id = acquired["wake"]["attempt_id"].as_str().unwrap().to_string();
+    let (_, automatic_message) = prepare_mcp_app(
+        &fixture.runtime,
+        &fixture.receiver,
+        &fixture.receiver_endpoint,
+        fixture.receiver_generation,
+        &binding,
+        &wake_id,
+        &wake_attempt_id,
+    );
+    let pre_dispatch_lease = task_attempt_lease_expires_at(&fixture.db, &task_attempt_id);
+    let unknown = fixture.runtime.agent_continuation_wake_finish(
+        None,
+        fixture.receiver.clone(),
+        fixture.receiver_endpoint.clone(),
+        fixture.receiver_generation,
+        binding.clone(),
+        wake_id.clone(),
+        wake_attempt_id.clone(),
+        "delivery_unknown".to_string(),
+    );
+    assert!(unknown.success, "{:?}", unknown.output);
+    let dispatch_grace = task_attempt_lease_expires_at(&fixture.db, &task_attempt_id);
+    assert!(dispatch_grace > pre_dispatch_lease);
+    let replay = fixture.runtime.agent_continuation_wake_finish(
+        None,
+        fixture.receiver.clone(),
+        fixture.receiver_endpoint.clone(),
+        fixture.receiver_generation,
+        binding,
+        wake_id.clone(),
+        wake_attempt_id,
+        "delivery_unknown".to_string(),
+    );
+    assert!(replay.success, "{:?}", replay.output);
+    assert_eq!(
+        task_attempt_lease_expires_at(&fixture.db, &task_attempt_id),
+        dispatch_grace,
+        "delivery_unknown replay must not slide scheduling grace"
+    );
+    let consumed = fixture.runtime.consume_agent_wake(
+        None,
+        fixture.receiver.clone(),
+        fixture.receiver_endpoint.clone(),
+        fixture.receiver_generation,
+        wake_id,
+        resume_field(&automatic_message, "consume_token"),
+    );
+    assert!(consumed.success, "{:?}", consumed.output);
+    assert!(task_attempt_lease_expires_at(&fixture.db, &task_attempt_id) > dispatch_grace);
 }
 
 #[test]
@@ -2506,7 +3049,7 @@ fn mcp_app_consume_ack_race_and_teardown_preserve_exact_wake_semantics() {
         fixture.receiver_endpoint.clone(),
         fixture.receiver_generation,
         wake_id.clone(),
-        "wc_wake_consume_00000000000000000000000000000000".to_string(),
+        "wc_wake_consume_AAAAAAAAAAAAAAAAAAAAAA".to_string(),
     );
     assert!(!wrong_token.success);
     let wrong_generation = fixture.runtime.consume_agent_wake(
@@ -2889,11 +3432,13 @@ fn explicit_activation_bootstrap_is_replayable_and_consumes_wake_separately() {
     assert!(consumed.success, "{:?}", consumed.output);
     let inbox = runtime.list_agent_inbox(
         None,
-        agent_b.clone(),
-        endpoint_b,
-        generation_b,
-        Some(0),
-        Some(10),
+        webcodex_tool_contracts::ListAgentInboxInput {
+            agent_id: agent_b.clone(),
+            endpoint_id: endpoint_b,
+            expected_controller_generation: generation_b,
+            after_delivery_order: Some(0),
+            limit: Some(10),
+        },
     );
     assert!(inbox.success, "{:?}", inbox.output);
     assert_eq!(
@@ -2909,7 +3454,10 @@ fn explicit_activation_bootstrap_is_replayable_and_consumes_wake_separately() {
 #[test]
 fn mcp_app_binding_input_requires_canonical_view_fence() {
     let fixture = mcp_continuation_fixture("mcp-binding-input");
-    let valid = format!("wc_host_binding_{}", "a0".repeat(16));
+    let valid = format!(
+        "wc_host_binding_{}",
+        webcodex_core::compact::encode([0xa0; 16])
+    );
     for invalid in [
         String::new(),
         format!("wc_binding_{}", "a".repeat(32)),

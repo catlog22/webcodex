@@ -1,17 +1,14 @@
 //! Runtime handlers for explicit Workflow Session tool calls.
 
 use super::session_context::{
-    session_authority_denied_result, session_lifecycle_denied_result, session_message_error_result,
-    session_project_mismatch_result, unknown_session_result,
+    absent_workflow_session_result, session_authority_denied_result,
+    session_lifecycle_denied_result, session_message_error_result, session_project_mismatch_result,
     workflow_session_authority_fingerprint, SessionProjectMismatch,
 };
-use super::todo;
 use super::tool_inputs::SessionMode;
-use super::{
-    session_projects, sessions, RecoveryKind, SessionToolCall, ToolCall, ToolResult, ToolRuntime,
-};
+use super::{sessions, RecoveryKind, ToolCall, ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
-use serde_json::{json, Value};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 impl ToolRuntime {
@@ -20,8 +17,39 @@ impl ToolRuntime {
         call: ToolCall,
         auth: Option<&AuthContext>,
         transport: sessions::SessionTransport,
+        window: Option<&crate::client_window::ClientWindow>,
+        trusted_recording_session_id: Option<&str>,
     ) -> ToolResult {
         match call {
+            ToolCall::RecordExternalObservation {
+                project,
+                session_id,
+                adapter_id,
+                event_id,
+                observed_tool,
+                exit_code,
+            } => {
+                self.external_observation_tool(
+                    project,
+                    session_id,
+                    Some(webcodex_store::ExternalObservation {
+                        adapter_id,
+                        event_id,
+                        tool: observed_tool,
+                        exit_code,
+                        recorded_at: chrono::Utc::now().timestamp(),
+                    }),
+                    auth,
+                )
+                .await
+            }
+            ToolCall::ListExternalObservations {
+                project,
+                session_id,
+            } => {
+                self.external_observation_tool(project, session_id, None, auth)
+                    .await
+            }
             ToolCall::StartSession {
                 project,
                 title,
@@ -40,6 +68,15 @@ impl ToolRuntime {
                     auth,
                 )
                 .await
+            }
+            ToolCall::ListSessions {
+                project,
+                lifecycle,
+                offset,
+                limit,
+            } => {
+                self.list_sessions_tool(project, lifecycle, offset, limit, auth)
+                    .await
             }
             ToolCall::SessionSummary { session_id, limit } => {
                 self.session_summary_tool(session_id, limit, auth).await
@@ -77,6 +114,7 @@ impl ToolRuntime {
                 reply_to,
                 priority,
                 requires_ack,
+                delivery_key,
             } => {
                 self.post_session_message_tool(
                     session_id,
@@ -86,7 +124,10 @@ impl ToolRuntime {
                     reply_to,
                     priority,
                     requires_ack,
+                    delivery_key,
                     auth,
+                    window,
+                    trusted_recording_session_id,
                 )
                 .await
             }
@@ -164,6 +205,95 @@ impl ToolRuntime {
         }
     }
 
+    pub(crate) async fn list_sessions_tool(
+        &self,
+        project: String,
+        lifecycle: Option<webcodex_tool_contracts::SessionLifecycleInput>,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
+        let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
+            Ok(resolved) => resolved,
+            Err(error) => return error.into_tool_result(),
+        };
+        let owner = match workflow_session_authority_fingerprint(auth) {
+            Ok(owner) => owner,
+            Err(_) => {
+                return ToolResult::err_with_output(
+                    "session_authority_identity_unavailable",
+                    json!({
+                        "error_kind": "session_authority_identity_unavailable", "state_changed": false,
+                    }),
+                )
+            }
+        };
+        let lifecycle = lifecycle.map(|state| match state {
+            webcodex_tool_contracts::SessionLifecycleInput::Active => {
+                sessions::SessionLifecycle::Active
+            }
+            webcodex_tool_contracts::SessionLifecycleInput::Closed => {
+                sessions::SessionLifecycle::Closed
+            }
+        });
+        let offset = offset.unwrap_or(0);
+        let page = self.sessions.discover_sessions(
+            &resolved.resolved_id,
+            &owner,
+            lifecycle,
+            offset,
+            limit.unwrap_or(10),
+        );
+        let mut rows = Vec::new();
+        for item in &page.sessions {
+            // Discovery is no authority grant. Recheck each exact target before
+            // projecting it or minting its caller-scoped short selector.
+            if self
+                .authorize_session_target(&item.session_id, "list_sessions", auth)
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let mut row = serde_json::to_value(item).expect("Session discovery item serializes");
+            if let Some(session_ref) = self.session_reference_for_id(&item.session_id, auth) {
+                row["session_ref"] = json!(session_ref);
+            }
+            rows.push(row);
+        }
+        let mut output = json!({
+            "project": resolved.resolved_id,
+            "total": page.total,
+            "offset": offset,
+            "next_offset": page.next_offset,
+            "sessions": rows,
+            "selection": "caller_must_choose_exact_session",
+        });
+        // Bound the actual UTF-8 JSON output, including principal-scoped refs.
+        // Removed rows remain discoverable on the next ordinary inventory page.
+        const MAX_RESULT_BYTES: usize = 32 * 1024;
+        while serde_json::to_vec(&output)
+            .expect("Session discovery serializes")
+            .len()
+            > MAX_RESULT_BYTES
+        {
+            let rows = output["sessions"]
+                .as_array_mut()
+                .expect("Session discovery rows");
+            if rows.pop().is_none() {
+                return ToolResult::err_with_output(
+                    "session_discovery_result_too_large",
+                    json!({
+                        "error_kind": "session_discovery_result_too_large", "state_changed": false,
+                    }),
+                );
+            }
+            let next = offset.saturating_add(rows.len());
+            output["next_offset"] = json!(next);
+        }
+        ToolResult::ok(output)
+    }
+
     pub(crate) async fn start_session_tool(
         &self,
         project: Option<String>,
@@ -195,7 +325,10 @@ impl ToolRuntime {
         // CLAUDE.md, ...). Any read failure is swallowed and never fails
         // start_session. `null` when no project was provided.
         let project_instructions = match &resolved {
-            Some(resolved) => Some(self.load_project_instructions(&resolved.config).await),
+            Some(resolved) => Some(
+                self.load_effective_session_instructions(resolved, auth)
+                    .await,
+            ),
             None => None,
         };
         if resolved.is_none() && auth.is_some_and(AuthContext::is_open_anonymous) {
@@ -238,13 +371,26 @@ impl ToolRuntime {
         .with_owner_authority_fingerprint(Some(owner_authority_fingerprint))
         .with_project_instructions(project_instructions.clone())
         .with_execution_context(execution_context.unwrap_or_default());
+        if self.sessions.prepare_request().await.is_err() {
+            return session_storage_unavailable_result();
+        }
         let summary = match self.sessions.start_session_with_options(options) {
             Ok(summary) => summary,
             Err(error) => {
                 return invalid_execution_context_result(error);
             }
         };
-        ToolResult::ok(json!({
+        if self.sessions.flush().await.is_err() {
+            return ToolResult::err_with_output(
+                "Session persistence could not be confirmed",
+                json!({
+                    "error_kind": "session_persistence_uncertain", "session_id": summary.session_id,
+                    "state_changed": true, "recovery": "resume this exact session_id after storage recovers"
+                }),
+            );
+        }
+        let session_ref = self.session_reference_for_id(&summary.session_id, auth);
+        let mut output = json!({
             "success": true,
             "session_id": summary.session_id,
             "project": summary.project,
@@ -257,7 +403,11 @@ impl ToolRuntime {
             "lifecycle": summary.lifecycle,
             "created_at": summary.created_at,
             "project_instructions": project_instructions,
-        }))
+        });
+        if let Some(session_ref) = session_ref {
+            output["session_ref"] = json!(session_ref);
+        }
+        ToolResult::ok(output)
     }
 
     pub(crate) async fn update_session_context_tool(
@@ -279,7 +429,7 @@ impl ToolRuntime {
             Err(err) => return err.into_tool_result(),
         };
         let Some(summary) = self.sessions.summary(&session_id, None) else {
-            return unknown_session_result(&session_id);
+            return absent_workflow_session_result(&self.sessions, &session_id, auth);
         };
         if summary.project.as_deref() != Some(resolved.resolved_id.as_str()) {
             let mismatch = SessionProjectMismatch {
@@ -320,7 +470,7 @@ impl ToolRuntime {
                 "updated_at": outcome.summary.updated_at,
             })),
             Err(sessions::SessionExecutionContextUpdateError::UnknownSession) => {
-                unknown_session_result(&session_id)
+                absent_workflow_session_result(&self.sessions, &session_id, auth)
             }
             Err(sessions::SessionExecutionContextUpdateError::SessionNotActive { lifecycle }) => {
                 session_lifecycle_denied_result(
@@ -353,17 +503,22 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         if let Err(result) = self
-            .authorize_session_target(&session_id, "session_summary", auth)
+            .authorize_session_target(&session_id, "read_session_summary", auth)
             .await
         {
             return result;
         }
         match self.sessions.summary(&session_id, limit) {
-            Some(summary) => ToolResult::ok(
-                serde_json::to_value(summary)
-                    .unwrap_or_else(|_| json!({"session_id": session_id, "events": []})),
-            ),
-            None => unknown_session_result(&session_id),
+            Some(summary) => {
+                let session_ref = self.session_reference_for_id(&session_id, auth);
+                let mut output = serde_json::to_value(summary)
+                    .unwrap_or_else(|_| json!({"session_id": session_id, "events": []}));
+                if let Some(session_ref) = session_ref {
+                    output["session_ref"] = json!(session_ref);
+                }
+                ToolResult::ok(output)
+            }
+            None => absent_workflow_session_result(&self.sessions, &session_id, auth),
         }
     }
 
@@ -393,7 +548,9 @@ impl ToolRuntime {
                     "updated_at": outcome.summary.updated_at,
                 }))
             }
-            Err(sessions::SessionCloseError::UnknownSession) => unknown_session_result(&session_id),
+            Err(sessions::SessionCloseError::UnknownSession) => {
+                absent_workflow_session_result(&self.sessions, &session_id, auth)
+            }
         }
     }
 
@@ -406,7 +563,11 @@ impl ToolRuntime {
         let Some((project, owner_authority_fingerprint)) =
             self.sessions.session_target_authority(session_id)
         else {
-            return Err(unknown_session_result(session_id));
+            return Err(absent_workflow_session_result(
+                &self.sessions,
+                session_id,
+                auth,
+            ));
         };
         if let Some(project) = project {
             // Project authorization and immutable creation-time Session authority
@@ -444,12 +605,20 @@ impl ToolRuntime {
             if !synthetic_test_fixture && owner_authority_fingerprint != caller_fingerprint {
                 return Err(session_authority_denied_result(session_id, tool_name));
             }
+            self.sessions
+                .prepare_request()
+                .await
+                .map_err(|_| session_storage_unavailable_result())?;
             return Ok(resolved);
         }
 
         #[cfg(test)]
         if owner_authority_fingerprint == sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
         {
+            self.sessions
+                .prepare_request()
+                .await
+                .map_err(|_| session_storage_unavailable_result())?;
             return Ok(None);
         }
 
@@ -461,6 +630,10 @@ impl ToolRuntime {
         if owner_authority_fingerprint != caller_fingerprint {
             return Err(session_authority_denied_result(session_id, tool_name));
         }
+        self.sessions
+            .prepare_request()
+            .await
+            .map_err(|_| session_storage_unavailable_result())?;
         Ok(None)
     }
 
@@ -500,7 +673,10 @@ impl ToolRuntime {
         reply_to: Option<String>,
         priority: sessions::SessionMessagePriority,
         requires_ack: bool,
+        delivery_key: Option<String>,
         auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        trusted_recording_session_id: Option<&str>,
     ) -> ToolResult {
         if let Err(result) = self
             .authorize_session_target(&session_id, "post_session_message", auth)
@@ -508,24 +684,55 @@ impl ToolRuntime {
         {
             return result;
         }
-        match self.sessions.post_message_with_ack(
-            sessions::PostSessionMessageInput {
-                session_id: session_id.clone(),
-                kind,
-                message,
-                tags,
-                reply_to,
-                priority,
-            },
-            requires_ack,
-        ) {
-            Ok(message) => ToolResult::ok(json!({
+        let delivery = match delivery_key {
+            Some(delivery_key) => {
+                let sender_scope =
+                    match message_delivery_sender_scope(auth, window, trusted_recording_session_id)
+                    {
+                        Ok(scope) => scope,
+                        Err(message) => {
+                            return ToolResult::err_with_output(
+                                message,
+                                json!({
+                                    "error_kind": "message_sender_identity_unavailable",
+                                    "session_id": session_id,
+                                    "state_changed": false,
+                                }),
+                            )
+                        }
+                    };
+                Some(sessions::SessionMessageDelivery {
+                    sender_scope,
+                    delivery_key,
+                })
+            }
+            None => None,
+        };
+        match self
+            .sessions
+            .post_message_with_ack_and_delivery(
+                sessions::PostSessionMessageInput {
+                    session_id: session_id.clone(),
+                    kind,
+                    message,
+                    tags,
+                    reply_to,
+                    priority,
+                },
+                requires_ack,
+                delivery,
+            )
+            .await
+        {
+            Ok(outcome) => ToolResult::ok(json!({
                 "success": true,
                 "session_id": session_id,
-                "message_id": message.message_id,
-                "message": message,
+                "message_id": outcome.message.message_id,
+                "message": outcome.message,
+                "replayed": outcome.replayed,
+                "state_changed": outcome.state_changed,
             })),
-            Err(err) => session_message_error_result(&session_id, None, err),
+            Err(err) => session_message_error_result(&self.sessions, auth, &session_id, None, err),
         }
     }
 
@@ -560,7 +767,7 @@ impl ToolRuntime {
                 "session_id": session_id,
                 "messages": messages,
             })),
-            Err(err) => session_message_error_result(&session_id, None, err),
+            Err(err) => session_message_error_result(&self.sessions, auth, &session_id, None, err),
         }
     }
 
@@ -576,7 +783,7 @@ impl ToolRuntime {
         {
             return result;
         }
-        match self.sessions.get_assignment(&session_id, &message_id) {
+        match self.sessions.get_assignment(&session_id, &message_id).await {
             Ok(snapshot) => ToolResult::ok(json!({
                 "success": true,
                 "session_id": session_id,
@@ -585,7 +792,13 @@ impl ToolRuntime {
                 "direct_replies": snapshot.direct_replies,
                 "assignment_fence": snapshot.assignment_fence,
             })),
-            Err(err) => session_message_error_result(&session_id, Some(&message_id), err),
+            Err(err) => session_message_error_result(
+                &self.sessions,
+                auth,
+                &session_id,
+                Some(&message_id),
+                err,
+            ),
         }
     }
 
@@ -638,17 +851,15 @@ impl ToolRuntime {
                 "session_id": session_id,
                 "messages": observation.messages,
                 "observation_token": observation.observation_token,
-                "continuation_semantics": super::ContinuationSemantics::new(
-                    super::ContinuationKind::Observe,
-                    super::ContinuationCarrier::ObservationToken,
-                ).to_value(),
                 "changed": observation.changed,
                 "wait_outcome": observation.wait_outcome,
                 "waited_ms": observation.waited_ms,
                 "history_lost": observation.history_lost,
                 "has_more": observation.has_more,
             })),
-            Err(err) => session_message_observation_error_result(&session_id, err),
+            Err(err) => {
+                session_message_observation_error_result(&self.sessions, auth, &session_id, err)
+            }
         }
     }
 
@@ -675,7 +886,13 @@ impl ToolRuntime {
                 "message_id": message.message_id,
                 "message": message,
             })),
-            Err(err) => session_message_error_result(&session_id, Some(&message_id), err),
+            Err(err) => session_message_error_result(
+                &self.sessions,
+                auth,
+                &session_id,
+                Some(&message_id),
+                err,
+            ),
         }
     }
 
@@ -699,7 +916,15 @@ impl ToolRuntime {
         }
         let completion_id = match Self::completion_key_fingerprint(completion_key) {
             Ok(completion_id) => completion_id,
-            Err(err) => return session_message_error_result(&session_id, Some(&message_id), err),
+            Err(err) => {
+                return session_message_error_result(
+                    &self.sessions,
+                    auth,
+                    &session_id,
+                    Some(&message_id),
+                    err,
+                )
+            }
         };
         let author_session_id =
             self.trusted_collaboration_author_session(trusted_recording_session_id);
@@ -714,7 +939,9 @@ impl ToolRuntime {
                 completion_id: completion_id.clone(),
                 author_session_id,
                 expected_assignment_fence,
-            }) {
+            })
+            .await
+        {
             Ok(outcome) => ToolResult::ok(json!({
                 "success": true,
                 "session_id": session_id,
@@ -725,7 +952,13 @@ impl ToolRuntime {
                 "todo": outcome.todo,
                 "answer": outcome.answer,
             })),
-            Err(err) => session_message_error_result(&session_id, Some(&message_id), err),
+            Err(err) => session_message_error_result(
+                &self.sessions,
+                auth,
+                &session_id,
+                Some(&message_id),
+                err,
+            ),
         }
     }
 
@@ -736,7 +969,7 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         if let Err(result) = self
-            .authorize_session_target(&session_id, "session_discussion_summary", auth)
+            .authorize_session_target(&session_id, "read_session_discussion_summary", auth)
             .await
         {
             return result;
@@ -756,9 +989,29 @@ impl ToolRuntime {
                 "recent_progress": summary.recent_progress,
                 "recent_decisions": summary.recent_decisions,
             })),
-            Err(err) => session_message_error_result(&session_id, None, err),
+            Err(err) => session_message_error_result(&self.sessions, auth, &session_id, None, err),
         }
     }
+}
+
+pub(crate) fn message_delivery_sender_scope(
+    auth: Option<&AuthContext>,
+    window: Option<&crate::client_window::ClientWindow>,
+    recording_session_id: Option<&str>,
+) -> Result<String, String> {
+    let (principal_kind, principal_id) = super::runtime_observation_principal(auth)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"webcodex.message-delivery-sender.v1\0");
+    for field in [
+        principal_kind.as_str(),
+        principal_id.as_str(),
+        window.map_or("", crate::client_window::ClientWindow::key),
+        recording_session_id.unwrap_or_default(),
+    ] {
+        hasher.update((field.len() as u64).to_be_bytes());
+        hasher.update(field.as_bytes());
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn invalid_session_message_observation_request(session_id: &str, message: &str) -> ToolResult {
@@ -775,16 +1028,17 @@ fn invalid_session_message_observation_request(session_id: &str, message: &str) 
 }
 
 fn session_message_observation_error_result(
+    sessions: &sessions::SessionStore,
+    auth: Option<&AuthContext>,
     session_id: &str,
     error: sessions::SessionMessageObservationError,
 ) -> ToolResult {
     match error {
         sessions::SessionMessageObservationError::UnknownSession => {
-            unknown_session_result(session_id)
+            absent_workflow_session_result(sessions, session_id, auth)
         }
         sessions::SessionMessageObservationError::MalformedToken
         | sessions::SessionMessageObservationError::OversizedToken
-        | sessions::SessionMessageObservationError::WrongSession
         | sessions::SessionMessageObservationError::FutureRevision => ToolResult::err_with_output(
             "invalid_session_message_observation_token",
             json!({
@@ -821,579 +1075,12 @@ fn invalid_execution_context_result(error: String) -> ToolResult {
     )
 }
 
-impl ToolRuntime {
-    /// Dispatcher for the consolidated `session` tool surface.
-    pub(crate) async fn consolidated_session_tool(
-        &self,
-        call: SessionToolCall,
-        auth: Option<&AuthContext>,
-        transport: sessions::SessionTransport,
-    ) -> ToolResult {
-        match call {
-            SessionToolCall::Start {
-                project,
-                projects,
-                title,
-                mode,
-                execution_context,
-            } => {
-                self.consolidated_session_start(
-                    project,
-                    projects,
-                    title,
-                    mode,
-                    execution_context,
-                    auth,
-                )
-                .await
-            }
-            SessionToolCall::Get { session_id } => self.consolidated_session_get(&session_id),
-            SessionToolCall::List { project, limit } => {
-                self.consolidated_session_list(project, limit, auth).await
-            }
-            SessionToolCall::AttachProject {
-                session_id,
-                project,
-                expected_revision,
-            } => {
-                self.consolidated_session_attach(&session_id, &project, expected_revision, auth)
-                    .await
-            }
-            SessionToolCall::DetachProject {
-                session_id,
-                project,
-                expected_revision,
-            } => {
-                self.consolidated_session_detach(&session_id, &project, expected_revision, auth)
-                    .await
-            }
-            SessionToolCall::UpdateContext {
-                project,
-                session_id,
-                execution_context,
-            } => {
-                self.update_session_context_tool(
-                    project,
-                    session_id,
-                    execution_context,
-                    auth,
-                    transport,
-                )
-                .await
-            }
-            SessionToolCall::Compact { session_id, note } => {
-                self.consolidated_session_compact(&session_id, note, auth)
-                    .await
-            }
-            #[cfg(feature = "workspace-checkpoints")]
-            SessionToolCall::Restore {
-                session_id,
-                project,
-                checkpoint_id,
-                confirm,
-            } => {
-                self.consolidated_session_restore(
-                    &session_id,
-                    project.as_deref(),
-                    &checkpoint_id,
-                    confirm,
-                    auth,
-                )
-                .await
-            }
-            #[cfg(not(feature = "workspace-checkpoints"))]
-            SessionToolCall::Restore { session_id, .. } => ToolResult::err_with_output(
-                "session restore requires the workspace-checkpoints feature",
-                json!({
-                    "error_kind": "workspace_checkpoints_unavailable",
-                    "session_id": session_id,
-                    "state_changed": false,
-                }),
-            ),
-            SessionToolCall::Summary { session_id, limit } => {
-                self.session_summary_tool(session_id, limit, auth).await
-            }
-            SessionToolCall::Close { session_id } => {
-                self.close_session_tool(session_id, auth).await
-            }
-        }
-    }
-
-    async fn consolidated_session_start(
-        &self,
-        project: Option<String>,
-        projects: Option<Vec<String>>,
-        title: Option<String>,
-        mode: Option<SessionMode>,
-        execution_context: Option<sessions::SessionExecutionContext>,
-        auth: Option<&AuthContext>,
-    ) -> ToolResult {
-        if project.is_some() && projects.is_some() {
-            return ToolResult::err_with_output(
-                "invalid_arguments: project and projects are mutually exclusive",
-                json!({
-                    "error_kind": "invalid_arguments",
-                    "failure_kind": "invalid_arguments",
-                    "field": "projects",
-                    "state_changed": false,
-                }),
-            );
-        }
-        let (canonical_input, attached_inputs): (Option<String>, Vec<String>) =
-            match (&project, &projects) {
-                (Some(input), None) => (Some(input.clone()), Vec::new()),
-                (None, Some(inputs)) => {
-                    let inputs = match validate_project_list(inputs) {
-                        Ok(inputs) => inputs,
-                        Err(message) => {
-                            return ToolResult::err_with_output(
-                                format!("invalid_arguments: {message}"),
-                                json!({
-                                    "error_kind": "invalid_arguments",
-                                    "failure_kind": "invalid_arguments",
-                                    "field": "projects",
-                                    "state_changed": false,
-                                }),
-                            );
-                        }
-                    };
-                    let mut inputs = inputs.into_iter();
-                    let canonical = inputs.next().expect("validated non-empty");
-                    (Some(canonical), inputs.collect::<Vec<_>>())
-                }
-                // Project-less Sessions stay legal (same semantics as the legacy
-                // start_session tool); compact requires a canonical project.
-                (None, None) => (None, Vec::new()),
-                (Some(_), Some(_)) => unreachable!("mutually exclusive checked above"),
-            };
-        // Every workspace input is independently resolved and authorized before
-        // the session is created; the canonical project is re-resolved inside
-        // start_session_tool with identical semantics.
-        let mut attached_resolved = Vec::with_capacity(attached_inputs.len());
-        for input in &attached_inputs {
-            match self.resolve_project_input_for_auth(input, auth).await {
-                Ok(resolved) => attached_resolved.push(resolved.resolved_id),
-                Err(err) => return err.into_tool_result(),
-            }
-        }
-        let result = self
-            .start_session_tool(
-                canonical_input,
-                title,
-                mode.unwrap_or_default(),
-                false,
-                false,
-                execution_context,
-                auth,
-            )
-            .await;
-        if !result.success {
-            return result;
-        }
-        let session_id = result
-            .output
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let mut output = result.output;
-        output["action"] = json!("start");
-        match self
-            .session_projects
-            .initialize(&session_id, attached_resolved)
-        {
-            Ok(record) => {
-                output["projects"] = projects_json(&self.sessions, &record);
-                output["attached_revision"] = json!(record.revision);
-            }
-            Err(error) => {
-                output["attached_error"] = json!(error.message());
-                output["projects"] = projects_json(
-                    &self.sessions,
-                    &session_projects::SessionProjectsRecord {
-                        version: 1,
-                        session_id: session_id.clone(),
-                        revision: 0,
-                        attached: Vec::new(),
-                    },
-                );
-            }
-        }
-        ToolResult {
-            success: true,
-            output,
-            ..result
-        }
-    }
-
-    fn consolidated_session_get(&self, session_id: &str) -> ToolResult {
-        let Some(summary) = self.sessions.summary(session_id, None) else {
-            return unknown_session_result(session_id);
-        };
-        let record = self.session_projects.load(session_id).unwrap_or_else(|_| {
-            session_projects::SessionProjectsRecord {
-                version: 1,
-                session_id: session_id.to_string(),
-                revision: 0,
-                attached: Vec::new(),
-            }
-        });
-        ToolResult::ok(json!({
-            "success": true,
-            "action": "get",
-            "session_id": summary.session_id,
-            "project": summary.project,
-            "title": summary.title,
-            "mode": summary.mode,
-            "guards": summary.guards,
-            "lifecycle": summary.lifecycle,
-            "execution_context": summary.execution_context,
-            "created_at": summary.created_at,
-            "updated_at": summary.updated_at,
-            "projects": projects_json(&self.sessions, &record),
-            "revision": record.revision,
-        }))
-    }
-
-    async fn consolidated_session_list(
-        &self,
-        project: Option<String>,
-        limit: Option<usize>,
-        auth: Option<&AuthContext>,
-    ) -> ToolResult {
-        let Some(project) = project else {
-            return ToolResult::err_with_output(
-                "invalid_arguments: list requires an explicit project filter",
-                json!({
-                    "error_kind": "invalid_arguments",
-                    "failure_kind": "invalid_arguments",
-                    "field": "project",
-                    "state_changed": false,
-                }),
-            );
-        };
-        let resolved = match self.resolve_project_input_for_auth(&project, auth).await {
-            Ok(resolved) => resolved,
-            Err(err) => return err.into_tool_result(),
-        };
-        let list = self.workflow_sessions_console_list(&resolved.resolved_id, limit);
-        ToolResult::ok(json!({
-            "success": true,
-            "action": "list",
-            "project": resolved.resolved_id,
-            "total": list.total,
-            "returned": list.returned,
-            "truncated": list.truncated,
-            "sessions": list.sessions,
-        }))
-    }
-
-    pub(crate) async fn consolidated_session_attach(
-        &self,
-        session_id: &str,
-        project: &str,
-        expected_revision: u64,
-        auth: Option<&AuthContext>,
-    ) -> ToolResult {
-        let Some(canonical) = self.require_session_project(session_id) else {
-            return unknown_session_result(session_id);
-        };
-        let resolved = match self.resolve_project_input_for_auth(project, auth).await {
-            Ok(resolved) => resolved,
-            Err(err) => return err.into_tool_result(),
-        };
-        if canonical.as_deref() == Some(resolved.resolved_id.as_str()) {
-            return ToolResult::err_with_output(
-                format!("invalid_project: {project} is the canonical session project"),
-                json!({
-                    "error_kind": "invalid_project",
-                    "session_id": session_id,
-                    "state_changed": false,
-                }),
-            );
-        }
-        match self.session_projects.attach(
-            session_id,
-            resolved.resolved_id.clone(),
-            expected_revision,
-        ) {
-            Ok(record) => ToolResult::ok(json!({
-                "success": true,
-                "action": "attach_project",
-                "session_id": session_id,
-                "project": resolved.resolved_id,
-                "projects": projects_json(&self.sessions, &record),
-                "revision": record.revision,
-            })),
-            Err(error) => error.into_tool_result(),
-        }
-    }
-
-    pub(crate) async fn consolidated_session_detach(
-        &self,
-        session_id: &str,
-        project: &str,
-        expected_revision: u64,
-        auth: Option<&AuthContext>,
-    ) -> ToolResult {
-        let Some(canonical) = self.require_session_project(session_id) else {
-            return unknown_session_result(session_id);
-        };
-        let resolved = match self.resolve_project_input_for_auth(project, auth).await {
-            Ok(resolved) => resolved,
-            Err(err) => return err.into_tool_result(),
-        };
-        if canonical.as_deref() == Some(resolved.resolved_id.as_str()) {
-            return ToolResult::err_with_output(
-                format!("invalid_project: cannot detach the canonical session project {project}"),
-                json!({
-                    "error_kind": "invalid_project",
-                    "session_id": session_id,
-                    "state_changed": false,
-                }),
-            );
-        }
-        match self
-            .session_projects
-            .detach(session_id, &resolved.resolved_id, expected_revision)
-        {
-            Ok(record) => ToolResult::ok(json!({
-                "success": true,
-                "action": "detach_project",
-                "session_id": session_id,
-                "project": resolved.resolved_id,
-                "projects": projects_json(&self.sessions, &record),
-                "revision": record.revision,
-            })),
-            Err(error) => error.into_tool_result(),
-        }
-    }
-
-    fn require_session_project(&self, session_id: &str) -> Option<Option<String>> {
-        if !self.sessions.contains_session(session_id) {
-            return None;
-        }
-        self.sessions.session_project(session_id)
-    }
-}
-
-fn validate_project_list(inputs: &[String]) -> Result<Vec<String>, String> {
-    if inputs.is_empty() {
-        return Err("projects must not be empty".to_string());
-    }
-    if inputs.len() > 8 {
-        return Err("projects accepts at most 8 entries".to_string());
-    }
-    let mut seen = std::collections::BTreeSet::new();
-    for input in inputs {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            return Err("projects entries must be non-empty".to_string());
-        }
-        if !seen.insert(trimmed.to_string()) {
-            return Err(format!("duplicate projects entry '{trimmed}'"));
-        }
-    }
-    Ok(inputs
-        .iter()
-        .map(|input| input.trim().to_string())
-        .collect())
-}
-
-fn projects_json(
-    sessions: &sessions::SessionStore,
-    record: &session_projects::SessionProjectsRecord,
-) -> Value {
-    let canonical = sessions.session_project(&record.session_id).unwrap_or(None);
-    let mut projects: Vec<Value> = Vec::with_capacity(record.attached.len() + 1);
-    if let Some(canonical) = canonical.as_deref() {
-        projects.push(json!({"project": canonical, "canonical": true}));
-    }
-    for attached in &record.attached {
-        if Some(attached.project.as_str()) == canonical.as_deref() {
-            continue;
-        }
-        projects.push(json!({"project": attached.project, "canonical": false}));
-    }
-    json!(projects)
-}
-
-impl ToolRuntime {
-    /// `session compact`: deterministically distill session state into one
-    /// Memory (knowhow) entry tagged as compaction output.
-    pub(crate) async fn consolidated_session_compact(
-        &self,
-        session_id: &str,
-        note: Option<String>,
-        auth: Option<&AuthContext>,
-    ) -> ToolResult {
-        let Some(summary) = self.sessions.summary(session_id, None) else {
-            return unknown_session_result(session_id);
-        };
-        let Some(canonical) = summary.project.clone() else {
-            return ToolResult::err_with_output(
-                "session_execution_context_requires_project",
-                json!({
-                    "error_kind": "session_has_no_project",
-                    "session_id": session_id,
-                    "state_changed": false,
-                    "message": "compact deposits its output into project Memory; the session needs a canonical project",
-                }),
-            );
-        };
-        let todos = self
-            .todo_store
-            .load(session_id)
-            .unwrap_or_else(|_| todo::TodoSessionRecord {
-                version: 1,
-                session_id: session_id.to_string(),
-                revision: 0,
-                todos: Vec::new(),
-            });
-        let open_todos: Vec<Value> = todos
-            .todos
-            .iter()
-            .filter(|todo| {
-                !matches!(
-                    todo.status,
-                    todo::TodoStatus::Resolved | todo::TodoStatus::Cancelled
-                )
-            })
-            .map(|todo| {
-                json!({
-                    "todo_id": todo.todo_id,
-                    "subject": todo.subject,
-                    "status": todo.status.as_str(),
-                    "assignee": todo.assignee,
-                })
-            })
-            .collect();
-        let note = note.unwrap_or_default();
-        if webcodex_core::sensitive_text::secret_like_value(&note) {
-            return ToolResult::err_with_output(
-                "compact note looks like a secret; refusing to persist it",
-                json!({
-                    "error_kind": "secret_like_input_rejected",
-                    "session_id": session_id,
-                    "state_changed": false,
-                }),
-            );
-        }
-        let body = json!({
-            "session_id": session_id,
-            "compacted_at_unix_ms": now_unix_millis(),
-            "lifecycle": summary.lifecycle,
-            "execution_context": summary.execution_context,
-            "counts": summary.counts,
-            "open_todos": open_todos,
-            "note": note,
-        });
-        let body_string = serde_json::to_string_pretty(&body).unwrap_or_else(|_| body.to_string());
-        let summary_line = format!(
-            "Compaction of session {session_id}: {} open todo(s), lifecycle {:?}",
-            open_todos.len(),
-            summary.lifecycle
-        );
-        let resolved = match self.resolve_project_input_for_auth(&canonical, auth).await {
-            Ok(resolved) => resolved,
-            Err(err) => return err.into_tool_result(),
-        };
-        let memory_key = format!("session_compact.{session_id}");
-        let result = self.memory_set(
-            &resolved,
-            memory_key.clone(),
-            summary_line,
-            Some(body_string),
-            None,
-            Some(false),
-            Some(vec!["compaction".to_string(), "session".to_string()]),
-            None,
-            auth,
-        );
-        if !result.success {
-            return result;
-        }
-        let mut output = result.output;
-        output["action"] = json!("compact");
-        output["session_id"] = json!(session_id);
-        output["compact"] = body;
-        ToolResult {
-            success: true,
-            output,
-            ..result
-        }
-    }
-
-    /// `session restore`: re-apply one exact checkpoint to a session workspace.
-    /// The checkpoint may live under the canonical project or any attached one.
-    #[cfg(feature = "workspace-checkpoints")]
-    pub(crate) async fn consolidated_session_restore(
-        &self,
-        session_id: &str,
-        project: Option<&str>,
-        checkpoint_id: &str,
-        confirm: bool,
-        auth: Option<&AuthContext>,
-    ) -> ToolResult {
-        let Some(summary) = self.sessions.summary(session_id, None) else {
-            return unknown_session_result(session_id);
-        };
-        let mut candidates: Vec<String> = Vec::new();
-        if let Some(project) = project {
-            match self.resolve_project_input_for_auth(project, auth).await {
-                Ok(resolved) => candidates.push(resolved.resolved_id),
-                Err(err) => return err.into_tool_result(),
-            }
-        } else {
-            if let Some(canonical) = summary.project.clone() {
-                candidates.push(canonical);
-            }
-            if let Ok(record) = self.session_projects.load(session_id) {
-                for attached in record.attached {
-                    if !candidates.contains(&attached.project) {
-                        candidates.push(attached.project);
-                    }
-                }
-            }
-        }
-        for candidate in &candidates {
-            if self.checkpoint_store.load(candidate, checkpoint_id).is_ok() {
-                let result = self
-                    .workspace_checkpoint_restore(
-                        candidate.clone(),
-                        checkpoint_id.to_string(),
-                        confirm,
-                    )
-                    .await;
-                if !result.success {
-                    return result;
-                }
-                let mut output = result.output;
-                output["action"] = json!("restore");
-                output["session_id"] = json!(session_id);
-                return ToolResult {
-                    success: true,
-                    output,
-                    ..result
-                };
-            }
-        }
-        ToolResult::err_with_output(
-            format!("unknown_checkpoint_id: {checkpoint_id}"),
-            json!({
-                "error_kind": "unknown_checkpoint_id",
-                "session_id": session_id,
-                "checkpoint_id": checkpoint_id,
-                "state_changed": false,
-            }),
-        )
-        .with_recovery(RecoveryKind::FixInput, None)
-    }
-}
-
-fn now_unix_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .unwrap_or(0)
+/// No Session mutation or tool execution has been admitted for this request.
+pub(super) fn session_storage_unavailable_result() -> ToolResult {
+    ToolResult::err_with_output(
+        "Workflow Session storage is temporarily unavailable",
+        json!({
+            "error_kind": "session_storage_unavailable", "execution_state": "not_started", "state_changed": false
+        }),
+    )
 }

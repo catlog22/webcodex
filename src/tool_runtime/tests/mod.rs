@@ -2,20 +2,36 @@
 
 mod support;
 
-mod action_tools;
+mod agent_continuation_refs;
+mod agent_task_attempt_refs;
 mod agent_tasks;
 mod agent_waits;
 mod apply_text_edits;
+mod artifact_transfer;
 mod assignment_fence;
+mod browser_navigation;
+mod browser_user_handoff;
 mod builtin_coding_workflow;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoint;
+#[cfg(unix)]
+mod cli_runtime_projection;
+#[cfg(feature = "experimental-code-mode")]
+mod code_mode;
+#[cfg(feature = "experimental-code-mode")]
+mod code_mode_e2b;
+mod coding_agent_context;
+mod coding_agent_discovery;
 mod coding_task;
 mod coding_task_semantic_navigation;
 mod collaboration;
 mod computer_budgets;
+mod computer_lifecycle;
+mod computer_post_observation;
 mod context_projection;
 mod continuation_feedback;
+mod control_sidecars;
+mod current_window_activity;
 mod diagnostics;
 mod dispatch;
 mod edit_tool_telemetry;
@@ -27,20 +43,38 @@ mod goals;
 mod handoff;
 mod handoff_brief;
 mod hygiene;
+mod job_attention;
+mod job_continuation;
+mod job_input;
+mod job_query;
+mod job_terminal_wait;
 mod jobs;
+mod kernel_pipeline;
 mod lsp;
 mod memory;
 mod metadata;
+mod model_workflow;
 mod observe_jobs;
+mod pdf_document;
+mod peer_collaboration;
 mod permission_gate;
 mod process;
+mod project_build_handoff;
+mod project_format_handoff;
+mod project_references;
 mod read_files;
 mod reconnect;
+mod resource_references;
+mod runner_discovery;
+mod runner_fixtures;
+mod safe_recovery;
 mod schema;
 mod script;
+mod search_and_read;
 mod search_project_texts;
+mod session_discovery;
+mod session_retention;
 mod session_shells;
-mod session_tools;
 mod sessions;
 mod sessions_git;
 mod sessions_guards;
@@ -52,7 +86,7 @@ mod startup_brief;
 mod startup_catalog;
 mod sync_timeout;
 mod targeted_inventory;
-mod tool_exposure;
+mod task_outputs;
 mod trusted_smoke;
 mod unified_diff;
 mod validation_events;
@@ -61,4 +95,9 @@ mod validation_identity;
 mod validation_summary;
 mod work_on_project;
 mod work_result;
+mod workbench;
 mod write_project_file;
+
+mod external_observations;
+
+mod docx_document;

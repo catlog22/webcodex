@@ -4,6 +4,8 @@ use crate::projects::ProjectConfig;
 use crate::runner_protocol::{RunnerProjectLineage, RunnerProjectSummary, RunnerView};
 use serde_json::{json, Value};
 
+const MODEL_PROJECT_REFERENCE_PREFIX: &str = "~p";
+
 #[derive(Debug, Clone)]
 pub(crate) struct ProjectResolverCandidate {
     pub(crate) id: String,
@@ -90,60 +92,182 @@ pub(crate) struct ProjectResolverError {
     pub(crate) candidates: Vec<ProjectResolverCandidate>,
 }
 
+const PROJECT_ERROR_CANDIDATE_LIMIT: usize = 5;
+const PROJECT_ERROR_INPUT_CHARS: usize = 200;
+const PROJECT_ERROR_LABEL_CHARS: usize = 128;
+const PROJECT_SIMILARITY_CHARS: usize = 64;
+
+fn bounded_project_text(value: &str, max_chars: usize) -> (String, bool) {
+    let mut chars = value.chars();
+    let text = chars.by_ref().take(max_chars).collect();
+    (text, chars.next().is_some())
+}
+
+/// A thresholded, diagonal-band edit distance; arbitrary paths/names never
+/// cause an unbounded all-pairs string-distance calculation.
+fn project_edit_distance(left: &[char], right: &[char]) -> usize {
+    const MAX: usize = 2;
+    if left.len().abs_diff(right.len()) > MAX {
+        return MAX + 1;
+    }
+    let mut previous = [MAX + 1; PROJECT_SIMILARITY_CHARS + 1];
+    for (index, value) in previous
+        .iter_mut()
+        .enumerate()
+        .take(right.len().min(MAX) + 1)
+    {
+        *value = index;
+    }
+    for (index, left_char) in left.iter().enumerate() {
+        let row = index + 1;
+        let mut current = [MAX + 1; PROJECT_SIMILARITY_CHARS + 1];
+        current[0] = row.min(MAX + 1);
+        let mut minimum = current[0];
+        for column in row.saturating_sub(MAX).max(1)..=(row + MAX).min(right.len()) {
+            current[column] = (previous[column] + 1)
+                .min(current[column - 1] + 1)
+                .min(previous[column - 1] + usize::from(*left_char != right[column - 1]));
+            minimum = minimum.min(current[column]);
+        }
+        if minimum > MAX {
+            return MAX + 1;
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn project_candidate_relevance(input: &str, candidate: &ProjectResolverCandidate) -> (u8, usize) {
+    let input = input.rsplit(':').next().unwrap_or(input).trim();
+    if input.is_empty() {
+        return (5, 0);
+    }
+    let query = input
+        .chars()
+        .take(PROJECT_SIMILARITY_CHARS)
+        .flat_map(char::to_lowercase)
+        .take(PROJECT_SIMILARITY_CHARS)
+        .collect::<String>();
+    let query_chars = query.chars().collect::<Vec<_>>();
+    [
+        Some(candidate.agent_project_id.as_str()),
+        candidate.name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|field| !field.is_empty())
+    .map(|field| {
+        if field.len() <= PROJECT_SIMILARITY_CHARS * 4
+            && input.len() <= PROJECT_SIMILARITY_CHARS * 4
+            && field == input
+        {
+            return (0, 0);
+        }
+        let value = field
+            .chars()
+            .take(PROJECT_SIMILARITY_CHARS)
+            .flat_map(char::to_lowercase)
+            .take(PROJECT_SIMILARITY_CHARS)
+            .collect::<String>();
+        if value == query {
+            return (1, 0);
+        }
+        if value.starts_with(&query) || query.starts_with(&value) {
+            return (2, 0);
+        }
+        if value.contains(&query) {
+            return (3, 0);
+        }
+        let distance = project_edit_distance(&query_chars, &value.chars().collect::<Vec<_>>());
+        if distance <= 2 {
+            (4, distance)
+        } else {
+            (5, 0)
+        }
+    })
+    .min()
+    .unwrap_or((5, 0))
+}
+
 impl ProjectResolverError {
     fn candidate_payload(candidate: &ProjectResolverCandidate) -> Value {
-        json!({
+        let name = candidate
+            .name
+            .as_deref()
+            .map(|name| bounded_project_text(name, PROJECT_ERROR_LABEL_CHARS));
+        let mut value = json!({
             "id": candidate.id,
             "client_id": candidate.client_id,
-            "agent_project_id": candidate.agent_project_id,
-            "name": candidate.name,
-            "path": candidate.path,
             "connected": candidate.connected,
-            "status": candidate.status,
-            "last_seen": candidate.last_seen,
-        })
+            "status": bounded_project_text(&candidate.status, 32).0,
+        });
+        if let Some((name, truncated)) = name {
+            value["name"] = json!(name);
+            if truncated {
+                value["name_truncated"] = json!(true);
+            }
+        }
+        value
     }
 
     fn to_output(&self) -> Value {
-        let candidates: Vec<Value> = self
-            .candidates
+        let (project, truncated) = bounded_project_text(&self.project, PROJECT_ERROR_INPUT_CHARS);
+        // Retain only five ranked references during selection. Identity fields
+        // are never shortened into a different, apparently executable selector.
+        let mut best = Vec::with_capacity(PROJECT_ERROR_CANDIDATE_LIMIT + 1);
+        for candidate in &self.candidates {
+            if candidate.id.len() > 512
+                || candidate.client_id.len() > 128
+                || candidate.id.chars().any(char::is_control)
+                || candidate.client_id.chars().any(char::is_control)
+            {
+                continue;
+            }
+            let rank = project_candidate_relevance(&project, candidate);
+            best.push((rank, candidate));
+            best.sort_by(|(left_rank, left), (right_rank, right)| {
+                left_rank
+                    .cmp(right_rank)
+                    .then_with(|| right.connected.cmp(&left.connected))
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            best.truncate(PROJECT_ERROR_CANDIDATE_LIMIT);
+        }
+        let candidates = best
             .iter()
-            .map(Self::candidate_payload)
-            .collect();
-        json!({
+            .map(|(_, candidate)| Self::candidate_payload(candidate))
+            .collect::<Vec<_>>();
+        let query = project.rsplit(':').next().unwrap_or(&project).trim();
+        let (query, _) = bounded_project_text(query, PROJECT_ERROR_LABEL_CHARS);
+        let mut arguments = json!({"limit": 30});
+        if !project.starts_with(MODEL_PROJECT_REFERENCE_PREFIX)
+            && !query.is_empty()
+            && !query.chars().any(char::is_control)
+        {
+            arguments["query"] = json!(query);
+        }
+        let mut output = json!({
             "error_kind": self.kind.as_str(),
-            "project": self.project,
-            "hint": "Use a full runtime project id in the form agent:<client_id>:<project_id> from list_projects.",
+            "project": project,
+            "hint": "Call list_projects with the suggested filters; select an exact id or project_ref. Suggestions never select an execution target.",
             "candidates": candidates,
-        })
+            "candidate_count": self.candidates.len(),
+            "candidates_truncated": candidates.len() < self.candidates.len(),
+            "suggested_call": super::SuggestedToolCall::fallback_recovery("list_projects", arguments).to_value(),
+        });
+        if truncated {
+            output["project_truncated"] = json!(true);
+        }
+        output
     }
 
     pub(crate) fn to_message(&self) -> String {
-        let mut message = format!(
-            "{} '{}'. Use a full runtime project id in the form agent:<client_id>:<project_id> from list_projects.",
-            match self.kind {
-                ProjectResolverErrorKind::UnknownProject => "unknown_project",
-                ProjectResolverErrorKind::AmbiguousProject => "ambiguous_project",
-            },
-            self.project
-        );
-        if self.candidates.is_empty() {
-            return message;
-        }
-        let candidate_summary = self
-            .candidates
-            .iter()
-            .map(|candidate| {
-                format!(
-                    "{} [{}] {} ({})",
-                    candidate.id, candidate.client_id, candidate.path, candidate.status
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        message.push_str(" Candidates: ");
-        message.push_str(&candidate_summary);
-        message
+        let (project, _) = bounded_project_text(&self.project, PROJECT_ERROR_INPUT_CHARS);
+        format!(
+            "{} {}. Use list_projects to select an exact id or project_ref.",
+            self.kind.as_str(),
+            json!(project)
+        )
     }
 
     pub(crate) fn into_tool_result(self) -> ToolResult {
@@ -168,7 +292,76 @@ pub(crate) fn runner_project_runtime_id(client_id: &str, project_id: &str) -> St
     format!("agent:{}:{}", client_id, project_id)
 }
 
+fn project_reference_index(raw: &str) -> Option<Result<u64, ()>> {
+    let digits = raw.strip_prefix(MODEL_PROJECT_REFERENCE_PREFIX)?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    if digits.len() > 1 && digits.starts_with('0') {
+        return Some(Err(()));
+    }
+    Some(
+        digits
+            .parse::<u64>()
+            .ok()
+            .filter(|index| *index > 0)
+            .ok_or(()),
+    )
+}
+
+fn format_project_reference(ref_index: u64) -> String {
+    format!("{MODEL_PROJECT_REFERENCE_PREFIX}{ref_index}")
+}
+
+fn project_reference_principal_key(auth: Option<&AuthContext>) -> Option<String> {
+    super::session_context::project_reference_principal_fingerprint(auth).ok()
+}
+
 impl ToolRuntime {
+    pub(crate) fn project_reference_for_identity(
+        &self,
+        canonical_project_id: &str,
+        root_fingerprint: Option<&str>,
+        auth: Option<&AuthContext>,
+    ) -> Option<String> {
+        let db = self.project_reference_db.as_ref()?;
+        let principal_key = project_reference_principal_key(auth)?;
+        let root_fingerprint = root_fingerprint?;
+        let record = db
+            .get_or_create_project_reference(
+                &principal_key,
+                canonical_project_id,
+                root_fingerprint,
+                chrono::Utc::now().timestamp(),
+            )
+            .ok()?;
+        Some(format_project_reference(record.ref_index))
+    }
+
+    pub(crate) fn project_reference_for_resolved(
+        &self,
+        project: &ResolvedProject,
+        auth: Option<&AuthContext>,
+    ) -> Option<String> {
+        self.project_reference_for_identity(
+            &project.resolved_id,
+            project.root_fingerprint.as_deref(),
+            auth,
+        )
+    }
+
+    fn lookup_project_reference(
+        &self,
+        ref_index: u64,
+        auth: Option<&AuthContext>,
+    ) -> Option<crate::db::ProjectReferenceRecord> {
+        let db = self.project_reference_db.as_ref()?;
+        let principal_key = project_reference_principal_key(auth)?;
+        db.lookup_project_reference(&principal_key, ref_index)
+            .ok()
+            .flatten()
+    }
+
     fn project_candidate_from_view(
         client: &RunnerView,
         project: &RunnerProjectSummary,
@@ -253,6 +446,38 @@ impl ToolRuntime {
         }
 
         let all_candidates = self.agent_project_candidates_for_auth(auth).await;
+
+        if let Some(reference_index) = project_reference_index(raw) {
+            let reference_index = match reference_index {
+                Ok(reference_index) => reference_index,
+                Err(()) => {
+                    return Err(ProjectResolverError {
+                        kind: ProjectResolverErrorKind::UnknownProject,
+                        project: raw.to_string(),
+                        candidates: all_candidates,
+                    });
+                }
+            };
+            let Some(reference) = self.lookup_project_reference(reference_index, auth) else {
+                return Err(ProjectResolverError {
+                    kind: ProjectResolverErrorKind::UnknownProject,
+                    project: raw.to_string(),
+                    candidates: all_candidates,
+                });
+            };
+            if let Some(candidate) = all_candidates.iter().find(|candidate| {
+                candidate.id == reference.canonical_project_id
+                    && candidate.root_fingerprint.as_deref()
+                        == Some(reference.root_fingerprint.as_str())
+            }) {
+                return Ok(Self::resolved_from_candidate(project, candidate));
+            }
+            return Err(ProjectResolverError {
+                kind: ProjectResolverErrorKind::UnknownProject,
+                project: raw.to_string(),
+                candidates: all_candidates,
+            });
+        }
 
         if raw.starts_with("agent:") {
             let Some(rest) = raw.strip_prefix("agent:") else {

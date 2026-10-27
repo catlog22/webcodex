@@ -9,7 +9,11 @@ use webcodex_core::lsp_bridge::{
     LocationsResult, WorkspaceSymbolsResult,
 };
 use webcodex_core::workflow_session_contract::is_tool_call_expectation_metadata_field as shared_is_tool_call_expectation_metadata_field;
-pub use webcodex_core::workflow_session_contract::is_valid_session_id;
+pub use webcodex_core::workflow_session_contract::{
+    is_valid_session_id, strip_tool_call_expectation_metadata,
+    tool_supports_model_facing_assertion_name, tool_supports_model_facing_result_expectation,
+    validate_model_facing_assertion_name, validate_model_facing_result_expectation,
+};
 use webcodex_tool_contracts::{
     runtime_tool_session_evidence_policy, ToolChangedPathEvidence, ToolDiffReviewEvidence,
     ToolExplorationEvidence, ToolNavigationEvidenceKind,
@@ -20,11 +24,11 @@ use super::model::{
     ToolCallRecorderMetadata, LOGICAL_INVOCATION_ID_PREFIX, LOGICAL_INVOCATION_ROLE_BUSINESS,
     LOGICAL_INVOCATION_ROLE_RECORDER, MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS,
     MAX_OBSERVED_PATHS_PER_EVENT, MAX_VALIDATION_EXCERPT_CHARS, TOOL_ACCEPTED_EXIT_CODES_FIELD,
-    TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_EXPECTATION_METADATA_FIELDS,
-    TOOL_EXPECTATION_RESULT_MATCHED, TOOL_EXPECTATION_RESULT_MATCHED_RESULT,
-    TOOL_EXPECTATION_RESULT_MISMATCH, TOOL_EXPECTATION_RESULT_NONE,
-    TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE, TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS,
-    TOOL_EXPECTED_FAILURE_FIELD, TOOL_EXPECTED_FAILURE_KIND_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
+    TOOL_ASSERTION_NAME_FIELD, TOOL_EXPECTATION_RESULT_MATCHED,
+    TOOL_EXPECTATION_RESULT_MATCHED_RESULT, TOOL_EXPECTATION_RESULT_MISMATCH,
+    TOOL_EXPECTATION_RESULT_NONE, TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
+    TOOL_EXPECTATION_RESULT_UNEXPECTED_SUCCESS, TOOL_EXPECTED_FAILURE_FIELD,
+    TOOL_EXPECTED_FAILURE_KIND_FIELD, TOOL_RESULT_EXPECTATION_FIELD,
 };
 use super::util::{bound_summary_string, looks_like_secret_string, validation_excerpt};
 
@@ -78,9 +82,17 @@ pub(super) fn is_valid_logical_invocation_role(value: &str) -> bool {
 /// recorder/business duplicates are collapsed only inside the supplied Session
 /// slice; legacy events without complete correlation remain independent facts.
 pub fn canonical_tool_call_finished_events(events: &[SessionEvent]) -> Vec<&SessionEvent> {
+    canonical_tool_call_finished_event_refs(events.iter())
+}
+
+// The store owns Arc-backed deques. Borrow their events instead of cloning the
+// entire retained ledger solely to satisfy the slice-shaped public API.
+pub(super) fn canonical_tool_call_finished_event_refs<'a>(
+    events: impl IntoIterator<Item = &'a SessionEvent>,
+) -> Vec<&'a SessionEvent> {
     let mut selected = Vec::<(usize, &SessionEvent)>::new();
     let mut correlated = HashMap::<&str, Vec<(usize, &SessionEvent)>>::new();
-    for (event_index, event) in events.iter().enumerate() {
+    for (event_index, event) in events.into_iter().enumerate() {
         if event.kind != "tool_call_finished" {
             continue;
         }
@@ -161,6 +173,8 @@ pub fn current_attempt_event_view(summary: &SessionSummary) -> CurrentAttemptEve
         .rposition(|event| event.kind == "task_instruction");
     let (boundary_source, boundary_reason_code) = if boundary_event_index.is_some() {
         ("task_instruction", None)
+    } else if summary.current_instruction.is_some() {
+        ("task_instruction", Some("attempt_history_outside_window"))
     } else if summary.events_truncated {
         ("unavailable", Some("attempt_boundary_evicted"))
     } else {
@@ -199,13 +213,6 @@ pub fn extract_project(value: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
-pub fn tool_supports_model_facing_assertion_name(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "run_process" | "run_script" | "run_shell" | "run_job"
-    )
-}
-
 pub fn safe_model_facing_assertion_name(tool_name: &str, assertion_name: &str) -> Option<String> {
     if !tool_supports_model_facing_assertion_name(tool_name) {
         return None;
@@ -216,148 +223,6 @@ pub fn safe_model_facing_assertion_name(tool_name: &str, assertion_name: &str) -
         && !trimmed.chars().any(char::is_control)
         && !looks_like_secret_string(trimmed))
     .then(|| trimmed.to_string())
-}
-
-pub fn validate_model_facing_assertion_name(
-    tool_name: &str,
-    arguments: &Value,
-) -> Result<(), String> {
-    if !tool_supports_model_facing_assertion_name(tool_name) {
-        return Ok(());
-    }
-    let Some(value) = arguments
-        .as_object()
-        .and_then(|object| object.get(TOOL_ASSERTION_NAME_FIELD))
-    else {
-        return Ok(());
-    };
-    let Some(value) = value.as_str() else {
-        return Err(format!(
-            "invalid arguments for tool '{tool_name}': assertion_name must be a string"
-        ));
-    };
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Err(format!(
-            "invalid arguments for tool '{tool_name}': assertion_name must not be empty or whitespace-only"
-        ));
-    }
-    if trimmed.chars().count() > MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS {
-        return Err(format!(
-            "invalid arguments for tool '{tool_name}': assertion_name exceeds the {MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS}-character limit"
-        ));
-    }
-    if trimmed.chars().any(char::is_control) {
-        return Err(format!(
-            "invalid arguments for tool '{tool_name}': assertion_name must be a single-line human-readable label"
-        ));
-    }
-    if looks_like_secret_string(trimmed) {
-        return Err(format!(
-            "invalid arguments for tool '{tool_name}': assertion_name must not contain credential-like material"
-        ));
-    }
-    Ok(())
-}
-
-pub fn tool_supports_model_facing_result_expectation(tool_name: &str) -> bool {
-    matches!(
-        tool_name,
-        "run_process"
-            | "run_script"
-            | "run_shell"
-            | "session_shell_exec"
-            | "cargo_fmt"
-            | "cargo_check"
-            | "cargo_test"
-            | "go_test"
-            | "validate"
-    )
-}
-
-pub fn validate_model_facing_result_expectation(
-    tool_name: &str,
-    arguments: &Value,
-) -> Result<(), String> {
-    let Some(object) = arguments.as_object() else {
-        return Ok(());
-    };
-    let result_expectation = object.get(TOOL_RESULT_EXPECTATION_FIELD);
-    let accepted_exit_codes = object.get(TOOL_ACCEPTED_EXIT_CODES_FIELD);
-    if result_expectation.is_none() && accepted_exit_codes.is_none() {
-        return Ok(());
-    }
-    if !tool_supports_model_facing_result_expectation(tool_name) {
-        return Err(format!(
-            "invalid arguments for tool '{tool_name}': result expectation is not supported by this tool"
-        ));
-    }
-    let consolidated_validate_action = if tool_name == "validate" {
-        object.get("action").and_then(Value::as_str)
-    } else {
-        None
-    };
-    if consolidated_validate_action == Some("summary") {
-        return Err(
-            "invalid arguments for tool 'validate': result expectation is supported only by the cargo/go actions, not summary"
-                .to_string(),
-        );
-    }
-    let is_cargo_fmt = tool_name == "cargo_fmt"
-        || (tool_name == "validate" && consolidated_validate_action == Some("cargo_fmt"));
-    if is_cargo_fmt
-        && result_expectation.is_some()
-        && object.get("check").and_then(Value::as_bool) != Some(true)
-    {
-        return Err(
-            "invalid arguments for tool 'cargo_fmt': result_expectation is supported only with check=true; mutating cargo fmt failures cannot be reclassified as expected observations"
-                .to_string(),
-        );
-    }
-    if let Some(value) = result_expectation {
-        let Some(value) = value.as_str() else {
-            return Err(format!(
-                "invalid arguments for tool '{tool_name}': result_expectation must be one of success, failure, or observe"
-            ));
-        };
-        if !matches!(value, "success" | "failure" | "observe") {
-            return Err(format!(
-                "invalid arguments for tool '{tool_name}': result_expectation must be one of success, failure, or observe"
-            ));
-        }
-    }
-    if let Some(value) = accepted_exit_codes {
-        if tool_name != "run_process" {
-            return Err(format!(
-                "invalid arguments for tool '{tool_name}': accepted_exit_codes is supported only by run_process"
-            ));
-        }
-        let Some(values) = value.as_array() else {
-            return Err(
-                "invalid arguments for tool 'run_process': accepted_exit_codes must be a non-empty array of integers"
-                    .to_string(),
-            );
-        };
-        if values.is_empty()
-            || values.len() > 32
-            || values.iter().any(|value| value.as_i64().is_none())
-        {
-            return Err(
-                "invalid arguments for tool 'run_process': accepted_exit_codes must contain 1..32 integers"
-                    .to_string(),
-            );
-        }
-        if result_expectation
-            .and_then(Value::as_str)
-            .is_some_and(|value| value != "observe")
-        {
-            return Err(
-                "invalid arguments for tool 'run_process': accepted_exit_codes may be combined only with result_expectation=observe (or with result_expectation omitted)"
-                    .to_string(),
-            );
-        }
-    }
-    Ok(())
 }
 
 pub fn tool_call_expectation_from_arguments(arguments: &Value) -> ToolCallExpectation {
@@ -411,17 +276,27 @@ pub fn is_tool_call_expectation_metadata_field(field: &str) -> bool {
     shared_is_tool_call_expectation_metadata_field(field)
 }
 
-pub fn strip_tool_call_expectation_metadata(arguments: Value) -> Value {
-    let Value::Object(mut obj) = arguments else {
-        return arguments;
-    };
-    for &key in TOOL_CALL_EXPECTATION_METADATA_FIELDS {
-        obj.remove(key);
-    }
-    Value::Object(obj)
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ToolFailureSummary {
+    pub expected_count: usize,
+    pub unexpected_count: usize,
+    pub expectation_mismatch_count: usize,
+    pub unexpected_success_count: usize,
+    pub recent_expected: Vec<Value>,
+    pub recent_unexpected: Vec<Value>,
+    pub recent_mismatches: Vec<Value>,
+    pub recent_unexpected_successes: Vec<Value>,
 }
 
 pub fn tool_failure_summary_from_events(events: &[SessionEvent], limit: usize) -> Value {
+    serde_json::to_value(tool_failure_evidence_from_events(events, limit))
+        .expect("tool failure evidence serializes")
+}
+
+pub fn tool_failure_evidence_from_events(
+    events: &[SessionEvent],
+    limit: usize,
+) -> ToolFailureSummary {
     let limit = limit.min(20);
     let mut expected_count = 0usize;
     let mut unexpected_count = 0usize;
@@ -469,16 +344,16 @@ pub fn tool_failure_summary_from_events(events: &[SessionEvent], limit: usize) -
         }
     }
 
-    json!({
-        "expected_count": expected_count,
-        "unexpected_count": unexpected_count,
-        "expectation_mismatch_count": expectation_mismatch_count,
-        "unexpected_success_count": unexpected_success_count,
-        "recent_expected": recent_expected,
-        "recent_unexpected": recent_unexpected,
-        "recent_mismatches": recent_mismatches,
-        "recent_unexpected_successes": recent_unexpected_successes,
-    })
+    ToolFailureSummary {
+        expected_count,
+        unexpected_count,
+        expectation_mismatch_count,
+        unexpected_success_count,
+        recent_expected,
+        recent_unexpected,
+        recent_mismatches,
+        recent_unexpected_successes,
+    }
 }
 
 pub(super) fn actual_failure_kind_for_tool_result(
@@ -536,6 +411,24 @@ pub fn public_result_expectation_satisfied(
         TOOL_EXPECTATION_RESULT_NONE => None,
         _ => Some(false),
     }
+}
+
+/// Display-only result from the durable ledger's matcher; pending results stay absent.
+pub fn tool_result_expectation_classification(
+    success: bool,
+    expectation: &ToolCallExpectation,
+    output: &Value,
+    error: Option<&str>,
+) -> Option<&'static str> {
+    if !expectation.expected_failure
+        && expectation.result_expectation.is_none()
+        && expectation.accepted_exit_codes.is_empty()
+    {
+        return None;
+    }
+    let kind = actual_failure_kind_for_tool_result(output, error, None);
+    let result = classify_failure_expectation(success, expectation, kind.as_deref(), output);
+    (result != TOOL_EXPECTATION_RESULT_NONE).then_some(result)
 }
 
 pub(super) fn classify_failure_expectation(
@@ -634,6 +527,8 @@ pub(super) fn classify_error_message(message: &str) -> String {
     let lower = message.to_ascii_lowercase();
     let kind = if lower.contains("session_project_mismatch") {
         "session_project_mismatch"
+    } else if lower.contains("session_retention_expired") {
+        "session_retention_expired"
     } else if lower.contains("unknown_session_id") {
         "unknown_session_id"
     } else if lower.contains("confirmation_required")
@@ -722,8 +617,6 @@ pub struct SessionToolContract {
     pub change_summary_like: bool,
     pub project_write: bool,
     pub path_hint: SessionPathHint,
-    pub accepts_context_ack: bool,
-    pub advances_context_checkpoint: bool,
 }
 
 pub fn changed_paths_for_tool(contract: SessionToolContract, arguments: &Value) -> Vec<String> {
@@ -817,9 +710,9 @@ pub fn exploration_tool_kind(tool_name: &str) -> Option<ExplorationToolKind> {
         ToolExplorationEvidence::Read | ToolExplorationEvidence::ReadBatch => {
             Some(ExplorationToolKind::Read)
         }
-        ToolExplorationEvidence::Search | ToolExplorationEvidence::SearchBatch => {
-            Some(ExplorationToolKind::Search)
-        }
+        ToolExplorationEvidence::Search
+        | ToolExplorationEvidence::SearchBatch
+        | ToolExplorationEvidence::SearchCompound => Some(ExplorationToolKind::Search),
         ToolExplorationEvidence::Navigation(_) => Some(ExplorationToolKind::Navigation),
     }
 }
@@ -835,7 +728,8 @@ pub fn observed_input_paths_for_tool(
     match runtime_tool_session_evidence_policy(tool_name).exploration {
         ToolExplorationEvidence::None
         | ToolExplorationEvidence::Search
-        | ToolExplorationEvidence::SearchBatch => return Vec::new(),
+        | ToolExplorationEvidence::SearchBatch
+        | ToolExplorationEvidence::SearchCompound => return Vec::new(),
         ToolExplorationEvidence::ReadBatch => {
             let mut paths = Vec::new();
             if let Some(items) = arguments.get("items").and_then(Value::as_array) {
@@ -905,7 +799,7 @@ pub fn sanitize_persistent_shell_event_evidence(
             && value.len() <= 96
             && value
                 .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
     });
     evidence.shell_state = evidence.shell_state.and_then(sanitize_shell_evidence_atom);
     evidence.execution_state = evidence
@@ -942,20 +836,23 @@ pub fn observed_paths_for_successful_result(
     match exploration {
         ToolExplorationEvidence::None => return Vec::new(),
         ToolExplorationEvidence::Read | ToolExplorationEvidence::ReadBatch => {}
-        ToolExplorationEvidence::Search | ToolExplorationEvidence::SearchBatch => {
-            let search_outputs: Vec<&Value> =
-                if matches!(exploration, ToolExplorationEvidence::SearchBatch) {
-                    output
-                        .get("items")
-                        .and_then(Value::as_array)
-                        .into_iter()
-                        .flatten()
-                        .filter(|item| item.get("success").and_then(Value::as_bool) == Some(true))
-                        .filter_map(|item| item.get("output"))
-                        .collect()
-                } else {
-                    vec![output]
-                };
+        ToolExplorationEvidence::Search
+        | ToolExplorationEvidence::SearchBatch
+        | ToolExplorationEvidence::SearchCompound => {
+            let search_outputs: Vec<&Value> = match exploration {
+                ToolExplorationEvidence::SearchBatch => output
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter(|item| item.get("success").and_then(Value::as_bool) == Some(true))
+                    .filter_map(|item| item.get("output"))
+                    .collect(),
+                ToolExplorationEvidence::SearchCompound => {
+                    output.get("search").into_iter().collect()
+                }
+                _ => vec![output],
+            };
             for search_output in search_outputs {
                 for key in ["matches", "files"] {
                     for record in search_output
@@ -1110,7 +1007,7 @@ pub(super) fn push_path(paths: &mut Vec<String>, path: &str) {
 
 /// Compute whether a tool call should contribute to `diff_review_count`.
 ///
-/// Only reads a safe boolean (`include_diff`) from arguments for `show_changes`.
+/// Only reads a safe boolean (`include_diff`) from arguments for `read_workspace_changes`.
 /// Does not store raw input, command text, or diff content.
 pub(super) fn diff_review_like_for_tool(tool_name: &str, arguments: &Value) -> bool {
     match runtime_tool_session_evidence_policy(tool_name).diff_review {
@@ -1135,22 +1032,35 @@ pub(super) fn extract_job_id(output: &Value) -> Option<String> {
 
 pub fn validation_output_summary_for_tool_result(tool_name: &str, output: &Value) -> Option<Value> {
     let execution_policy = execution_policy_for_tool(tool_name)?;
-    let stdout_value = output.get("stdout_tail")?;
-    let stderr_value = output.get("stderr_tail")?;
-    let stdout = stdout_value.as_str()?;
-    let stderr = stderr_value.as_str()?;
+    // A started execution whose handoff observation failed has no log snapshot.
+    // Preserve its unknown outcome in the existing ledger instead of mistaking
+    // sparse recovery for "no validation invoked". Missing output is incomplete,
+    // never evidence of an empty successful capture.
+    let unknown_started = output.get("execution_state").and_then(Value::as_str)
+        == Some("outcome_unknown")
+        && output.get("command_started").and_then(Value::as_bool) == Some(true);
+    let stdout = output
+        .get("stdout_tail")
+        .and_then(Value::as_str)
+        .or_else(|| unknown_started.then_some(""))?;
+    let stderr = output
+        .get("stderr_tail")
+        .and_then(Value::as_str)
+        .or_else(|| unknown_started.then_some(""))?;
     let stdout_excerpt = validation_excerpt(stdout);
     let stderr_excerpt = validation_excerpt(stderr);
     let stdout_truncated = output
         .get("stdout_truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        || stdout_excerpt.filtered;
+        || stdout_excerpt.filtered
+        || (unknown_started && output.get("stdout_tail").and_then(Value::as_str).is_none());
     let stderr_truncated = output
         .get("stderr_truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false)
-        || stderr_excerpt.filtered;
+        || stderr_excerpt.filtered
+        || (unknown_started && output.get("stderr_tail").and_then(Value::as_str).is_none());
 
     let mut summary = json!({
         "tool_name": tool_name,
@@ -1185,6 +1095,12 @@ pub fn validation_output_summary_for_tool_result(tool_name: &str, output: &Value
         "execution_state": output.get("execution_state").cloned().unwrap_or(Value::Null),
         "validation_tool": output.get("validation_tool").cloned().unwrap_or(Value::Null),
     });
+    if tool_name == "project_validate" {
+        copy_project_validation_evidence(&mut summary, output);
+    }
+    if let Some(source) = sanitized_validation_source(output.get("source_state")) {
+        summary["source_state"] = source;
+    }
     if matches!(
         execution_policy.detail,
         webcodex_tool_contracts::ToolAuditExecutionDetail::TestCounts
@@ -1220,6 +1136,59 @@ pub fn validation_output_summary_for_tool_result(tool_name: &str, output: &Value
         }
     }
     Some(summary)
+}
+
+#[cfg(test)]
+mod handoff_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn project_validation_ruff_evidence_survives_summary_and_resanitization() {
+        for (adapter, action) in [
+            ("python:ruff:check", "check"),
+            ("python:ruff:format", "format_check"),
+        ] {
+            let output = json!({
+                "adapter": adapter, "action": action, "backend": "python",
+                "validation_target_id": "target:0123456789abcdef01234567",
+                "stdout_tail": "", "stderr_tail": "", "unretained": "payload",
+            });
+            let summary =
+                validation_output_summary_for_tool_result("project_validate", &output).unwrap();
+            let retained =
+                sanitize_persisted_validation_output_summary("project_validate", &summary).unwrap();
+            for value in [&summary, &retained] {
+                for field in ["adapter", "action", "backend", "validation_target_id"] {
+                    assert_eq!(value[field], output[field]);
+                }
+                assert!(value.get("unretained").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_job_handoff_unknown_retains_incomplete_evidence_without_payload() {
+        for tool in ["run_shell", "cargo_check", "cargo_test"] {
+            let output = json!({"execution_state": "outcome_unknown", "command_started": true,
+                "command_completed": false, "failure_kind": "outcome_unknown", "terminal": false});
+            let summary = validation_output_summary_for_tool_result(tool, &output).unwrap();
+            assert_eq!(summary["execution_state"], "outcome_unknown");
+            assert_eq!(summary["stdout_truncated"], true);
+            assert_eq!(summary["stderr_truncated"], true);
+            assert_eq!(summary["stdout_tail_excerpt"], "");
+            assert_eq!(summary["stderr_tail_excerpt"], "");
+            assert!(validation_output_summary_for_tool_result(
+                tool,
+                &json!({"execution_state": "completed"})
+            )
+            .is_none());
+            assert!(validation_output_summary_for_tool_result(
+                tool,
+                &json!({"execution_state": "outcome_unknown", "command_started": false})
+            )
+            .is_none());
+        }
+    }
 }
 
 pub(super) fn sanitize_persisted_validation_output_summary(
@@ -1266,6 +1235,12 @@ pub(super) fn sanitize_persisted_validation_output_summary(
         "execution_state": object.get("execution_state").and_then(Value::as_str),
         "validation_tool": object.get("validation_tool").and_then(Value::as_str),
     });
+    if tool_name == "project_validate" {
+        copy_project_validation_evidence(&mut summary, value);
+    }
+    if let Some(source) = sanitized_validation_source(object.get("source_state")) {
+        summary["source_state"] = source;
+    }
     if matches!(
         execution_policy.detail,
         webcodex_tool_contracts::ToolAuditExecutionDetail::TestCounts
@@ -1301,6 +1276,19 @@ pub(super) fn sanitize_persisted_validation_output_summary(
         }
     }
     Some(summary)
+}
+
+fn sanitized_validation_source(value: Option<&Value>) -> Option<Value> {
+    let source: webcodex_core::validation_source::ValidationSourceState =
+        serde_json::from_value(value?.clone()).ok()?;
+    if source
+        .start_fence
+        .as_ref()
+        .is_some_and(|fence| !fence.is_valid())
+    {
+        return None;
+    }
+    serde_json::to_value(source).ok()
 }
 
 fn sanitized_test_count_assertion(value: Option<&Value>) -> Option<Value> {
@@ -1412,20 +1400,98 @@ mod result_expectation_tests {
     use super::*;
 
     #[test]
+    fn persistent_shell_evidence_accepts_compact_base64url_shell_id() {
+        let shell_id = "wc_shell_AAAAAAAA-AAAAAA_";
+        let evidence = persistent_shell_event_evidence_for_tool_result(
+            "execute_session_shell",
+            &json!({
+                "shell_id": shell_id,
+                "shell_state": "running",
+                "execution_state": "completed",
+                "command_started": true,
+                "command_completed": true
+            }),
+        )
+        .expect("session shell evidence");
+        assert_eq!(evidence.shell_id.as_deref(), Some(shell_id));
+    }
+
+    #[test]
     fn result_expectation_session_shell_exec_reuses_shared_contract_without_exit_code_list() {
         assert!(tool_supports_model_facing_result_expectation(
-            "session_shell_exec"
+            "execute_session_shell"
         ));
         validate_model_facing_result_expectation(
-            "session_shell_exec",
+            "execute_session_shell",
             &json!({"result_expectation": "observe"}),
         )
         .unwrap();
         assert!(validate_model_facing_result_expectation(
-            "session_shell_exec",
+            "execute_session_shell",
             &json!({"accepted_exit_codes": [0, 1]}),
         )
         .is_err());
+    }
+
+    #[test]
+    fn display_expectation_uses_terminal_facts_without_overriding_failures() {
+        let expectation = ToolCallExpectation {
+            result_expectation: Some("failure".into()),
+            ..Default::default()
+        };
+        let completed =
+            json!({"execution_state":"completed", "exit_code":1, "failure_kind":"process_exit"});
+        assert_eq!(
+            tool_result_expectation_classification(false, &expectation, &completed, None),
+            Some("matched_expected_failure")
+        );
+        assert_eq!(
+            tool_result_expectation_classification(true, &expectation, &completed, None),
+            Some("unexpected_success")
+        );
+        assert_eq!(
+            tool_result_expectation_classification(
+                false,
+                &expectation,
+                &json!({"execution_state":"timed_out"}),
+                None
+            ),
+            Some("unexpected_failure")
+        );
+        assert_eq!(
+            tool_result_expectation_classification(
+                true,
+                &expectation,
+                &json!({"execution_state":"running", "job_id":"job"}),
+                None
+            ),
+            None
+        );
+        assert_eq!(
+            tool_result_expectation_classification(
+                false,
+                &ToolCallExpectation::default(),
+                &completed,
+                None
+            ),
+            None
+        );
+        let accepted = ToolCallExpectation {
+            accepted_exit_codes: vec![1],
+            ..Default::default()
+        };
+        assert_eq!(
+            tool_result_expectation_classification(false, &accepted, &completed, None),
+            Some("matched_expected_result")
+        );
+        let rejected = ToolCallExpectation {
+            accepted_exit_codes: vec![0],
+            ..Default::default()
+        };
+        assert_eq!(
+            tool_result_expectation_classification(false, &rejected, &completed, None),
+            Some("expectation_mismatch")
+        );
     }
 
     #[test]
@@ -1590,6 +1656,80 @@ mod result_expectation_tests {
                 }),
             ),
             TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE
+        );
+    }
+}
+
+fn copy_project_validation_evidence(summary: &mut Value, output: &Value) {
+    if let Some(id) = output
+        .get("validation_target_id")
+        .and_then(Value::as_str)
+        .filter(|id| {
+            webcodex_core::validation_identity::is_structured_validation_target_identity(id)
+        })
+    {
+        summary["validation_target_id"] = json!(id);
+    }
+    for (field, allowed) in [
+        (
+            "adapter",
+            &[
+                "cargo_fmt",
+                "cargo_check",
+                "cargo_clippy",
+                "cargo_test",
+                "go_vet",
+                "go_test",
+                "python:pytest:test",
+                "python:ruff:check",
+                "python:ruff:format",
+                "node:script:check",
+                "node:tap:test",
+            ][..],
+        ),
+        ("action", &["format_check", "check", "lint", "test"][..]),
+        ("backend", &["rust", "go", "python", "node"][..]),
+    ] {
+        if let Some(value) = output
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|v| allowed.contains(v))
+        {
+            summary[field] = json!(value);
+        }
+    }
+}
+
+#[cfg(test)]
+mod retention_error_kind_tests {
+    use super::{actual_failure_kind_for_tool_result, classify_error_message};
+    use serde_json::json;
+
+    #[test]
+    fn retention_expired_stays_a_distinct_error_kind() {
+        let message = "session_retention_expired: wc_sess_x existed, but its Closed-session historical retention expired";
+        assert_eq!(classify_error_message(message), "session_retention_expired");
+        assert_eq!(
+            classify_error_message("unknown_session_id: wc_sess_x"),
+            "unknown_session_id"
+        );
+        assert_eq!(
+            actual_failure_kind_for_tool_result(&json!({}), Some(message), Some("runtime_error"))
+                .as_deref(),
+            Some("session_retention_expired")
+        );
+        assert_eq!(
+            actual_failure_kind_for_tool_result(
+                &json!({
+                    "error_kind": "session_retention_expired",
+                    "session_id": "wc_sess_x",
+                    "state_changed": false,
+                }),
+                Some(message),
+                None,
+            )
+            .as_deref(),
+            Some("session_retention_expired")
         );
     }
 }

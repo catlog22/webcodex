@@ -2,7 +2,7 @@
 //!
 //! This is a **custom QUIC stream transport** for Runner connections, NOT
 //! HTTP/3. It runs a separate `quinn` UDP listener in parallel with the HTTP
-//! server (which keeps serving GPT Actions over TCP 443 via Nginx unchanged).
+//! server (which keeps serving MCP over TCP 443 via Nginx unchanged).
 //! Nginx is not involved in QUIC.
 //!
 //! QUIC is an alternative transport for the existing Runner envelope protocol.
@@ -28,7 +28,7 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 
 /// The rustls crypto provider used for the QUIC transport. The dependency tree
@@ -365,9 +365,23 @@ async fn handle_quic_connection(
         mpsc::channel::<RunnerEnvelope>(crate::runner_session::OUTGOING_CHANNEL_CAPACITY);
     let writer_task = tokio::spawn(async move {
         while let Some(env) = out_rx.recv().await {
+            let envelope_kind = env.kind();
+            let send_started = Instant::now();
             if write_quic_frame(&mut send, &env).await.is_err() {
+                crate::runner_http::observe_server_stream_writer_send(
+                    RunnerTransport::Quic,
+                    envelope_kind,
+                    None,
+                    crate::runner_http::RunnerStreamMetricOutcome::TransportError,
+                );
                 return crate::runner_session::WriterExit::TransportFailed;
             }
+            crate::runner_http::observe_server_stream_writer_send(
+                RunnerTransport::Quic,
+                envelope_kind,
+                Some(send_started.elapsed()),
+                crate::runner_http::RunnerStreamMetricOutcome::Success,
+            );
         }
         if send.finish().is_err() {
             crate::runner_session::WriterExit::TransportFailed
@@ -388,7 +402,7 @@ async fn handle_quic_connection(
             connection_id: &connection_id,
             notify,
             cancel,
-            transport_label: "quic",
+            transport: RunnerTransport::Quic,
         },
         out_tx,
         reader,
@@ -466,10 +480,11 @@ mod tests {
     use super::*;
     use crate::runner_protocol::{
         RunnerCapabilities, RunnerJobUpdateRequest, RunnerProtocolGenerationNumber,
-        RunnerRegisterRequest, RunnerResultRequest, ShellJobOpRequest, ShellRunRequest,
-        RUNNER_PROTOCOL_GENERATION_V2, RUNNER_QUIC_ALPN_V1,
+        RunnerRegisterRequest, RunnerResultRequest, ShellRunRequest, RUNNER_PROTOCOL_GENERATION_V2,
+        RUNNER_QUIC_ALPN_V1,
     };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    use webcodex_runner_registry::JobStartRequest;
 
     /// ALPN used by the QUIC integration tests.
     const TEST_ALPN: &str = RUNNER_QUIC_ALPN_V1;
@@ -562,85 +577,21 @@ mod tests {
         generation: RunnerProtocolGenerationNumber,
         auth_token: Option<String>,
     ) -> QuicRegisterFrame {
-        let capabilities = crate::test_support::current_runner_capabilities(RunnerCapabilities {
-            shell: true,
-            file_read: true,
-            file_write: true,
-            artifact_export_chunk_read: false,
-            artifact_export_streaming_metadata: false,
-            structured_file_delete: true,
-            apply_text_edit_occurrence: false,
-            apply_text_edit_line_scope: false,
-            apply_patch: false,
-            apply_patch_match_metadata: false,
-            apply_patch_matching_mode: false,
-            apply_patch_strict_matching: false,
-            git: false,
-            jobs: true,
-            async_jobs: true,
-            async_shell_jobs: true,
-            ssh_shell: false,
-            persistent_shell: false,
-            ssh_persistent_shell: false,
-            structured_validation_argv: true,
-            structured_cargo_test_count_assertion: true,
-            structured_cargo_test_execution_policy: true,
-            structured_cargo_test_lib: true,
-            structured_go_test_json: true,
-            structured_go_test_tool: true,
-            structured_go_test_packages: true,
-            structured_process_argv: true,
-            structured_script_payload: false,
-            structured_script_javascript: false,
-            structured_script_typescript: false,
-            internal_posix_script: false,
-            structured_execution_jobs: false,
-            detached_process_jobs: false,
-            lsp_read_only_navigation: false,
-            lsp_call_hierarchy: false,
-            project_lifecycle: false,
-            project_path_registration: false,
-            managed_worktree: false,
-            skill_runtime: false,
-            skill_management: false,
-            computer_observe: false,
-            computer_application_discovery: false,
-            computer_application_launch: false,
-            computer_display_observe: false,
-            computer_pointer_control: false,
-            computer_clipboard_read: false,
-            computer_clipboard_write: false,
-            computer_snapshot_region: false,
-            computer_accessibility_observe: false,
-            computer_element_state: false,
-            computer_control: false,
-            computer_scroll_to_element: false,
-            computer_key_input: false,
-            computer_window_activate: false,
-            computer_text_input: false,
-            job_state_reconciliation: false,
-            coding_agent_runs: false,
-            native_tool_plugins: false,
-            managed_ssh_resources: false,
-            runner_config_control: false,
-        });
         QuicRegisterFrame::new(
             RunnerRegisterRequest {
-                process_started_at: None,
-                build: None,
-                job_concurrency_limit: None,
-                job_inventory: None,
-                coding_agent_providers: None,
-                coding_agent_inventory: None,
-                client_id: client_id.to_string(),
-                runner_instance_id: instance.to_string(),
                 runner_protocol_generation: generation,
                 display_name: Some("quic-test".to_string()),
                 owner: Some("tester".to_string()),
-                hostname: None,
-                host_context: None,
-                capabilities: capabilities,
-                policy: None,
+                ..crate::test_support::runner_registration(
+                    client_id,
+                    instance,
+                    RunnerCapabilities {
+                        structured_cargo_test_execution_policy: true,
+                        structured_cargo_test_lib: true,
+                        structured_cargo_check_packages: true,
+                        ..Default::default()
+                    },
+                )
             },
             auth_token,
         )
@@ -997,6 +948,7 @@ mod tests {
         let (request_id, rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "quic-gen2-rt".to_string(),
                     cwd: None,
                     command: "echo hi".to_string(),
@@ -1032,6 +984,8 @@ mod tests {
                     exit_code: Some(0),
                     stdout: Some("hi\n".to_string()),
                     stderr: Some(String::new()),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: Some(2),
                     error: None,
                 }
@@ -1094,20 +1048,13 @@ mod tests {
 
         let job = registry
             .start_job(
-                ShellJobOpRequest {
-                    op: "start".to_string(),
-                    client_id: Some("quic-job".to_string()),
-                    cwd: None,
-                    command: Some("printf hi".to_string()),
-                    timeout_secs: Some(5),
-                    job_id: None,
-                    since_stdout_line: None,
-                    since_stderr_line: None,
-                    tail_lines: None,
-                    limit: None,
-                    codex: None,
+                JobStartRequest {
+                    timeout_secs: 5,
+                    ..JobStartRequest::shell("quic-job".to_string(), "printf hi".to_string())
                 },
                 "tester".to_string(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1136,14 +1083,15 @@ mod tests {
                     status: "running".to_string(),
                     stdout_chunk: Some("hi".to_string()),
                     stderr_chunk: None,
-                    stdout_tail: None,
-                    stderr_tail: None,
                     log_snapshot: None,
                     exit_code: None,
                     duration_ms: None,
                     error: None,
                     command_execution_state: None,
                     validation_progress: None,
+                    test_count_evidence: None,
+                    format_mutation: None,
+                    build_artifacts: None,
                     activity: None,
                     finished: false,
                 },
@@ -1198,20 +1146,13 @@ mod tests {
 
         let job = registry
             .start_job(
-                ShellJobOpRequest {
-                    op: "start".to_string(),
-                    client_id: Some("quic-disc".to_string()),
-                    cwd: None,
-                    command: Some("sleep 10".to_string()),
-                    timeout_secs: Some(10),
-                    job_id: None,
-                    since_stdout_line: None,
-                    since_stderr_line: None,
-                    tail_lines: None,
-                    limit: None,
-                    codex: None,
+                JobStartRequest {
+                    timeout_secs: 10,
+                    ..JobStartRequest::shell("quic-disc".to_string(), "sleep 10".to_string())
                 },
                 "tester".to_string(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1249,6 +1190,7 @@ mod tests {
         let err = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "quic-disc".to_string(),
                     cwd: None,
                     command: "echo after".to_string(),
@@ -1513,7 +1455,7 @@ mod tests {
     }
 
     /// A QUIC-registered Runner must surface protocol generation 2 and the
-    /// `quic` transport in `list_runners` (used by runtime_status / list_runners).
+    /// `quic` transport in `list_runners` (used by get_runtime_status / list_runners).
     #[tokio::test]
     async fn quic_runner_surfaces_transport_and_protocol_in_list() {
         let (cert_der, key_der) = self_signed_cert();
@@ -1615,6 +1557,7 @@ mod tests {
         let (request_id, _rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "quic-steal".to_string(),
                     cwd: None,
                     command: "echo hi".to_string(),

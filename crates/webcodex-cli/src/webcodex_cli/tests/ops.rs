@@ -6,6 +6,90 @@ use crate::webcodex_cli::ops::{
 use crate::webcodex_cli::run_ops_command;
 use std::time::Duration;
 
+// A stateful HTTP fixture proves that an operator inventory follows the actual
+// continuation and does not silently treat the first model page as complete.
+#[tokio::test]
+async fn bounded_project_discovery_ops_traverses_all_pages() {
+    use std::io::BufRead as _;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let mut offsets = Vec::new();
+        loop {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut reader = std::io::BufReader::new(&mut stream);
+                    let mut length = 0;
+                    loop {
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        if line == "\r\n" || line.is_empty() {
+                            break;
+                        }
+                        if let Some(value) =
+                            line.to_ascii_lowercase().strip_prefix("content-length:")
+                        {
+                            length = value.trim().parse::<usize>().unwrap();
+                        }
+                    }
+                    let mut body = vec![0u8; length];
+                    reader.read_exact(&mut body).unwrap();
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    assert_eq!(request["tool"], "list_projects");
+                    assert_eq!(request["params"]["summary_only"], false);
+                    assert_eq!(request["params"]["limit"], 100);
+                    let offset = request["params"]["offset"].as_u64().unwrap();
+                    offsets.push(offset);
+                    let end = (offset + 100).min(211);
+                    let projects = (offset..end)
+                        .map(|index| {
+                            json!({
+                                "id":format!("agent:ops:p{index:03}"),"connected":true,
+                                "agent_status":"online","enabled":true,
+                                "capabilities":{"recommended_for_smoke":false}
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let response = json!({"success":true,"output":{
+                        "projects":projects,"count":end-offset,"matched_count":211,
+                        "offset":offset,"limit":100,"next_offset":(end < 211).then_some(end),
+                        "truncated":end < 211
+                    }})
+                    .to_string();
+                    write!(stream,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        response.len(), response).unwrap();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("fixture accept: {error}"),
+            }
+        }
+        offsets
+    });
+    let mut opts = ops_common_opts(format!("http://{address}"));
+    opts.token = Some("wc_pat_bounded_inventory_fixture".into());
+    opts.json = true;
+    let result = run_ops_command(OpsCommand::Projects(opts)).await;
+    stop_tx.send(()).unwrap();
+    let offsets = server.join().unwrap();
+    assert_eq!(offsets, vec![0, 100, 200]);
+    let output: Value = serde_json::from_str(&result.unwrap().stdout).unwrap();
+    assert_eq!(output["summary"]["count"], 211, "{output}");
+    assert_eq!(output["summary"]["matched_count"], 211);
+    assert_eq!(output["summary"]["truncated"], false);
+}
+
 #[test]
 fn ops_help_entrypoints_print_usage() {
     let cases: &[(&[&str], &[&str])] = &[
@@ -348,7 +432,7 @@ async fn ops_projects_http_401_uses_ops_report() {
     let output = run_ops_with_routes(
         OpsCommand::Projects(ops_common_opts(String::new())),
         vec![(
-            "/api/projects/list",
+            "/api/tools/call",
             json_http_response(401, json!({"error": "missing token"})),
         )],
     )
@@ -375,7 +459,7 @@ async fn ops_smoke_preflight_projects_401_uses_ops_report() {
                 ),
             ),
             (
-                "/api/projects/list",
+                "/api/tools/call",
                 json_http_response(401, json!({"error": "missing token"})),
             ),
         ],
@@ -408,12 +492,14 @@ async fn ops_http_403_reports_forbidden() {
 #[tokio::test]
 async fn ops_connection_failure_reports_runtime_unreachable() {
     let (addr, handle) = spawn_connection_drop_server();
-    let output = run_ops_command(OpsCommand::Status(ops_common_opts(format!(
-        "http://{addr}"
-    ))))
-    .await
-    .unwrap()
-    .stdout;
+    let mut opts = ops_common_opts(format!("http://{addr}"));
+    // Keep this transport-failure fixture independent of any Runner token in
+    // the parent test environment; ops/runtime APIs require a user PAT.
+    opts.token = Some("wc_pat_connection_failure_fixture".to_string());
+    let output = run_ops_command(OpsCommand::Status(opts))
+        .await
+        .unwrap()
+        .stdout;
     handle.join().unwrap();
     assert!(output.contains("Overall: FAIL"), "{output}");
     assert!(output.contains("runtime_unreachable"), "{output}");
@@ -432,8 +518,8 @@ fn ops_strict_exit_code_follows_report_status() {
     assert_eq!(ops_exit_code(true, warn.verdict.status), 0);
 
     let mut fail_runtime = runtime_status_fixture();
-    fail_runtime["agents"]["online_count"] = json!(0);
-    fail_runtime["agents"]["summary"]["online"] = json!(0);
+    fail_runtime["runners"]["online_count"] = json!(0);
+    fail_runtime["runners"]["summary"]["online"] = json!(0);
     let fail = ops_status_report("https://ops.example.test", &Some(fail_runtime));
     assert_eq!(fail.verdict.status, "fail");
     assert_eq!(ops_exit_code(true, fail.verdict.status), 2);
@@ -472,25 +558,19 @@ fn runtime_status_fixture() -> Value {
         "jobs": {
             "active_count": 0
         },
-        "agents": {
+        "runners": {
             "online_count": 1,
             "stale_count": 0,
-            "summary": {
-                "online": 1,
-                "offline": 0,
-                "stale": 0,
-                "clients": [
-                    {
-                        "client_id": "ops-agent",
-                        "status": "online",
-                        "transport": "websocket",
-                        "projects_count": 1,
-                        "active_jobs": 0,
-                        "pending_requests": 0,
-                        "last_seen_age_secs": 2
-                    }
-                ]
-            }
+            "summary": {"online": 1, "offline": 0, "stale": 0},
+            "clients": [{
+                "client_id": "ops-agent",
+                "status": "online",
+                "transport": "websocket",
+                "projects_count": 1,
+                "active_jobs": 0,
+                "pending_requests": 0,
+                "last_seen_age_secs": 2
+            }]
         },
         "projects": {
             "effective": {
@@ -499,6 +579,41 @@ fn runtime_status_fixture() -> Value {
             }
         }
     })
+}
+
+#[test]
+fn ops_reports_emit_only_runner_keys_from_canonical_input() {
+    let runtime = Some(runtime_status_fixture());
+    let status = ops_status_report("http://runtime.example", &runtime);
+    assert_eq!(
+        status.summary["runners"]["clients"][0]["client_id"],
+        "ops-agent"
+    );
+    assert!(status.summary.get("agents").is_none());
+    assert!(render_ops_status(&status, false)
+        .unwrap()
+        .contains("ops-agent"));
+    let runners = ops_runners_report("http://runtime.example", &runtime);
+    assert_eq!(runners.summary["runners"][0]["projects_count"], 1);
+    assert!(runners.summary.get("agents").is_none());
+    let missing = ops_runners_report("http://runtime.example", &None);
+    assert_eq!(missing.summary["runners"], json!([]));
+    assert!(missing.summary.get("agents").is_none());
+    let mut empty = runtime_status_fixture();
+    empty["runners"] = json!({"online_count":0,"stale_count":0,"clients":[],"summary":{"online":0,"offline":0,"stale":0}});
+    let empty = ops_runners_report("http://runtime.example", &Some(empty));
+    assert_eq!(empty.summary["runners"], json!([]));
+    assert!(empty.summary.get("agents").is_none());
+    let focused = ops_runner_report(
+        "http://runtime.example",
+        "msi",
+        &Some(runner_runtime_status_fixture()),
+    );
+    assert_eq!(focused.summary["runner_instance_id"], "instance-new");
+    assert!(focused.summary.get("agent_instance_id").is_none());
+    assert!(render_ops_runner(&focused, false)
+        .unwrap()
+        .contains("instance-new"));
 }
 
 fn runner_runtime_status_fixture() -> Value {
@@ -512,7 +627,7 @@ fn runner_runtime_status_fixture() -> Value {
             "client_id": "msi",
             "connected": true,
             "status": "online",
-            "agent_instance_id": "instance-new",
+            "runner_instance_id": "instance-new",
             "build": {
                 "version": "0.3.8",
                 "git_commit": "candidate1234",
@@ -794,11 +909,11 @@ fn spawn_smoke_preflight_server(
                     let first_line = request.lines().next().unwrap_or_default().to_string();
                     let body = if first_line.starts_with("POST /api/runtime/status ") {
                         json!({"success": true, "output": runtime_status_fixture()})
-                    } else if first_line.starts_with("POST /api/projects/list ") {
+                    } else if request.contains(r#""tool":"list_projects""#) {
                         json!({"success": true, "output": projects.clone()})
-                    } else if request.contains(r#""tool":"show_changes""#) {
+                    } else if request.contains(r#""tool":"read_workspace_changes""#) {
                         json!({"success": true, "output": clean_show_changes_fixture()})
-                    } else if request.contains(r#""tool":"workspace_hygiene_check""#) {
+                    } else if request.contains(r#""tool":"check_workspace_hygiene""#) {
                         json!({"success": true, "output": clean_hygiene_fixture()})
                     } else {
                         json!({"success": false, "error": "unexpected request"})
@@ -839,6 +954,14 @@ async fn run_smoke_preflight_with_projects(
     .stdout;
     stop_tx.send(()).unwrap();
     let requests = handle.join().unwrap();
+    for request in &requests {
+        let (_, body) = request.split_once("\r\n\r\n").unwrap();
+        let body: Value = serde_json::from_str(body).unwrap();
+        if body["tool"] == "list_projects" {
+            assert_eq!(body["params"]["project"], project);
+            assert_eq!(body["params"]["summary_only"], false);
+        }
+    }
     (output, requests)
 }
 
@@ -848,13 +971,13 @@ fn smoke_request_kinds(requests: &[String]) -> Vec<&'static str> {
         .map(|request| {
             let first_line = request.lines().next().unwrap_or_default();
             if first_line.starts_with("POST /api/runtime/status ") {
-                "runtime_status"
-            } else if first_line.starts_with("POST /api/projects/list ") {
-                "projects_list"
-            } else if request.contains(r#""tool":"show_changes""#) {
-                "show_changes"
-            } else if request.contains(r#""tool":"workspace_hygiene_check""#) {
-                "workspace_hygiene_check"
+                "get_runtime_status"
+            } else if request.contains(r#""tool":"list_projects""#) {
+                "list_projects"
+            } else if request.contains(r#""tool":"read_workspace_changes""#) {
+                "read_workspace_changes"
+            } else if request.contains(r#""tool":"check_workspace_hygiene""#) {
+                "check_workspace_hygiene"
             } else {
                 "unexpected"
             }
@@ -864,8 +987,8 @@ fn smoke_request_kinds(requests: &[String]) -> Vec<&'static str> {
 
 fn assert_no_workspace_preflight_tools(requests: &[String]) {
     let joined = requests.join("\n---\n");
-    assert!(!joined.contains(r#""tool":"show_changes""#));
-    assert!(!joined.contains(r#""tool":"workspace_hygiene_check""#));
+    assert!(!joined.contains(r#""tool":"read_workspace_changes""#));
+    assert!(!joined.contains(r#""tool":"check_workspace_hygiene""#));
 }
 
 #[test]
@@ -928,11 +1051,11 @@ fn ops_status_tool_inventory_rejects_missing_empty_or_inconsistent_data() {
 #[test]
 fn ops_status_no_online_agents_fails() {
     let mut runtime = runtime_status_fixture();
-    runtime["agents"]["online_count"] = json!(0);
-    runtime["agents"]["stale_count"] = json!(1);
-    runtime["agents"]["summary"]["online"] = json!(0);
-    runtime["agents"]["summary"]["stale"] = json!(1);
-    runtime["agents"]["summary"]["clients"][0]["status"] = json!("stale");
+    runtime["runners"]["online_count"] = json!(0);
+    runtime["runners"]["stale_count"] = json!(1);
+    runtime["runners"]["summary"]["online"] = json!(0);
+    runtime["runners"]["summary"]["stale"] = json!(1);
+    runtime["runners"]["clients"][0]["status"] = json!("stale");
     let report = ops_status_report("https://ops.example.test", &Some(runtime));
     assert_eq!(report.verdict.status, "fail");
     assert!(report
@@ -956,11 +1079,11 @@ fn ops_status_active_jobs_warns() {
 #[test]
 fn ops_runners_maps_online_stale_and_jobs() {
     let mut runtime = runtime_status_fixture();
-    runtime["agents"]["online_count"] = json!(1);
-    runtime["agents"]["stale_count"] = json!(1);
-    runtime["agents"]["summary"]["online"] = json!(1);
-    runtime["agents"]["summary"]["stale"] = json!(1);
-    runtime["agents"]["summary"]["clients"] = json!([
+    runtime["runners"]["online_count"] = json!(1);
+    runtime["runners"]["stale_count"] = json!(1);
+    runtime["runners"]["summary"]["online"] = json!(1);
+    runtime["runners"]["summary"]["stale"] = json!(1);
+    runtime["runners"]["clients"] = json!([
         {
             "client_id": "online",
             "status": "online",
@@ -998,7 +1121,7 @@ fn ops_runner_projects_only_exact_safe_runtime_identity() {
     assert_eq!(report.verdict.status, "pass");
     assert_eq!(report.summary["client_id"], "msi");
     assert_eq!(report.summary["connected"], true);
-    assert_eq!(report.summary["agent_instance_id"], "instance-new");
+    assert_eq!(report.summary["runner_instance_id"], "instance-new");
     assert_eq!(report.summary["build"]["git_commit"], "candidate1234");
     assert_eq!(report.summary["build"]["git_dirty"], false);
     assert_eq!(report.summary["source_alignment"]["status"], "different");
@@ -1214,7 +1337,7 @@ fn ops_smoke_preflight_online_non_recommended_project_warns() {
 fn ops_json_and_human_outputs_do_not_contain_secret_values() {
     let secret = "secret-token-value";
     let mut runtime = runtime_status_fixture();
-    runtime["agents"]["summary"]["clients"][0]["client_id"] = json!("safe-agent");
+    runtime["runners"]["clients"][0]["client_id"] = json!("safe-agent");
     let report = ops_status_report("https://ops.example.test", &Some(runtime));
     let json_output = render_ops_status(&report, true).unwrap();
     let human_output = render_ops_status(&report, false).unwrap();
@@ -1235,17 +1358,17 @@ async fn ops_smoke_preflight_calls_only_read_only_endpoints() {
     assert_eq!(
         smoke_request_kinds(&requests),
         vec![
-            "runtime_status",
-            "projects_list",
-            "show_changes",
-            "workspace_hygiene_check"
+            "get_runtime_status",
+            "list_projects",
+            "read_workspace_changes",
+            "check_workspace_hygiene"
         ]
     );
     let joined = requests.join("\n---\n");
     assert!(joined.contains("POST /api/runtime/status "));
-    assert!(joined.contains("POST /api/projects/list "));
-    assert!(joined.contains(r#""tool":"show_changes""#));
-    assert!(joined.contains(r#""tool":"workspace_hygiene_check""#));
+    assert!(joined.contains(r#""tool":"list_projects""#));
+    assert!(joined.contains(r#""tool":"read_workspace_changes""#));
+    assert!(joined.contains(r#""tool":"check_workspace_hygiene""#));
     assert!(!joined.contains(r#""tool":"run_shell""#));
     assert!(!joined.contains(r#""tool":"run_job""#));
     assert!(!output.contains("secret-smoke-token"));
@@ -1258,7 +1381,7 @@ async fn ops_smoke_preflight_project_missing_short_circuits() {
         run_smoke_preflight_with_projects(projects_fixture(true), "agent:ops:missing").await;
     assert_eq!(
         smoke_request_kinds(&requests),
-        vec!["runtime_status", "projects_list"]
+        vec!["get_runtime_status", "list_projects"]
     );
     assert_no_workspace_preflight_tools(&requests);
     assert!(output.contains("Overall: FAIL"));
@@ -1275,7 +1398,7 @@ async fn ops_smoke_preflight_disconnected_project_short_circuits() {
     let (output, requests) = run_smoke_preflight_with_projects(projects, "agent:ops:smoke").await;
     assert_eq!(
         smoke_request_kinds(&requests),
-        vec!["runtime_status", "projects_list"]
+        vec!["get_runtime_status", "list_projects"]
     );
     assert_no_workspace_preflight_tools(&requests);
     assert!(output.contains("Overall: FAIL"));
@@ -1300,7 +1423,7 @@ async fn ops_smoke_preflight_non_git_project_short_circuits() {
     let (output, requests) = run_smoke_preflight_with_projects(projects, "agent:ops:smoke").await;
     assert_eq!(
         smoke_request_kinds(&requests),
-        vec!["runtime_status", "projects_list"]
+        vec!["get_runtime_status", "list_projects"]
     );
     assert_no_workspace_preflight_tools(&requests);
     assert!(output.contains("Overall: FAIL"));

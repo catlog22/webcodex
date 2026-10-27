@@ -1,9 +1,14 @@
 use super::*;
 use std::fs::OpenOptions;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
+#[cfg(unix)]
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(unix)]
 static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[cfg(unix)]
 fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     TEST_ENV_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -75,7 +80,7 @@ fn internal_mode_subprocess_entrypoint() {
 fn safe_context() -> ShellJobContext {
     ShellJobContext {
         runtime_project_id: Some("agent:test:project".to_string()),
-        workflow_session_id: Some("wc_sess_test".to_string()),
+        workflow_session_id: Some("wc_sess_n_gsG5blnjZHfyYD".to_string()),
         ssh_resource: None,
         project_cwd: Some("/tmp/project".to_string()),
         cwd: Some("/tmp/project".to_string()),
@@ -103,6 +108,23 @@ fn test_request(executable: String, args: Vec<String>) -> DetachedStartRequest {
             timeout_secs: 10,
         },
     }
+}
+
+#[test]
+fn detached_launch_accepts_six_hours_and_rejects_above_seven_days() {
+    let mut request = test_request("/bin/true".to_string(), Vec::new());
+    request.launch.timeout_secs = 21_600;
+    assert!(validate_start_request(&request).is_ok());
+
+    request.launch.timeout_secs = PROCESS_TIMEOUT_MAX_SECS;
+    assert!(validate_start_request(&request).is_ok());
+
+    request.launch.timeout_secs = PROCESS_TIMEOUT_MAX_SECS + 1;
+    let error = validate_start_request(&request).unwrap_err();
+    assert!(
+        error.contains(&PROCESS_TIMEOUT_MAX_SECS.to_string()),
+        "{error}"
+    );
 }
 
 #[cfg(any(unix, windows))]
@@ -524,7 +546,7 @@ fn process_alive(pid: u32) -> bool {
     rc == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(any(unix, all(windows, feature = "runner-real-process-tests")))]
 fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -536,7 +558,7 @@ fn wait_until(timeout: Duration, mut predicate: impl FnMut() -> bool) -> bool {
     predicate()
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(any(unix, all(windows, feature = "runner-real-process-tests")))]
 fn wait_for_terminal(store: &DetachedJobStore, job_id: &str) -> DetachedJobRecord {
     assert!(wait_until(Duration::from_secs(15), || {
         store

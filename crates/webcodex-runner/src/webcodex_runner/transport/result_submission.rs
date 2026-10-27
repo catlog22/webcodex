@@ -1,20 +1,24 @@
 use std::fmt;
 use std::sync::{atomic::AtomicBool, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::blocking::Client;
 
-use crate::runner_protocol::{
+use super::http_client::{RunnerHttpError, RunnerHttpErrorKind};
+use crate::webcodex_runner::config::{HotRunnerConfig, ReloadableRunnerConfig};
+use crate::webcodex_runner::dispatch::runner_tool_trace_enabled;
+use crate::webcodex_runner::output::CommandResult;
+use crate::webcodex_runner::ShellCommandResult;
+use webcodex_core::runner_protocol::{
     RunnerEnvelope, RunnerJobUpdateRequest, RunnerJobUpdateResponse,
     RunnerPersistentShellResultRequest, RunnerPersistentShellResultResponse, RunnerResultPayload,
     RunnerResultRequest, RunnerResultResponse,
 };
-use crate::webcodex_runner::config::{HotRunnerConfig, ReloadableRunnerConfig};
-use crate::webcodex_runner::dispatch::runner_tool_trace_enabled;
-use crate::webcodex_runner::ShellCommandResult;
-use crate::{CommandResult, RunnerHttpError, RunnerHttpErrorKind};
 
-use super::{concise_log_error, send_provider_metadata, sleep_or_shutdown};
+use super::{
+    concise_log_error, observe_runner_request_duration, observe_runner_stream_outgoing_channel,
+    send_provider_metadata, sleep_or_shutdown, RunnerStreamMetricOutcome, StreamTransport,
+};
 
 /// Result submission endpoint used by the polling transport sink.
 pub(super) const RUNNER_RESULT_PATH: &str = "/api/shell/agent/result";
@@ -260,6 +264,22 @@ impl RunnerSink {
         }
     }
 
+    fn transport_name(&self) -> &'static str {
+        match self {
+            RunnerSink::Http(_) => webcodex_runner_config::TRANSPORT_POLLING,
+            RunnerSink::WebSocket { .. } => webcodex_runner_config::TRANSPORT_WEBSOCKET,
+            RunnerSink::Quic { .. } => webcodex_runner_config::TRANSPORT_QUIC,
+        }
+    }
+
+    fn stream_transport(&self) -> Option<StreamTransport> {
+        match self {
+            RunnerSink::Http(_) => None,
+            RunnerSink::WebSocket { .. } => Some(StreamTransport::WebSocket),
+            RunnerSink::Quic { .. } => Some(StreamTransport::Quic),
+        }
+    }
+
     /// Active Runner process identity carried by this sink so every result /
     /// job_update submission includes it.
     pub(crate) fn runner_instance_id(&self) -> &str {
@@ -289,6 +309,8 @@ impl RunnerSink {
                 exit_code: result.exit_code,
                 stdout: result.stdout,
                 stderr: result.stderr,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: result.duration_ms,
                 error: result.error,
             },
@@ -304,7 +326,7 @@ impl RunnerSink {
     pub(crate) fn submit_mcp_gateway_result(
         &self,
         request_id: String,
-        response: crate::mcp_gateway::McpGatewayResponse,
+        response: webcodex_core::mcp_gateway::McpGatewayResponse,
     ) -> Result<ResultSubmission, SubmitResultError> {
         self.submit_result_payload(RunnerResultPayload {
             result: RunnerResultRequest {
@@ -314,6 +336,8 @@ impl RunnerSink {
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -340,6 +364,8 @@ impl RunnerSink {
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -365,6 +391,8 @@ impl RunnerSink {
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -380,6 +408,9 @@ impl RunnerSink {
         body: RunnerResultPayload,
     ) -> Result<ResultSubmission, SubmitResultError> {
         let request_id = body.result.request_id.clone();
+        if let Some(duration_ms) = body.result.duration_ms {
+            observe_runner_request_duration(self.transport_name(), duration_ms);
+        }
         if runner_tool_trace_enabled() {
             tracing::info!(
                 event = "runner_tool_result_submit_started",
@@ -392,13 +423,35 @@ impl RunnerSink {
         let submitted = match self {
             RunnerSink::Http(h) => submit_result_http(h, &body),
             RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
+                let transport = self
+                    .stream_transport()
+                    .expect("push RunnerSink must have stream transport");
+                let queue_started = Instant::now();
                 let env = RunnerEnvelope::Result { payload: body };
-                tx.blocking_send(env).map_err(|_| {
-                    SubmitResultError::TransportClosed(
-                        "agent transport result channel closed".to_string(),
-                    )
-                })?;
-                Ok(ResultSubmission::Accepted)
+                match tx.blocking_send(env) {
+                    Ok(()) => {
+                        observe_runner_stream_outgoing_channel(
+                            transport,
+                            "result",
+                            Some(queue_started.elapsed()),
+                            false,
+                            RunnerStreamMetricOutcome::Success,
+                        );
+                        Ok(ResultSubmission::Accepted)
+                    }
+                    Err(_) => {
+                        observe_runner_stream_outgoing_channel(
+                            transport,
+                            "result",
+                            None,
+                            false,
+                            RunnerStreamMetricOutcome::Closed,
+                        );
+                        Err(SubmitResultError::TransportClosed(
+                            "agent transport result channel closed".to_string(),
+                        ))
+                    }
+                }
             }
         };
         if runner_tool_trace_enabled() {
@@ -430,6 +483,8 @@ impl RunnerSink {
         let ShellCommandResult {
             result,
             execution_state,
+            stdout_truncated,
+            stderr_truncated,
         } = shell_result;
         let body = RunnerResultPayload {
             result: RunnerResultRequest {
@@ -439,6 +494,8 @@ impl RunnerSink {
                 exit_code: result.exit_code,
                 stdout: result.stdout,
                 stderr: result.stderr,
+                stdout_truncated,
+                stderr_truncated,
                 duration_ms: result.duration_ms,
                 error: result.error,
             },
@@ -477,7 +534,7 @@ impl RunnerSink {
     pub(crate) fn submit_persistent_shell_result(
         &self,
         request_id: String,
-        result: crate::runner_protocol::PersistentShellResult,
+        result: webcodex_core::runner_protocol::PersistentShellResult,
     ) -> Result<ResultSubmission, SubmitResultError> {
         let body = RunnerPersistentShellResultRequest {
             client_id: self.client_id().to_string(),
@@ -488,13 +545,35 @@ impl RunnerSink {
         match self {
             RunnerSink::Http(h) => submit_persistent_shell_result_http(h, &body),
             RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
-                tx.blocking_send(RunnerEnvelope::PersistentShellResult { payload: body })
-                    .map_err(|_| {
-                        SubmitResultError::TransportClosed(
+                let transport = self
+                    .stream_transport()
+                    .expect("push RunnerSink must have stream transport");
+                let queue_started = Instant::now();
+                let env = RunnerEnvelope::PersistentShellResult { payload: body };
+                match tx.blocking_send(env) {
+                    Ok(()) => {
+                        observe_runner_stream_outgoing_channel(
+                            transport,
+                            "persistent_shell_result",
+                            Some(queue_started.elapsed()),
+                            false,
+                            RunnerStreamMetricOutcome::Success,
+                        );
+                        Ok(ResultSubmission::Accepted)
+                    }
+                    Err(_) => {
+                        observe_runner_stream_outgoing_channel(
+                            transport,
+                            "persistent_shell_result",
+                            None,
+                            false,
+                            RunnerStreamMetricOutcome::Closed,
+                        );
+                        Err(SubmitResultError::TransportClosed(
                             "agent transport persistent shell result channel closed".to_string(),
-                        )
-                    })?;
-                Ok(ResultSubmission::Accepted)
+                        ))
+                    }
+                }
             }
         }
     }
@@ -507,7 +586,10 @@ impl RunnerSink {
         let (RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. }) = self else {
             return;
         };
-        send_provider_metadata(tx, runtime, Some(generation));
+        let transport = self
+            .stream_transport()
+            .expect("push RunnerSink must have stream transport");
+        send_provider_metadata(transport, tx, runtime, Some(generation));
     }
 
     pub(crate) fn same_job_update_target(&self, other: &Self) -> bool {
@@ -553,13 +635,41 @@ impl RunnerSink {
                 }
             }
             RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
+                let transport = self
+                    .stream_transport()
+                    .expect("push RunnerSink must have stream transport");
                 let env = RunnerEnvelope::JobUpdate {
                     payload: body.clone(),
                 };
                 match tx.try_send(env) {
-                    Ok(()) => Ok(true),
-                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(false),
+                    Ok(()) => {
+                        observe_runner_stream_outgoing_channel(
+                            transport,
+                            "job_update",
+                            None,
+                            false,
+                            RunnerStreamMetricOutcome::Success,
+                        );
+                        Ok(true)
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        observe_runner_stream_outgoing_channel(
+                            transport,
+                            "job_update",
+                            None,
+                            true,
+                            RunnerStreamMetricOutcome::Backpressure,
+                        );
+                        Ok(false)
+                    }
                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                        observe_runner_stream_outgoing_channel(
+                            transport,
+                            "job_update",
+                            None,
+                            false,
+                            RunnerStreamMetricOutcome::Closed,
+                        );
                         Err("agent transport send failed".to_string())
                     }
                 }
@@ -590,11 +700,35 @@ impl RunnerSink {
                 }
             }
             RunnerSink::WebSocket { tx, .. } | RunnerSink::Quic { tx, .. } => {
+                let transport = self
+                    .stream_transport()
+                    .expect("push RunnerSink must have stream transport");
+                let queue_started = Instant::now();
                 let env = RunnerEnvelope::JobUpdate {
                     payload: body.clone(),
                 };
-                tx.blocking_send(env)
-                    .map_err(|_| "agent transport send failed".to_string())
+                match tx.blocking_send(env) {
+                    Ok(()) => {
+                        observe_runner_stream_outgoing_channel(
+                            transport,
+                            "job_update",
+                            Some(queue_started.elapsed()),
+                            false,
+                            RunnerStreamMetricOutcome::Success,
+                        );
+                        Ok(())
+                    }
+                    Err(_) => {
+                        observe_runner_stream_outgoing_channel(
+                            transport,
+                            "job_update",
+                            None,
+                            false,
+                            RunnerStreamMetricOutcome::Closed,
+                        );
+                        Err("agent transport send failed".to_string())
+                    }
+                }
             }
         }
     }
@@ -686,5 +820,7 @@ where
     T: serde::Serialize + ?Sized,
     R: serde::de::DeserializeOwned,
 {
-    crate::post_json_with_auth(client, server_url, token, path, body)
+    crate::webcodex_runner::transport::http_client::post_json_with_auth(
+        client, server_url, token, path, body,
+    )
 }

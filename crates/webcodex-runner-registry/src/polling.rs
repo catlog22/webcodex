@@ -1,17 +1,23 @@
+use super::dispatch_fence::PendingDispatchFence;
 use super::jobs::{
-    assert_active_instance_locked, observe_job_terminal, replace_log_limited, request_preview,
-    retain_ordinary_result_stream, retain_result_stream_to,
+    assert_active_instance_locked, combine_result_stream_truncation, observe_job_terminal,
+    replace_log_limited, request_preview, retain_ordinary_result_stream_with_evidence,
+    retain_result_stream_to_with_evidence,
 };
-use super::requests::{remove_pending_request_locked, take_pending_request_locked};
+use super::requests::{
+    record_sync_request_cancellation, remove_pending_request_locked, take_pending_request_locked,
+};
 use super::state::JobLifecycleState;
 use super::validation::{validate_id, validate_runner_instance_id};
+use super::RunnerRequestCancellationReason;
 use super::{now_ts, RunnerFeature, RunnerRegistry};
 use webcodex_core::coding_agent::{
     validate_response_for_request as validate_coding_agent_response, CodingAgentDispatchState,
     CodingAgentResponse,
 };
 use webcodex_core::mcp_gateway::{
-    validate_response as validate_mcp_gateway_response, McpGatewayDispatchState, McpGatewayResponse,
+    validate_response as validate_mcp_gateway_response, McpGatewayDispatchState, McpGatewayRequest,
+    McpGatewayResponse, McpGatewayResponsePayload,
 };
 use webcodex_core::plugin::{
     validate_response_for_request as validate_plugin_gateway_response, PluginDispatchState,
@@ -92,51 +98,51 @@ impl RunnerRegistry {
             let Some(request_id) = request_id else {
                 return Ok(None);
             };
-            let stale_runner_config_error =
-                inner.pending_by_id.get(&request_id).and_then(|pending| {
-                    match (
-                        &pending.operation,
-                        pending.expected_runner_config_runner_instance_id.as_deref(),
-                    ) {
-                        (RunnerOperation::RunnerConfig(_), Some(expected)) => {
-                            let Some(runner) = inner.runners.get(&body.client_id) else {
-                                return Some((
-                                    "runner_replaced",
-                                    "Exact Runner disappeared before config operation dispatch"
-                                        .to_string(),
-                                ));
-                            };
-                            if runner.runner_instance_id != expected {
-                                return Some((
-                                    "runner_replaced",
-                                    "Exact Runner changed before config operation dispatch"
-                                        .to_string(),
-                                ));
-                            }
-                            (!runner
-                                .runner_features
-                                .supports(RunnerFeature::RunnerConfigControl))
-                            .then_some((
-                                "capability_unavailable",
-                                "Runner config-control capability changed before dispatch"
-                                    .to_string(),
-                            ))
-                        }
-                        (RunnerOperation::RunnerConfig(_), None) => Some((
-                            "runner_replaced",
-                            "Runner config exact-process fence is missing".to_string(),
-                        )),
-                        (_, Some(_)) => Some((
-                            "runner_replaced",
-                            "Runner config exact-process fence is inconsistent".to_string(),
-                        )),
-                        _ => None,
-                    }
-                });
-            if let Some((code, message)) = stale_runner_config_error {
+            // The exact synchronous Computer caller has stopped waiting. Retire
+            // only work not yet dispatched; this says nothing about a Host turn
+            // or an already dispatched native operation.
+            let abandoned_computer = inner.pending_by_id.get(&request_id).is_some_and(|pending| {
+                matches!(&pending.operation, RunnerOperation::Computer(_))
+                    && pending.job_id.is_none()
+                    && !pending.dispatched
+                    && pending
+                        .waiter
+                        .as_ref()
+                        .is_some_and(tokio::sync::oneshot::Sender::is_closed)
+            });
+            if abandoned_computer {
+                if let Some(pending) = take_pending_request_locked(&mut inner, &request_id) {
+                    record_sync_request_cancellation(
+                        self.telemetry.as_ref(),
+                        &pending,
+                        RunnerRequestCancellationReason::WaiterClosed,
+                    );
+                }
+                continue;
+            }
+            let stale_input = inner.pending_by_id.get(&request_id).and_then(|pending| {
+                super::job_input::dispatch_rejection(&inner, &pending.operation, &body.client_id)
+            });
+            if let Some(code) = stale_input {
                 let Some(mut pending) = inner.pending_by_id.remove(&request_id) else {
                     continue;
                 };
+                if let Some(id) = pending.job_id.as_deref() {
+                    inner.request_to_job.remove(&request_id);
+                    if let Some(job) = inner.jobs_by_id.get_mut(id) {
+                        let now = now_ts();
+                        job.lifecycle = JobLifecycleState::Failed;
+                        job.ended_at = Some(now);
+                        job.activity = None;
+                        job.command_execution_state = Some(ShellCommandExecutionState::NotStarted);
+                        job.error = Some(code.into());
+                        observe_job_terminal(job, now);
+                        super::jobs::notify_job_update(job);
+                    }
+                    self.telemetry.runner_job_finalized(Some(&request_id), id);
+                } else {
+                    self.telemetry.runner_result_finalized(&request_id);
+                }
                 if let Some(waiter) = pending.waiter.take() {
                     let _ = waiter.send(ShellRunResponse {
                         success: false,
@@ -147,90 +153,66 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
-                        error: Some(format!("{code}: {message}")),
+                        error: Some(code.into()),
                         request_dispatched: Some(false),
                         command_execution_state: Some(ShellCommandExecutionState::NotStarted),
                     });
                 }
                 continue;
             }
-            let stale_ssh_resource_error =
-                inner.pending_by_id.get(&request_id).and_then(|pending| {
-                    match (
-                        &pending.operation,
-                        pending.expected_ssh_resource_runner_instance_id.as_deref(),
-                    ) {
-                        (RunnerOperation::SshResource(_), Some(expected_runner)) => {
-                            let Some(runner) = inner.runners.get(&body.client_id) else {
-                                return Some((
-                                    "runner_replaced",
-                                    "Exact Runner disappeared before SSH resource dispatch"
-                                        .to_string(),
-                                ));
-                            };
-                            if runner.runner_instance_id != expected_runner {
-                                return Some((
-                                    "runner_replaced",
-                                    "Exact Runner changed before SSH resource dispatch".to_string(),
-                                ));
-                            }
-                            (!runner
-                                .runner_features
-                                .supports(RunnerFeature::ManagedSshResources))
-                            .then_some((
-                                "ssh_resource_registry_unavailable",
-                                "Managed SSH resource capability changed before dispatch"
-                                    .to_string(),
-                            ))
-                        }
-                        (RunnerOperation::SshResource(_), None) => Some((
-                            "runner_replaced",
-                            "SSH resource exact Runner fence is missing".to_string(),
-                        )),
-                        (_, Some(_)) => Some((
-                            "runner_replaced",
-                            "SSH resource exact Runner fence is inconsistent".to_string(),
-                        )),
-                        _ => None,
-                    }
-                });
-            if let Some((code, message)) = stale_ssh_resource_error {
+            let stale_request_error = inner.pending_by_id.get(&request_id).and_then(|pending| {
+                pending
+                    .dispatch_fence
+                    .synchronous_rejection(&pending.operation, inner.runners.get(&body.client_id))
+            });
+            if let Some(error) = stale_request_error {
                 let Some(mut pending) = inner.pending_by_id.remove(&request_id) else {
                     continue;
                 };
                 if let Some(waiter) = pending.waiter.take() {
+                    let (cwd, command_preview) = match &pending.operation {
+                        RunnerOperation::RunnerInstruction(_)
+                        | RunnerOperation::RunnerConfig(_)
+                        | RunnerOperation::SshResource(_) => (None, String::new()),
+                        RunnerOperation::Skill(_) => (None, request_preview(&pending.request)),
+                        _ => (
+                            pending.request.cwd.clone(),
+                            request_preview(&pending.request),
+                        ),
+                    };
                     let _ = waiter.send(ShellRunResponse {
                         success: false,
                         request_id: request_id.clone(),
                         client_id: body.client_id.clone(),
-                        cwd: None,
-                        command_preview: String::new(),
+                        cwd,
+                        command_preview,
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
-                        error: Some(format!("{code}: {message}")),
+                        error: Some(error),
                         request_dispatched: Some(false),
                         command_execution_state: Some(ShellCommandExecutionState::NotStarted),
                     });
                 }
+                inner.persistent_waiters.remove(&request_id);
                 continue;
             }
             let stale_bridge_error =
                 inner.pending_by_id.get(&request_id).and_then(|pending| {
-                    match (
-                        &pending.operation,
-                        pending.expected_mcp_gateway_runner_instance_id.as_deref(),
-                        pending.expected_mcp_gateway_provider_id.as_deref(),
-                        pending.expected_mcp_gateway_provider_instance_id.as_deref(),
-                    ) {
+                    match (&pending.operation, &pending.dispatch_fence) {
                         (
                             RunnerOperation::McpGateway(operation),
-                            Some(expected_runner),
-                            Some(expected_provider),
-                            Some(expected_provider_instance),
+                            PendingDispatchFence::McpGateway(fence),
                         ) => {
+                            let expected_runner = fence.runner_instance_id.as_str();
+                            let expected_provider = fence.provider_id.as_str();
+                            let expected_provider_instance = fence.provider_instance_id.as_str();
                             if operation.provider_id() != expected_provider
                                 || operation.provider_instance_id() != expected_provider_instance
                             {
@@ -271,8 +253,9 @@ impl RunnerRegistry {
                                     .to_string(),
                             ))
                         }
-                        (operation, None, None, None)
-                            if !matches!(operation, RunnerOperation::McpGateway(_)) =>
+                        (operation, fence)
+                            if !matches!(operation, RunnerOperation::McpGateway(_))
+                                && !matches!(fence, PendingDispatchFence::McpGateway(_)) =>
                         {
                             None
                         }
@@ -297,6 +280,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(error.clone()),
                         request_dispatched: Some(false),
@@ -376,6 +361,8 @@ impl RunnerRegistry {
                         exit_code: None,
                         stdout: None,
                         stderr: None,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
                         duration_ms: None,
                         error: Some(message.clone()),
                         request_dispatched: Some(false),
@@ -393,67 +380,6 @@ impl RunnerRegistry {
                 inner.mcp_gateway_waiters.remove(&request_id);
                 inner.coding_agent_waiters.remove(&request_id);
                 inner.coding_agent_fences.remove(&request_id);
-                inner.persistent_waiters.remove(&request_id);
-                continue;
-            }
-            let stale_skill_error = inner.pending_by_id.get(&request_id).and_then(|pending| {
-                match (&pending.operation, pending.skill_fence.as_ref()) {
-                    (RunnerOperation::Skill(_), Some(fence)) => {
-                        let Some(runner) = inner.runners.get(&body.client_id) else {
-                            return Some(
-                                "stale_runner: Skill target Runner disappeared before dispatch"
-                                    .to_string(),
-                            );
-                        };
-                        if runner.runner_instance_id != fence.runner_instance_id {
-                            return Some(
-                                "stale_runner: Skill target Runner changed before dispatch"
-                                    .to_string(),
-                            );
-                        }
-                        let required = if fence.management {
-                            RunnerFeature::SkillManagement
-                        } else {
-                            RunnerFeature::SkillRuntime
-                        };
-                        (!runner.runner_features.supports(required)).then(|| {
-                            format!(
-                                "skill_capability_unavailable: exact Runner no longer advertises {} before dispatch",
-                                required.as_wire_name()
-                            )
-                        })
-                    }
-                    (RunnerOperation::Skill(_), None) => Some(
-                        "stale_runner: Skill exact dispatch fence is missing".to_string(),
-                    ),
-                    (_, Some(_)) => Some(
-                        "stale_runner: Skill dispatch fence is attached to the wrong request kind"
-                            .to_string(),
-                    ),
-                    (_, None) => None,
-                }
-            });
-            if let Some(error) = stale_skill_error {
-                let Some(mut pending) = inner.pending_by_id.remove(&request_id) else {
-                    continue;
-                };
-                if let Some(waiter) = pending.waiter.take() {
-                    let response = ShellRunResponse {
-                        success: false,
-                        request_id: request_id.clone(),
-                        client_id: body.client_id.clone(),
-                        cwd: None,
-                        command_preview: request_preview(&pending.request),
-                        exit_code: None,
-                        stdout: None,
-                        stderr: None,
-                        duration_ms: None,
-                        error: Some(error),
-                        request_dispatched: Some(false),
-                        command_execution_state: Some(ShellCommandExecutionState::NotStarted),
-                    };
-                    let _ = waiter.send(response);
-                }
                 inner.persistent_waiters.remove(&request_id);
                 continue;
             }
@@ -508,75 +434,29 @@ impl RunnerRegistry {
                 inner.persistent_waiters.remove(&request_id);
                 continue;
             }
-            let stale_project_error = inner.pending_by_id.get(&request_id).and_then(|pending| {
-                match (
-                    pending.expected_project_id.as_deref(),
-                    pending.expected_project_cwd.as_deref(),
-                ) {
-                    (Some(project_id), Some(project_cwd)) => match inner.runners.get(&body.client_id) {
-                        Some(runner) if runner.owner != pending.expected_runner_owner => Some(
-                            "stale_authority: target Runner owner changed before dispatch".to_string(),
-                        ),
-                        Some(runner)
-                            if !runner.runner_features.supports(RunnerFeature::FileWrite) =>
-                        {
-                            Some(
-                            "stale_authority: target Runner no longer advertises file_write before dispatch"
-                                .to_string(),
-                            )
-                        }
-                        Some(runner)
-                            if runner.projects.iter().any(|project| {
-                                !project.disabled
-                                    && project.id == project_id
-                                    && project.path == project_cwd
-                            }) => None,
-                        Some(_) | None => Some(format!(
-                            "stale_project: target project {project_id} is no longer registered at the resolved path"
-                        )),
-                    },
-                    (None, None) => None,
-                    _ => Some(
-                        "stale_project: pending project placement fence is incomplete".to_string(),
-                    ),
-                }
-            });
-            if let Some(error) = stale_project_error {
-                let Some(mut pending) = inner.pending_by_id.remove(&request_id) else {
-                    continue;
-                };
-                if let Some(waiter) = pending.waiter.take() {
-                    let response = ShellRunResponse {
-                        success: false,
-                        request_id: request_id.clone(),
-                        client_id: body.client_id.clone(),
-                        cwd: pending.request.cwd.clone(),
-                        command_preview: request_preview(&pending.request),
-                        exit_code: None,
-                        stdout: None,
-                        stderr: None,
-                        duration_ms: None,
-                        error: Some(error),
-                        request_dispatched: Some(false),
-                        command_execution_state: Some(ShellCommandExecutionState::NotStarted),
-                    };
-                    let _ = waiter.send(response);
-                }
-                inner.persistent_waiters.remove(&request_id);
-                continue;
-            }
-            let Some((request, operation, job_id)) =
+            let Some(dispatch_transport) = inner
+                .runners
+                .get(&body.client_id)
+                .map(|runner| runner.transport)
+            else {
+                return Err(format!("unknown shell client: {}", body.client_id));
+            };
+            let Some((request, operation, job_id, queue_wait)) =
                 inner.pending_by_id.get_mut(&request_id).map(|pending| {
                     pending.dispatched = true;
+                    pending.dispatched_transport = Some(dispatch_transport);
                     (
                         pending.request.clone(),
                         pending.operation.clone(),
                         pending.job_id.clone(),
+                        pending.enqueued_at.elapsed(),
                     )
                 })
             else {
                 continue;
             };
+            self.telemetry
+                .runner_request_dequeued(&request_id, dispatch_transport, queue_wait);
             if matches!(
                 &operation,
                 RunnerOperation::Job(RunnerJobOperation::Stop { .. })
@@ -589,12 +469,9 @@ impl RunnerRegistry {
                     if job.lifecycle == JobLifecycleState::Queued {
                         job.lifecycle = JobLifecycleState::RunnerQueued;
                         // Dispatch proves only that the Runner accepted the
-                        // Job request. A typed structured Job becomes started
-                        // only when the Runner reports `running` after a
-                        // successful child spawn.
-                        if job.structured_execution.is_none() {
-                            job.started_at = Some(now_ts());
-                        }
+                        // Job request. The command becomes started only when the
+                        // Runner reports running or a terminal execution outcome;
+                        // a pre-spawn rejection must remain NotStarted.
                         super::jobs::notify_job_update(job);
                     }
                 }
@@ -677,8 +554,17 @@ impl RunnerRegistry {
         {
             return Err("unexpected Plugin gateway result for non-Plugin request".to_string());
         }
+        let request_round_trip = pending.enqueued_at.elapsed();
+        let dispatched_transport = pending.dispatched_transport;
         self.telemetry
             .runner_result_accepted(&body.request_id, &payload);
+        if let Some(transport) = dispatched_transport {
+            self.telemetry.runner_request_round_trip(
+                &body.request_id,
+                transport,
+                request_round_trip,
+            );
+        }
         let trace_request_id = body.request_id.clone();
         let RunnerResultPayload {
             result: body,
@@ -720,6 +606,38 @@ impl RunnerRegistry {
                     },
                 ),
             };
+            if pending.dispatched {
+                if let (
+                    RunnerOperation::McpGateway(McpGatewayRequest::ToolsCall {
+                        provider_id,
+                        provider_instance_id,
+                        name,
+                        ..
+                    }),
+                    Some(McpGatewayResponsePayload::ToolResult { result }),
+                    PendingDispatchFence::McpGateway(fence),
+                ) = (
+                    &pending.operation,
+                    response.payload.as_ref(),
+                    &pending.dispatch_fence,
+                ) {
+                    if fence.runner_instance_id == body.runner_instance_id
+                        && provider_id == &fence.provider_id
+                        && provider_instance_id == &fence.provider_instance_id
+                    {
+                        self.telemetry
+                            .mcp_tool_result_validated(crate::ValidatedMcpToolResult {
+                                request_id: &trace_request_id,
+                                client_id: &pending.request.client_id,
+                                runner_instance_id: &fence.runner_instance_id,
+                                provider_id,
+                                provider_instance_id,
+                                tool_name: name,
+                                result,
+                            });
+                    }
+                }
+            }
             let waiter = inner.mcp_gateway_waiters.remove(&body.request_id);
             if let Some(waiter) = waiter {
                 let _ = waiter.send(response);
@@ -811,15 +729,26 @@ impl RunnerRegistry {
         // independently without silently constraining the other first.
         let raw_stdout = body.stdout;
         let raw_stderr = body.stderr;
-        let stdout = if pending.operation.is_large_native_image_request() {
-            retain_result_stream_to(
+        let (stdout, server_stdout_truncated) = if pending.operation.is_large_native_image_request()
+        {
+            retain_result_stream_to_with_evidence(
                 raw_stdout.clone(),
                 webcodex_core::artifact_policy::MAX_MCP_IMAGE_RESPONSE_BYTES,
             )
+        } else if pending.operation.is_large_internal_artifact_chunk_request() {
+            retain_result_stream_to_with_evidence(
+                raw_stdout.clone(),
+                webcodex_core::artifact_policy::MAX_INTERNAL_ARTIFACT_CHUNK_RESPONSE_BYTES,
+            )
         } else {
-            retain_ordinary_result_stream(raw_stdout.clone())
+            retain_ordinary_result_stream_with_evidence(raw_stdout.clone())
         };
-        let stderr = retain_ordinary_result_stream(raw_stderr.clone());
+        let (stderr, server_stderr_truncated) =
+            retain_ordinary_result_stream_with_evidence(raw_stderr.clone());
+        let stdout_truncated =
+            combine_result_stream_truncation(body.stdout_truncated, server_stdout_truncated);
+        let stderr_truncated =
+            combine_result_stream_truncation(body.stderr_truncated, server_stderr_truncated);
         let success = matches!(
             command_execution_state,
             None | Some(ShellCommandExecutionState::Completed)
@@ -855,6 +784,8 @@ impl RunnerRegistry {
             exit_code: body.exit_code,
             stdout,
             stderr,
+            stdout_truncated,
+            stderr_truncated,
             duration_ms: body.duration_ms,
             error,
             request_dispatched: Some(pending.dispatched),

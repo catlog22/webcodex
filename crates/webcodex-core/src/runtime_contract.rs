@@ -13,12 +13,25 @@ pub const FILE_READ_MAX_LIMIT: usize = 2000;
 /// Raw producer-page budget for `git_diff_hunks`, independent of the final
 /// serialized model-facing result ceiling.
 pub const MIN_GIT_DIFF_HUNKS_PAGE_BYTES: usize = 16 * 1024;
-pub const DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES: usize = 64 * 1024;
 /// Keep producer stdout comfortably below the ordinary 256 KiB per-stream
 /// Runner result-retention default, leaving headroom for framing and metadata.
 pub const MAX_GIT_DIFF_HUNKS_PAGE_BYTES: usize = 192 * 1024;
-pub const GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES: usize = 512;
+/// Broad review should use the full safe producer page by default. Smaller pages
+/// only add Runner round-trips and repeat the same Git source scan; callers can
+/// still request a tighter page explicitly when useful.
+pub const DEFAULT_GIT_DIFF_HUNKS_PAGE_BYTES: usize = MAX_GIT_DIFF_HUNKS_PAGE_BYTES;
+pub const GIT_DIFF_HUNKS_CONTINUATION_MAX_BYTES: usize = 192;
 pub const DEFAULT_OBSERVE_JOBS_TAIL_LINES: usize = 40;
+/// Maximum explicit bounded wait for observing already-accepted Job work.
+/// This is intentionally separate from execution timeouts and initial
+/// synchronous handoff grace budgets.
+pub const MAX_JOB_OBSERVATION_WAIT_SECS: u64 = 100;
+/// Historical transport-agnostic suggested Job observation wait. MCP adapters
+/// may further normalize this to the configured Host timing policy.
+pub const DEFAULT_JOB_CONTINUATION_WAIT_SECS: u64 = 55;
+/// Intrinsic structured-execution synchronous-grace ceiling. This is a runtime
+/// capability bound, not an MCP Host deadline; MCP transport applies a separate
+/// Server-side clamp before dispatch.
 pub const STRUCTURED_EXECUTION_SYNC_WAIT_MAX_SECS: u64 = 60;
 
 pub const MAX_SKILL_LIST_LIMIT: usize = 64;
@@ -46,6 +59,32 @@ pub const RECOVERY_KIND_VALUES: [&str; 7] = [
     "user_action",
     "none",
 ];
+
+pub const GENERATED_FOLLOW_UP_KIND_VALUES: [&str; 2] =
+    ["mechanically_followable", "fallback_recovery"];
+
+/// Host-facing execution posture for a server-generated parser-ready tool call.
+///
+/// MechanicallyFollowable means the Server has already resolved the semantic
+/// choice needed for this exact follow-up, for example deterministic paging.
+/// FallbackRecovery means the call is available only as an explicit recovery,
+/// detail, or blocked-dependency path and must not be auto-followed merely
+/// because it is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GeneratedFollowUpKind {
+    MechanicallyFollowable,
+    FallbackRecovery,
+}
+
+impl GeneratedFollowUpKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::MechanicallyFollowable => "mechanically_followable",
+            Self::FallbackRecovery => "fallback_recovery",
+        }
+    }
+}
 
 /// Closed model-facing vocabulary for continuing successful or partial
 /// observations. This is deliberately separate from failure recovery,
@@ -124,9 +163,14 @@ impl ContinuationSemantics {
 }
 
 pub const BUILTIN_CODING_WORKFLOW_CONTRACT: &str = "webcodex.coding_workflow";
-pub const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 9;
-pub const BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS: usize = 8;
-
+pub const BUILTIN_CODING_WORKFLOW_VERSION: u64 = 32;
+/// Per-field bootstrap prose ceiling, independent of aggregate startup/context byte budgets.
+/// Allows first-use, reuse, refresh and authority boundaries without lossy compression.
+pub const BUILTIN_BOOTSTRAP_GUIDANCE_MAX_CHARS: usize = 1536;
+/// Ergonomic regression targets for built-in model guidance. These are not
+/// wire/schema limits; the serialized startup budget remains the hard bound.
+pub const BUILTIN_CODING_WORKFLOW_GUIDANCE_TARGET_ITEMS: usize = 9;
+pub const BUILTIN_CODING_WORKFLOW_GUIDANCE_TARGET_ITEM_CHARS: usize = 320;
 /// Validate a Runner project path without applying host-local filesystem semantics.
 /// The Server may route to an agent on another OS, so both POSIX and Windows
 /// absolute-path shapes are accepted; the Runner remains authoritative for

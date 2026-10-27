@@ -97,11 +97,11 @@ api_get() {
 
 tool_call() {
     local tool="$1"
-    local arguments="$2"
+    local params="$2"
     local body
-    body="$(python3 - "$tool" "$arguments" <<'PY'
+    body="$(python3 - "$tool" "$params" <<'PY'
 import json, sys
-print(json.dumps({"tool": sys.argv[1], **json.loads(sys.argv[2])}, separators=(",", ":")))
+print(json.dumps({"tool": sys.argv[1], "params": json.loads(sys.argv[2])}, separators=(",", ":")))
 PY
 )"
     api_post /api/tools/call "$body"
@@ -113,7 +113,7 @@ agent_registered() {
     printf '%s' "$body" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-clients = d["output"]["agents"]["clients"]
+clients = d["output"]["runners"]["clients"]
 assert any(c["client_id"] == sys.argv[1] and c["connected"] for c in clients)
 ' "$CLIENT_ID" >/dev/null 2>&1
 }
@@ -138,7 +138,7 @@ provider_status_matches() {
     printf '%s' "$body" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-client = next(c for c in d["output"]["agents"]["clients"] if c["client_id"] == sys.argv[1])
+client = next(c for c in d["output"]["runners"]["clients"] if c["client_id"] == sys.argv[1])
 claude = client["tool_providers"]["claude_code"]
 call = claude["last_call"]
 assert call["capability"] == "search_project_text"
@@ -293,13 +293,8 @@ assert not ({"Edit", "Read", "Bash", "Write", "NotebookEdit", "Agent"} & names)
 PY
 ok "public MCP tools exclude Claude internals and removed edit tools"
 
-api_get /openapi.json | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-count = sum(len(v) for v in d["paths"].values())
-assert 0 < count < 30, count
-' || fail "OpenAPI operation count exceeded GPT Actions bound"
-ok "OpenAPI operation count remains below GPT Actions limit"
+api_get /healthz >/dev/null || fail "Server readiness probe failed"
+ok "/healthz readiness remains available"
 
 READ_ARGS="$(python3 - "$RUNTIME_PROJECT" <<'PY'
 import json, sys
@@ -310,12 +305,12 @@ tool_call read_files "$READ_ARGS" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 item = d["output"]["items"][0]
-assert d["success"] and item["success"] and "before" in item["output"]["text"]
+assert d["success"] and "success" not in item and "error" not in item and "before" in item["output"]["text"]
 ' || fail "Native read failed"
 api_post /api/runtime/status '{}' | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-c = next(x for x in d["output"]["agents"]["clients"] if x["client_id"] == sys.argv[1])
+c = next(x for x in d["output"]["runners"]["clients"] if x["client_id"] == sys.argv[1])
 claude = c["tool_providers"]["claude_code"]
 assert claude["process_state"] == "not_started"
 assert claude.get("last_call") is None
@@ -331,8 +326,14 @@ tool_call search_project_texts "$SEARCH_ARGS" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 item = d["output"]["items"][0]
-assert d["success"] and item["success"]
-assert item["output"]["backend"] in ("rg", "grep")
+assert d["success"]
+if "success" in item:
+    assert item["success"] and item["error"] is None
+else:
+    assert "error" not in item
+out = item["output"]
+assert out.get("result_mode", "matches") == "matches" and out["matches"]
+assert out.get("backend") in (None, "grep")
 ' || fail "Native search fallback failed"
 wait_for_provider_call native true success null || fail "search fallback evidence did not propagate"
 ok "search fallback recorded selected_provider=native"

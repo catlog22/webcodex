@@ -6,8 +6,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use webcodex_core::runner_skill::{
-    normalize_runner_skill_resource_path, RunnerSkillDescriptor, RunnerSkillReadResponse,
-    RunnerSkillSource, MAX_RUNNER_SKILL_READ_TEXT_BYTES, RUNNER_SKILL_RESPONSE_FORMAT,
+    normalize_runner_skill_resource_path, RunnerSkillDescriptor, RunnerSkillExecutionRequest,
+    RunnerSkillReadResponse, RunnerSkillSource, MAX_RUNNER_SKILL_READ_TEXT_BYTES,
+    RUNNER_SKILL_RESPONSE_FORMAT,
 };
 use webcodex_core::skill_metadata::{parse_skill_metadata, MAX_SKILL_DEFINITION_BYTES};
 use webcodex_workspace::file_read_range;
@@ -23,6 +24,12 @@ const MAX_CONFIGURED_SKILL_ROOT_SCAN_ENTRIES: usize = 1024;
 pub(super) struct LiveSkill {
     pub(super) descriptor: RunnerSkillDescriptor,
     package_root: PathBuf,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedConfiguredSkillExecution {
+    pub(super) target_path: PathBuf,
+    pub(super) script: String,
 }
 
 #[derive(Debug, Default)]
@@ -341,12 +348,13 @@ fn load_live_skill(
     let package_root = package_path
         .canonicalize()
         .map_err(|_| "invalid_skill_package")?;
-    if !crate::runner_config::paths::path_is_within(&package_root, canonical_root) {
+    if !webcodex_runner_config::paths::path_is_within(&package_root, canonical_root) {
         return Err("invalid_skill_package");
     }
     stats.definitions_attempted = stats.definitions_attempted.saturating_add(1);
     let definition = resolve_regular_package_file(
         &package_root,
+        canonical_root,
         SKILL_DEFINITION_FILE,
         "missing_skill_definition",
         "invalid_skill_package",
@@ -374,6 +382,71 @@ fn load_live_skill(
     })
 }
 
+pub(super) fn prepare_execution_target(
+    config: &SkillsConfig,
+    request: &RunnerSkillExecutionRequest,
+) -> Result<PreparedConfiguredSkillExecution, String> {
+    request
+        .validate()
+        .map_err(|_| "skill_invalid_execution_request".to_string())?;
+    if request.expected_source != RunnerSkillSource::Configured {
+        return Err("skill_source_changed".to_string());
+    }
+    let path = normalize_runner_skill_resource_path(&request.path)
+        .map_err(|_| "skill_resource_path_invalid".to_string())?;
+    if webcodex_core::sensitive_paths::is_secret_path(&path) {
+        return Err("skill_sensitive_path".to_string());
+    }
+    let (skill, _scan_stats) = resolve_live_skill_by_id(config, &request.skill_id)?;
+    let skill = skill.ok_or_else(|| "skill_not_found".to_string())?;
+    if skill.descriptor.definition_revision() != request.expected_definition_revision {
+        return Err("skill_definition_changed".to_string());
+    }
+    let canonical_root = skill
+        .package_root
+        .parent()
+        .ok_or_else(|| "skill_resource_path_invalid".to_string())?;
+    let target = resolve_regular_package_file(
+        &skill.package_root,
+        canonical_root,
+        &path,
+        "skill_resource_not_found",
+        "skill_resource_path_invalid",
+    )
+    .map_err(str::to_string)?;
+    let bytes =
+        read_bounded(&target, MAX_RUNNER_SKILL_READ_TEXT_BYTES).map_err(|code| match code {
+            "too_large" => "skill_resource_too_large".to_string(),
+            "invalid_utf8" => "skill_resource_unsupported_encoding".to_string(),
+            _ => "skill_resource_unavailable".to_string(),
+        })?;
+    if sha256_hex(&bytes) != request.expected_resource_sha256 {
+        return Err("skill_resource_changed".to_string());
+    }
+    let script =
+        String::from_utf8(bytes).map_err(|_| "skill_resource_unsupported_encoding".to_string())?;
+    if script.contains('\0') {
+        return Err("skill_resource_unsupported_encoding".to_string());
+    }
+    let definition_after = resolve_regular_package_file(
+        &skill.package_root,
+        canonical_root,
+        SKILL_DEFINITION_FILE,
+        "skill_definition_changed",
+        "skill_definition_changed",
+    )
+    .map_err(str::to_string)?;
+    let definition_after = read_bounded(&definition_after, MAX_SKILL_DEFINITION_BYTES)
+        .map_err(|_| "skill_definition_changed".to_string())?;
+    if sha256_hex(&definition_after) != request.expected_definition_revision {
+        return Err("skill_definition_changed".to_string());
+    }
+    Ok(PreparedConfiguredSkillExecution {
+        target_path: target,
+        script,
+    })
+}
+
 pub(super) fn read_resource(
     config: &SkillsConfig,
     skill_id: &str,
@@ -394,6 +467,10 @@ pub(super) fn read_resource(
     {
         return Err("skill_definition_changed".to_string());
     }
+    let canonical_root = skill
+        .package_root
+        .parent()
+        .ok_or_else(|| "skill_resource_path_invalid".to_string())?;
     // Package-relative paths may traverse; absolute paths read directly. Every
     // resolution stays symlink-free per component, and the final target must
     // land inside the Skill package or an operator-configured resource root.
@@ -406,7 +483,7 @@ pub(super) fn read_resource(
         )
         .map_err(str::to_string)?
     } else {
-        resolve_regular_package_file(
+        resolve_regular_resource_file(
             &skill.package_root,
             &path,
             "skill_resource_not_found",
@@ -414,10 +491,11 @@ pub(super) fn read_resource(
         )
         .map_err(str::to_string)?
     };
-    let within_package = crate::runner_config::paths::path_is_within(&target, &skill.package_root);
+    let within_package =
+        webcodex_runner_config::paths::path_is_within(&target, &skill.package_root);
     let within_resource_root = config.resource_roots.iter().any(|root| {
         root.canonicalize()
-            .map(|root| crate::runner_config::paths::path_is_within(&target, &root))
+            .map(|root| webcodex_runner_config::paths::path_is_within(&target, &root))
             .unwrap_or(false)
     });
     if !within_package && !within_resource_root {
@@ -436,7 +514,7 @@ pub(super) fn read_resource(
         _ => "skill_resource_unavailable".to_string(),
     })?;
     let range = file_read_range::EffectiveRange::new(Some(start_line), Some(limit));
-    let read = file_read_range::read_range_from_with_budget(
+    let read = file_read_range::read_page_from_with_budget(
         bytes.as_slice(),
         range,
         MAX_RUNNER_SKILL_READ_TEXT_BYTES,
@@ -451,6 +529,7 @@ pub(super) fn read_resource(
     })?;
     let definition_after = resolve_regular_package_file(
         &skill.package_root,
+        canonical_root,
         SKILL_DEFINITION_FILE,
         "skill_definition_changed",
         "skill_definition_changed",
@@ -488,6 +567,41 @@ pub(super) fn read_resource(
 }
 
 fn resolve_regular_package_file(
+    package_root: &Path,
+    canonical_root: &Path,
+    relative: &str,
+    missing_code: &'static str,
+    invalid_code: &'static str,
+) -> Result<PathBuf, &'static str> {
+    let mut current = package_root.to_path_buf();
+    let components = relative.split('/').collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        current.push(component);
+        let metadata = fs::symlink_metadata(&current).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                missing_code
+            } else {
+                invalid_code
+            }
+        })?;
+        let last = index + 1 == components.len();
+        if metadata_is_link_like(&metadata)
+            || (last && !metadata.is_file())
+            || (!last && !metadata.is_dir())
+        {
+            return Err(invalid_code);
+        }
+    }
+    let target = current.canonicalize().map_err(|_| invalid_code)?;
+    if !webcodex_runner_config::paths::path_is_within(&target, package_root)
+        || !webcodex_runner_config::paths::path_is_within(&target, canonical_root)
+    {
+        return Err(invalid_code);
+    }
+    Ok(target)
+}
+
+fn resolve_regular_resource_file(
     package_root: &Path,
     relative: &str,
     missing_code: &'static str,
@@ -546,7 +660,7 @@ fn resolve_open_regular_file(
     current.canonicalize().map_err(|_| invalid_code)
 }
 
-fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {
+pub(super) fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {
     if metadata.file_type().is_symlink() {
         return true;
     }
@@ -582,8 +696,10 @@ fn configured_skill_id(root: &Path, package_name: &str) -> String {
     hasher.update(configured_skill_root_identity(root).as_bytes());
     hasher.update(b"\0");
     hasher.update(package_name.as_bytes());
-    let digest = format!("{:x}", hasher.finalize());
-    format!("wc_skill_{}", &digest[..32])
+    format!(
+        "wc_skill_{}",
+        webcodex_core::compact::encode(&hasher.finalize()[..16])
+    )
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

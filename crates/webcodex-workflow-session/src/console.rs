@@ -1,6 +1,6 @@
 //! Human-facing, read-only Workflow Session projection for the host Console.
 //!
-//! This is deliberately a projection of the existing bounded Session ledger.
+//! This is deliberately a bounded recent-activity projection of durable Session history.
 //! It does not create observation truth, infer execution outcomes, or expose raw
 //! arguments/output. Correlation is presentation-only via `call_id`.
 
@@ -8,7 +8,10 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 
 use super::events::normalize_observed_project_path;
-use super::model::{SessionEvent, SessionMessageKind, SessionRecord};
+use super::model::{
+    SessionEvent, SessionMessageKind, SessionRecord, DEFAULT_MAX_SESSIONS,
+    DEFAULT_RECENT_EVENT_LIMIT,
+};
 use super::query::build_messages_summary;
 use super::util::{bound_chars, looks_like_secret_string};
 use webcodex_core::workflow_session_contract::is_safe_job_id;
@@ -17,16 +20,39 @@ use webcodex_tool_contracts::{
     ToolActivityPresentation,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct ConsoleValidationHooks {
     pub event_observes_validation_activity: fn(&SessionEvent) -> bool,
     pub validation_summary_from_events: fn(&[SessionEvent], usize) -> serde_json::Value,
 }
 
-pub const DEFAULT_CONSOLE_SESSION_LIST_LIMIT: usize = 20;
-pub const MAX_CONSOLE_SESSION_LIST_LIMIT: usize = 50;
+impl ConsoleValidationHooks {
+    pub(super) fn same_callbacks(self, other: Self) -> bool {
+        std::ptr::fn_addr_eq(
+            self.event_observes_validation_activity,
+            other.event_observes_validation_activity,
+        ) && std::ptr::fn_addr_eq(
+            self.validation_summary_from_events,
+            other.validation_summary_from_events,
+        )
+    }
+}
+
+/// Cache one base list projection per immutable Closed Session. The current
+/// Runner Job overlay is applied separately by the caller, never cached.
+#[derive(Debug)]
+pub(super) struct CachedConsoleList {
+    pub raw: std::sync::Arc<serde_json::value::RawValue>,
+    pub hooks: ConsoleValidationHooks,
+    pub row: WorkflowSessionConsoleListItem,
+}
+
+// The Console is a human-facing view over an already bounded durable ledger.
+// Do not hide retained Sessions/events behind a second, much smaller presentation cap.
+pub const DEFAULT_CONSOLE_SESSION_LIST_LIMIT: usize = DEFAULT_MAX_SESSIONS;
+pub const MAX_CONSOLE_SESSION_LIST_LIMIT: usize = DEFAULT_MAX_SESSIONS;
 pub const DEFAULT_CONSOLE_ACTIVITY_LIMIT: usize = 100;
-pub const MAX_CONSOLE_ACTIVITY_LIMIT: usize = 200;
+pub const MAX_CONSOLE_ACTIVITY_LIMIT: usize = DEFAULT_RECENT_EVENT_LIMIT;
 const MAX_CONSOLE_TEXT_CHARS: usize = 240;
 const MAX_CONSOLE_PATHS_PER_ITEM: usize = 8;
 const MAX_CONSOLE_LIST_TEXT_CHARS: usize = 120;
@@ -151,20 +177,6 @@ pub struct WorkflowSessionConsoleDetail {
     pub activity_total: usize,
     pub activity_returned: usize,
     pub activity_truncated: bool,
-    /// Workspace projects visible to this console, canonical first. Populated
-    /// by the runtime from the session workspace projection; the crate-side
-    /// default is empty for sessions without a recorded projection.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub projects: Vec<WorkflowSessionConsoleProject>,
-    /// Revision of the workspace projection; console mutations pass it back
-    /// as the CAS fence for attach/detach.
-    pub projects_revision: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct WorkflowSessionConsoleProject {
-    pub project: String,
-    pub canonical: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -340,8 +352,6 @@ pub(super) fn build_detail(
         activity_total,
         activity_returned,
         activity_truncated: activity_total > activity_returned,
-        projects: Vec::new(),
-        projects_revision: 0,
     }
 }
 
@@ -389,15 +399,24 @@ fn build_overview(
                 .is_some_and(validation.event_observes_validation_activity)
     });
 
-    let retained_events = record
+    // The canonical validation extractor cannot emit evidence when none of the
+    // retained events observes validation activity. Avoid deep-cloning an entire
+    // (potentially 2,000-event) Session history in this common case. Validation
+    // sessions still use the untouched canonical evidence and reconciliation path.
+    let validation_summary = if record
         .events
         .iter()
-        .map(|event| event.as_ref().clone())
-        .collect::<Vec<_>>();
-    // The validation module owns validation identity, parser, terminality, and
-    // historical failure resolution. Console deliberately narrows that existing
-    // aggregate instead of interpreting validation output itself.
-    let validation_summary = (validation.validation_summary_from_events)(&retained_events, 1);
+        .any(|event| (validation.event_observes_validation_activity)(event))
+    {
+        let retained_events = record
+            .events
+            .iter()
+            .map(|event| event.as_ref().clone())
+            .collect::<Vec<_>>();
+        (validation.validation_summary_from_events)(&retained_events, 1)
+    } else {
+        (validation.validation_summary_from_events)(&[], 1)
+    };
     let validation_available = validation_summary
         .get("available")
         .and_then(serde_json::Value::as_bool)
@@ -1148,11 +1167,11 @@ mod tests {
         for (tool, expected) in [
             ("read_files", "Read"),
             ("search_project_texts", "Searched"),
-            ("lsp_status", "Navigated"),
-            ("apply_text_edits", "Edited"),
+            ("get_lsp_status", "Navigated"),
+            ("edit_project_files", "Edited"),
             ("cargo_test", "Tested"),
             ("run_process", "Ran"),
-            ("git_review_summary", "Reviewed"),
+            ("read_git_review_summary", "Reviewed"),
             ("observe_jobs", "Used"),
         ] {
             assert_eq!(semantic_kind_for_tool(tool), expected, "{tool}");
@@ -1168,7 +1187,7 @@ mod tests {
             logical_invocation_role: None,
             session_id: "wc_sess_legacy".to_string(),
             kind: "tool_call_finished".to_string(),
-            context_revision: None,
+            legacy_context_revision: None,
             context_result_summary: None,
             timestamp: 1,
             transport: "api".to_string(),
@@ -1246,7 +1265,7 @@ mod tests {
             ToolActivityPresentation::Transport
         );
         assert_eq!(
-            activity_presentation_for_tool("goal_plan_state"),
+            activity_presentation_for_tool("sync_goal_plan"),
             ToolActivityPresentation::Transport
         );
     }

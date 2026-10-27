@@ -8,6 +8,7 @@ async fn registry_allows_quic_run_queueing() {
     let (_request_id, _rx) = registry
         .enqueue_run(
             ShellRunRequest {
+                login: false,
                 client_id: "quic-run".to_string(),
                 cwd: None,
                 command: "echo hi".to_string(),
@@ -105,8 +106,8 @@ async fn registry_allows_quic_v1_file_and_project_ops_queueing() {
                 pattern: None,
                 expected_sha256: None,
                 expected_prefix: None,
-                start_line: None,
-                end_line: None,
+                start_line: Some(1),
+                end_line: Some(1),
                 line: None,
                 create_dirs: false,
                 wait_timeout_secs: 0,
@@ -137,20 +138,10 @@ async fn registry_allows_quic_v1_start_job_queueing() {
 
     let job = registry
         .start_job(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("quic-job".to_string()),
-                cwd: None,
-                command: Some("sleep 1".to_string()),
-                timeout_secs: Some(5),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("quic-job", "sleep 1", Some(5)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -166,6 +157,7 @@ async fn registry_allows_quic_v1_stop_job_delivery_queueing() {
     let registry = RunnerRegistry::default();
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -186,20 +178,10 @@ async fn registry_allows_quic_v1_stop_job_delivery_queueing() {
         .unwrap();
     let job = registry
         .start_job(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("quic-stop".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("quic-stop", "sleep 10", Some(10)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();

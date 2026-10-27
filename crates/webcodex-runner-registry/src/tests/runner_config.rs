@@ -1,11 +1,14 @@
 use super::*;
+use webcodex_core::runner_instruction::RunnerInstructionRequest;
 use webcodex_core::runner_protocol::{
     RunnerConfigAction, RunnerConfigOperationRequest, RunnerPollRequest, RunnerRegisterRequest,
     ShellCommandExecutionState, RUNNER_CONFIG_REQUEST_KIND,
 };
+use webcodex_core::ssh_resource::SshResourceRequest;
 
 fn registration(instance: &str, runner_config_control: bool) -> RunnerRegisterRequest {
     current_runner_registration(RunnerRegisterRequest {
+        computer_session_availability: None,
         client_id: "runner-config-control".to_string(),
         runner_instance_id: instance.to_string(),
         runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -29,6 +32,134 @@ fn registration(instance: &str, runner_config_control: bool) -> RunnerRegisterRe
 
 fn alice() -> RunnerAccess {
     auth_context(Some("alice"), false)
+}
+
+#[tokio::test]
+async fn invalid_control_payload_is_rejected_before_runner_lookup() {
+    let registry = RunnerRegistry::default();
+    let invalid_ssh = SshResourceRequest::Register {
+        expected_revision: 4,
+        name: String::new(),
+        target: "17724@w10".into(),
+        default_cwd: None,
+    };
+    assert!(invalid_ssh.validate().is_err());
+    let error = registry
+        .enqueue_ssh_resource("missing", "missing", invalid_ssh, None, "test".into())
+        .await
+        .unwrap_err();
+    assert_eq!(error, "ssh_resource_invalid: request was not started");
+    let invalid_config = RunnerConfigOperationRequest {
+        action: RunnerConfigAction::Reload,
+        expected_generation: Some(0),
+    };
+    assert!(invalid_config.validate().is_err());
+    let error = registry
+        .enqueue_runner_config("missing", "missing", invalid_config, None, "test".into())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error,
+        "invalid_runner_config_request: request was not started"
+    );
+    assert!(registry.inner.lock().await.pending_by_id.is_empty());
+}
+
+#[tokio::test]
+async fn instruction_control_preserves_visibility_and_dequeue_identity() {
+    let registry = RunnerRegistry::default();
+    let mut registration = registration("instance-a", true);
+    registration
+        .capabilities
+        .set(RunnerFeature::InstructionRuntime, true);
+    registry.register(registration).await.unwrap();
+    let denied = auth_context(Some("bob"), false);
+    for client_id in ["runner-config-control", "missing-runner"] {
+        let error = registry
+            .enqueue_runner_instruction(
+                client_id,
+                "instance-a",
+                RunnerInstructionRequest::snapshot(),
+                Some(&denied),
+                "test".into(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, "exact Runner is unavailable");
+    }
+    assert!(registry.inner.lock().await.pending_by_id.is_empty());
+
+    let auth = alice();
+    let (_, receiver) = registry
+        .enqueue_runner_instruction(
+            "runner-config-control",
+            "instance-a",
+            RunnerInstructionRequest::snapshot(),
+            Some(&auth),
+            "test".into(),
+        )
+        .await
+        .unwrap();
+    // Exercise the dequeue fence independently from registration's drain.
+    registry
+        .inner
+        .lock()
+        .await
+        .runners
+        .get_mut("runner-config-control")
+        .unwrap()
+        .runner_instance_id = "instance-b".into();
+    assert!(registry
+        .poll(RunnerPollRequest {
+            client_id: "runner-config-control".into(),
+            runner_instance_id: "instance-b".into(),
+        })
+        .await
+        .unwrap()
+        .is_none());
+    let response = receiver.await.unwrap();
+    assert!(!response.success);
+    assert_eq!(response.request_dispatched, Some(false));
+    assert_eq!(
+        response.command_execution_state,
+        Some(ShellCommandExecutionState::NotStarted)
+    );
+    assert!(response
+        .error
+        .as_deref()
+        .unwrap()
+        .starts_with("runner_replaced:"));
+    assert!(registry.inner.lock().await.pending_by_id.is_empty());
+}
+
+#[tokio::test]
+async fn runner_semantic_observation_order_stays_bound_to_its_record() {
+    let registry = RunnerRegistry::default();
+    let auth = alice();
+    registry
+        .register(registration("instance-a", true))
+        .await
+        .unwrap();
+    let first = registry
+        .get_runner_semantic_view_checked_for_auth("runner-config-control", Some(&auth))
+        .await
+        .unwrap();
+    let first_returned = std::time::Instant::now();
+    registry
+        .register(registration("instance-b", true))
+        .await
+        .unwrap();
+    let replacement = registry
+        .get_runner_semantic_view_checked_for_auth("runner-config-control", Some(&auth))
+        .await
+        .unwrap();
+    // Delayed consumption of the first view must not give the retired identity
+    // a new timestamp after the replacement was already verified.
+    assert_eq!(first.view.runner_instance_id, "instance-a");
+    assert_eq!(replacement.view.runner_instance_id, "instance-b");
+    assert!(first.observed_at <= first_returned);
+    assert!(replacement.observed_at >= first_returned);
+    assert!(first.observed_at <= replacement.observed_at);
 }
 
 #[tokio::test]

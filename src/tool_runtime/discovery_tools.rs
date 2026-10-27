@@ -12,6 +12,7 @@ impl ToolRuntime {
         call: ToolCall,
         auth: Option<&AuthContext>,
         protocol_capabilities: ToolProtocolCapabilities,
+        discovery_tools: Option<&std::collections::BTreeSet<String>>,
     ) -> ToolResult {
         match call {
             ToolCall::ListTools {
@@ -29,7 +30,12 @@ impl ToolRuntime {
                 client_id,
                 client_ids,
                 include_projects,
+                projects_offset,
                 summary_only,
+                query,
+                status,
+                limit,
+                offset,
             } => {
                 self.list_runners_with_options(
                     auth,
@@ -37,7 +43,12 @@ impl ToolRuntime {
                         client_id,
                         client_ids,
                         include_projects,
+                        projects_offset,
                         summary_only,
+                        query,
+                        status,
+                        limit,
+                        offset,
                     },
                 )
                 .await
@@ -50,41 +61,12 @@ impl ToolRuntime {
                 self.runtime_status_with_options(auth, compact, summary_only, client_id)
                     .await
             }
-            ToolCall::ReadToolTrace {
-                trace_ref,
-                offset,
-                limit,
-                payload_index,
-            } => match tokio::task::spawn_blocking({
-                let trace_ref = trace_ref.clone();
-                move || {
-                    crate::tool_request_trace::read_full_trace(
-                        &trace_ref,
-                        offset,
-                        limit,
-                        payload_index,
-                    )
-                }
-            })
-            .await
-            .map_err(|_| crate::tool_request_trace::TraceReadError {
-                kind: "trace_store_unavailable",
-                message: "trace diagnostic worker failed".to_string(),
-            })
-            .and_then(|result| result)
-            {
-                Ok(output) => ToolResult::ok(output),
-                Err(error) => ToolResult::err_with_output(
-                    error.message.clone(),
-                    serde_json::json!({
-                        "error_kind": error.kind,
-                        "message": error.message,
-                        "trace_ref": trace_ref,
-                        "state_changed": false,
-                    }),
-                ),
-            },
+            call @ ToolCall::ReadToolTrace { .. } => {
+                self.read_tool_trace_diagnostic(call, auth).await
+            }
             ToolCall::ToolManifest {
+                query,
+                limit,
                 tool_name,
                 category,
                 intent,
@@ -92,11 +74,15 @@ impl ToolRuntime {
                 include_risk_summary,
             } => {
                 self.tool_manifest(
+                    discovery_tools,
+                    auth,
                     tool_name,
                     category,
                     intent,
                     include_recommended_flows,
                     include_risk_summary,
+                    query,
+                    limit,
                     protocol_capabilities,
                 )
                 .await

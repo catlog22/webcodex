@@ -1,5 +1,73 @@
 use super::*;
 
+/// Internal read facts stay typed until the model-output boundary. Stale
+/// revisions belong to the Server's snapshot identity, not the Runner wire.
+pub(crate) type FileReadOutcome = Result<FileReadRange, FileReadFailure>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileReadFailure {
+    Read(ReadFileReason),
+    StaleRevision,
+}
+
+impl From<ReadFileReason> for FileReadFailure {
+    fn from(reason: ReadFileReason) -> Self {
+        Self::Read(reason)
+    }
+}
+
+impl FileReadFailure {
+    pub(crate) fn into_tool_result(self, path: Option<&str>) -> ToolResult {
+        let reason = match self {
+            Self::Read(reason) => reason.as_str(),
+            Self::StaleRevision => "stale_read_revision",
+        };
+        ToolResult::err_with_output(
+            format!("read_file failed: {reason}"),
+            json!({
+                "error_kind": "read_file_failed",
+                "reason_code": reason,
+                "path": path.unwrap_or(""),
+                "state_changed": false,
+            }),
+        )
+    }
+}
+
+/// Physical file-read capability. It owns only the Runner transport needed for
+/// target-fenced reads, response validation and cancellation, not runtime state.
+#[derive(Clone)]
+pub(crate) struct ProjectFileReader {
+    runner_registry: std::sync::Arc<crate::runner_http::RunnerRegistry>,
+}
+
+impl ProjectFileReader {
+    pub(crate) fn new(runner_registry: std::sync::Arc<crate::runner_http::RunnerRegistry>) -> Self {
+        Self { runner_registry }
+    }
+}
+
+/// Dropping the last singleflight waiter must also remove its queued request.
+/// Other waiters retain the shared future, so one caller timing out cannot
+/// cancel their physical read. This guard also covers ordinary read cancellation.
+struct PendingReadGuard {
+    registry: std::sync::Arc<crate::runner_http::RunnerRegistry>,
+    request_id: Option<String>,
+}
+
+impl Drop for PendingReadGuard {
+    fn drop(&mut self) {
+        if let Some(request_id) = self.request_id.take() {
+            let registry = self.registry.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    registry.cancel_request(&request_id).await;
+                });
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn read_file_content_result(
     content: String,
@@ -36,6 +104,7 @@ pub(crate) fn read_file_runner_stdout_result(
     read_file_runner_stdout_result_with_options(stdout, start_line, limit, false)
 }
 
+#[cfg(test)]
 pub(crate) fn read_file_runner_stdout_result_with_options(
     stdout: String,
     start_line: Option<usize>,
@@ -60,17 +129,119 @@ pub(crate) fn effective_read_file_range(
     (range.start_line, range.limit, range.end_line())
 }
 
+/// Re-project one caller-requested sub-range from a larger canonical plain-text
+/// read. `read_files` uses this after coalescing overlapping/nearby requests so
+/// the Runner performs fewer reads while the public result still preserves the
+/// original item order, range metadata, SHA, and optional line numbering.
+pub(crate) fn slice_read_file_range(
+    parent: &FileReadRange,
+    start_line: Option<usize>,
+    limit: Option<usize>,
+    with_line_numbers: bool,
+    path: &str,
+) -> FileReadOutcome {
+    let range = slice_covered_read_range(parent, start_line, limit)
+        .ok_or(ReadFileReason::MalformedRunnerResponse)?;
+    validate_read_file_output_budget(&range, with_line_numbers, Some(path))?;
+    Ok(range)
+}
+
+fn slice_covered_read_range(
+    parent: &FileReadRange,
+    start_line: Option<usize>,
+    limit: Option<usize>,
+) -> Option<FileReadRange> {
+    let total_lines = parent.total_lines;
+    let parent_start = parent.start_line;
+    let parent_returned = parent.returned_lines;
+    let parent_end = parent.end_line;
+
+    let range = EffectiveRange::new(start_line, limit);
+    let returned_lines = if range.start_line > total_lines || total_lines == 0 {
+        0
+    } else {
+        range.limit.min(
+            total_lines
+                .saturating_sub(range.start_line)
+                .saturating_add(1),
+        )
+    };
+    let end_line = if returned_lines == 0 {
+        None
+    } else {
+        Some(
+            range
+                .start_line
+                .saturating_add(returned_lines)
+                .saturating_sub(1),
+        )
+    };
+
+    if returned_lines > 0 {
+        if range.start_line < parent_start || end_line > parent_end {
+            return None;
+        }
+    } else if range.start_line < parent_start && total_lines >= range.start_line {
+        return None;
+    }
+
+    let content = if returned_lines == 0 {
+        String::new()
+    } else {
+        let offset = range.start_line.saturating_sub(parent_start);
+        let segments = parent
+            .content
+            .split('\n')
+            .take(parent_returned)
+            .skip(offset)
+            .take(returned_lines)
+            .collect::<Vec<_>>();
+        if segments.len() != returned_lines {
+            return None;
+        }
+        segments.join("\n")
+    };
+    let has_more = end_line.is_some_and(|end| end < total_lines);
+    let next_start_line = if has_more {
+        end_line.map(|end| end + 1)
+    } else {
+        None
+    };
+    Some(FileReadRange {
+        content,
+        sha256: parent.sha256.clone(),
+        total_lines,
+        start_line: range.start_line,
+        limit: range.limit,
+        returned_lines,
+        end_line,
+        has_more,
+        next_start_line,
+    })
+}
+
 /// Build the unified `read_file` success [`ToolResult`] from a shared range
 /// result, enforcing the final serialized-output hard limit after JSON
 /// escaping and (optional) line numbering. The model output is reconstructed
 /// from the canonical fields only; no Runner envelope extras survive.
 ///
 /// `path` is the project-relative input path to attach for model navigation.
-fn build_read_file_success(
+pub(crate) fn build_read_file_success(
     result: &FileReadRange,
     with_line_numbers: bool,
     path: Option<&str>,
 ) -> ToolResult {
+    match project_read_file_success(result, with_line_numbers, path) {
+        Ok(output) => ToolResult::ok(output),
+        Err(failure) => failure.into_tool_result(path),
+    }
+}
+
+fn project_read_file_success(
+    result: &FileReadRange,
+    with_line_numbers: bool,
+    path: Option<&str>,
+) -> Result<Value, FileReadFailure> {
     let mut output =
         webcodex_workspace::file_read_normalize::success_output(result, with_line_numbers);
     if let Some(path) = path {
@@ -80,32 +251,37 @@ fn build_read_file_success(
     // The content budget already bounds the raw range, but a heavily escaped or
     // numbered payload could still grow; fail closed rather than truncate.
     if !webcodex_workspace::file_read_normalize::serialized_fits(&output) {
-        return read_file_failure(ReadFileReason::RangeTooLarge, path);
+        return Err(ReadFileReason::RangeTooLarge.into());
     }
-    ToolResult::ok(output)
+    Ok(output)
 }
 
 /// Stable, schema-backed failure output for `read_file`. Carries only the
 /// project-relative input path and a stable reason code — never absolute paths,
 /// raw OS error text, or runner stdout/stderr.
+#[cfg(test)]
 fn read_file_failure(reason: ReadFileReason, path: Option<&str>) -> ToolResult {
-    let output = json!({
-        "error_kind": "read_file_failed",
-        "reason_code": reason.as_str(),
-        "path": path.unwrap_or(""),
-        "state_changed": false,
-    });
-    ToolResult::err_with_output(format!("read_file failed: {}", reason.as_str()), output)
+    FileReadFailure::Read(reason).into_tool_result(path)
 }
 
-fn validate_read_file_path(path: &str) -> Option<ToolResult> {
+/// Preserve the established physical plain-output and final numbered/path
+/// budgets without making the projected JSON an internal read interface.
+fn validate_read_file_output_budget(
+    range: &FileReadRange,
+    with_line_numbers: bool,
+    path: Option<&str>,
+) -> Result<(), FileReadFailure> {
+    project_read_file_success(range, with_line_numbers, path).map(|_| ())
+}
+
+fn validate_read_file_path(path: &str) -> Result<(), FileReadFailure> {
     if validate_project_relative_path(path).is_err() {
-        return Some(read_file_failure(ReadFileReason::InvalidPath, Some(path)));
+        return Err(ReadFileReason::InvalidPath.into());
     }
     if crate::sensitive_paths::is_secret_path(path) {
-        return Some(read_file_failure(ReadFileReason::SensitivePath, Some(path)));
+        return Err(ReadFileReason::SensitivePath.into());
     }
-    None
+    Ok(())
 }
 
 #[cfg(test)]
@@ -336,6 +512,17 @@ fn instruction_agents_alias_resolution(root_listing: &str) -> InstructionAgentsA
     }
 }
 
+const PROJECT_INSTRUCTION_RUNNER_WAIT_TIMEOUT_SECS: u64 = 6;
+
+#[cfg(not(test))]
+const PROJECT_INSTRUCTION_RESPONSE_DEADLINE: Duration =
+    Duration::from_secs(PROJECT_INSTRUCTION_RUNNER_WAIT_TIMEOUT_SECS + 2);
+// Unit-test Runners are in-process fakes. Tests that exercise instruction loading
+// actively complete these requests, while unrelated Session tests must not spend
+// five production-sized best-effort deadlines waiting on an intentionally idle fake.
+#[cfg(test)]
+const PROJECT_INSTRUCTION_RESPONSE_DEADLINE: Duration = Duration::from_millis(250);
+
 enum InstructionCandidateRead {
     Found(super::project_instructions::LoadedInstructionCandidate),
     Missing,
@@ -371,11 +558,34 @@ pub(crate) fn relative_entry_path(rel_path: &str, name: &str) -> String {
     }
 }
 
-/// Parse a complete Runner `file_list` source (one entry per line, directories
-/// suffixed with `/`) into deterministically sorted project-relative entries.
-/// Paging is deliberately applied only after the complete source has reached
-/// the Server so `total_entries` and `next_offset` never describe a retained
-/// tail as if it were the full directory.
+/// Native pages encode leaf names as JSON, not newline-delimited pseudo paths.
+fn parse_directory_page(
+    stdout: &str,
+    rel_path: &str,
+    request: &webcodex_core::directory_page::DirectoryPageRequest,
+) -> Result<(Vec<Value>, usize, Option<usize>), String> {
+    use webcodex_core::directory_page::{DirectoryPage, MAX_PAGE_BYTES};
+    if stdout.len() > MAX_PAGE_BYTES {
+        return Err("directory page exceeds byte bound".into());
+    }
+    let page: DirectoryPage =
+        serde_json::from_str(stdout).map_err(|_| "malformed directory page")?;
+    page.validate(request)?;
+    let entries = page
+        .entries
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "path": relative_entry_path(rel_path, &entry.name),
+                "kind": if entry.directory { "dir" } else { "file" },
+            })
+        })
+        .collect();
+    Ok((entries, page.total_entries, page.next_offset))
+}
+
+/// Compatibility for deployed Runners without native directory pages. Only a
+/// complete, non-truncated source may be sliced; never page a retained tail.
 pub(crate) fn parse_file_list_entries(stdout: &str, rel_path: &str) -> Vec<Value> {
     let mut all: Vec<Value> = Vec::new();
     for line in stdout.lines() {
@@ -521,45 +731,73 @@ impl ToolRuntime {
         with_line_numbers: Option<bool>,
     ) -> ToolResult {
         let with_line_numbers = with_line_numbers.unwrap_or(false);
-        if let Some(failure) = validate_read_file_path(&path) {
-            return failure;
+        if let Err(failure) = validate_read_file_path(&path) {
+            return failure.into_tool_result(Some(&path));
         }
-        let proj = match self.resolve_project(&project).await {
-            Ok(project) => project,
+        let resolved = match self.resolve_project_input(&project).await {
+            Ok(resolved) => resolved,
             Err(error) => return ToolResult::err(error),
         };
-        self.read_one_validated_project_file(
-            &proj,
-            path,
-            start_line,
-            limit,
-            with_line_numbers,
-            None,
-        )
-        .await
+        let Some(runner) = self
+            .runner_registry
+            .get_runner_view(&resolved.config.client_id)
+            .await
+        else {
+            return read_file_failure(ReadFileReason::RunnerUnavailable, Some(&path));
+        };
+        let Some(runner_project_id) =
+            crate::tool_runtime::runner_local_project_id(&resolved.resolved_id)
+        else {
+            return read_file_failure(ReadFileReason::RunnerUnavailable, Some(&path));
+        };
+        let result = ProjectFileReader::new(self.runner_registry.clone())
+            .read_one_validated_project_file(
+                &resolved.config,
+                runner_project_id,
+                &runner.runner_instance_id,
+                &path,
+                start_line,
+                limit,
+                with_line_numbers,
+                None,
+            )
+            .await;
+        match result {
+            Ok(range) => {
+                // The historical single-read test entry attaches its path
+                // after the physical output cap, like the Runner-backed path.
+                let mut result = build_read_file_success(&range, with_line_numbers, None);
+                result.output["path"] = json!(path);
+                result
+            }
+            Err(failure) => failure.into_tool_result(Some(&path)),
+        }
     }
+}
 
+impl ProjectFileReader {
     pub(crate) async fn read_one_resolved_project_file(
         &self,
         project: &ProjectConfig,
+        runner_project_id: &str,
+        expected_runner_instance_id: &str,
         path: String,
         start_line: Option<usize>,
         limit: Option<usize>,
-        with_line_numbers: bool,
         deadline: Instant,
-    ) -> ToolResult {
+    ) -> FileReadOutcome {
         if Instant::now() >= deadline {
-            return read_file_failure(ReadFileReason::Timeout, Some(&path));
+            return Err(ReadFileReason::Timeout.into());
         }
-        if let Some(failure) = validate_read_file_path(&path) {
-            return failure;
-        }
+        validate_read_file_path(&path)?;
         self.read_one_validated_project_file(
             project,
-            path,
+            runner_project_id,
+            expected_runner_instance_id,
+            &path,
             start_line,
             limit,
-            with_line_numbers,
+            false,
             Some(deadline),
         )
         .await
@@ -568,22 +806,24 @@ impl ToolRuntime {
     async fn read_one_validated_project_file(
         &self,
         proj: &ProjectConfig,
-        path: String,
+        runner_project_id: &str,
+        expected_runner_instance_id: &str,
+        path: &str,
         start_line: Option<usize>,
         limit: Option<usize>,
         with_line_numbers: bool,
         deadline: Option<Instant>,
-    ) -> ToolResult {
+    ) -> FileReadOutcome {
         let client_id = proj.client_id.clone();
         let wait_timeout = 30;
         let (eff_start, _eff_limit, eff_end) = effective_read_file_range(start_line, limit);
         let (request_id, rx) = match self
             .runner_registry
-            .enqueue_file_op(
+            .enqueue_project_file_read(
                 ShellFileOpRequest {
                     op: "read".to_string(),
                     client_id,
-                    path: path.clone(),
+                    path: path.to_string(),
                     cwd: Some(proj.path.clone()),
                     content: None,
                     // The shared scanner bounds raw content. The Runner
@@ -601,53 +841,55 @@ impl ToolRuntime {
                     create_dirs: false,
                     wait_timeout_secs: wait_timeout,
                 },
+                runner_project_id,
+                &proj.path,
+                expected_runner_instance_id,
                 "tool_runtime".to_string(),
             )
             .await
         {
             Ok(r) => r,
-            Err(_) => return read_file_failure(ReadFileReason::RunnerUnavailable, Some(&path)),
+            Err(_) => return Err(ReadFileReason::RunnerUnavailable.into()),
+        };
+        let mut pending = PendingReadGuard {
+            registry: self.runner_registry.clone(),
+            request_id: Some(request_id.clone()),
         };
         let response = match deadline {
             Some(deadline) => tokio::time::timeout_at(deadline, rx).await,
             None => tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await,
         };
+        pending.request_id = None;
         match response {
             Ok(Ok(resp)) if resp.exit_code == Some(0) && resp.error.is_none() => {
-                let mut result = read_file_runner_stdout_result_with_options(
-                    resp.stdout.unwrap_or_default(),
+                let range = parse_runner_file_read_range(
+                    &resp.stdout.unwrap_or_default(),
                     start_line,
                     limit,
-                    with_line_numbers,
-                );
-                if result.success {
-                    result.output["path"] = json!(path);
-                    result
-                } else {
-                    // The Runner response failed validation; surface a stable
-                    // structured error using the project-relative path.
-                    result.output["path"] = json!(path);
-                    result
-                }
+                )?;
+                validate_read_file_output_budget(&range, with_line_numbers, None)?;
+                Ok(range)
             }
             // Map Runner execution failures to stable reason codes. The
             // raw `resp.error`/`resp.stderr` (which may carry the runner's
             // absolute path) is never forwarded to the model.
             Ok(Ok(resp)) => {
                 let reason = map_runner_read_error(&resp);
-                read_file_failure(reason, Some(&path))
+                Err(reason.into())
             }
             Ok(Err(_)) => {
                 self.runner_registry.cancel_request(&request_id).await;
-                read_file_failure(ReadFileReason::RunnerUnavailable, Some(&path))
+                Err(ReadFileReason::RunnerUnavailable.into())
             }
             Err(_) => {
                 self.runner_registry.cancel_request(&request_id).await;
-                read_file_failure(ReadFileReason::Timeout, Some(&path))
+                Err(ReadFileReason::Timeout.into())
             }
         }
     }
+}
 
+impl ToolRuntime {
     // -------------------------------------------------------------------------
     // Project instructions auto-load (best-effort, session-start guidance)
     // -------------------------------------------------------------------------
@@ -757,7 +999,6 @@ impl ToolRuntime {
         &self,
         config: &ProjectConfig,
     ) -> Option<InstructionAgentsAliasResolution> {
-        const WAIT_TIMEOUT: u64 = 6;
         let client_id = config.client_id.as_str();
         let (request_id, rx) = self
             .runner_registry
@@ -777,13 +1018,13 @@ impl ToolRuntime {
                     end_line: None,
                     line: None,
                     create_dirs: false,
-                    wait_timeout_secs: WAIT_TIMEOUT,
+                    wait_timeout_secs: PROJECT_INSTRUCTION_RUNNER_WAIT_TIMEOUT_SECS,
                 },
                 "project_instructions".to_string(),
             )
             .await
             .ok()?;
-        match tokio::time::timeout(Duration::from_secs(WAIT_TIMEOUT + 2), rx).await {
+        match tokio::time::timeout(PROJECT_INSTRUCTION_RESPONSE_DEADLINE, rx).await {
             Ok(Ok(resp)) if resp.exit_code == Some(0) && resp.error.is_none() => Some(
                 instruction_agents_alias_resolution(resp.stdout.as_deref().unwrap_or_default()),
             ),
@@ -808,8 +1049,6 @@ impl ToolRuntime {
         // Request one extra line so canonical envelope total/selection metadata
         // reliably signals truncation beyond the per-file cap.
         let read_limit = MAX_LINES_PER_FILE + 1;
-        const WAIT_TIMEOUT: u64 = 6;
-
         let client_id = config.client_id.as_str();
         let (request_id, rx) = match self
             .runner_registry
@@ -829,7 +1068,7 @@ impl ToolRuntime {
                     end_line: Some(read_limit),
                     line: None,
                     create_dirs: false,
-                    wait_timeout_secs: WAIT_TIMEOUT,
+                    wait_timeout_secs: PROJECT_INSTRUCTION_RUNNER_WAIT_TIMEOUT_SECS,
                 },
                 "project_instructions".to_string(),
             )
@@ -838,11 +1077,13 @@ impl ToolRuntime {
             Ok(enqueued) => enqueued,
             Err(_) => return InstructionCandidateRead::Unavailable,
         };
-        match tokio::time::timeout(Duration::from_secs(WAIT_TIMEOUT + 2), rx).await {
+        match tokio::time::timeout(PROJECT_INSTRUCTION_RESPONSE_DEADLINE, rx).await {
             Ok(Ok(resp)) if resp.exit_code == Some(0) && resp.error.is_none() => {
                 match parse_instruction_runner_stdout(resp.stdout.unwrap_or_default()) {
                     Ok(Some((content, total_lines, full_sha256))) => {
                         InstructionCandidateRead::Found(LoadedInstructionCandidate {
+                            source_scope:
+                                super::project_instructions::InstructionSourceScope::Project,
                             path: path.to_string(),
                             content,
                             total_lines,
@@ -893,15 +1134,29 @@ impl ToolRuntime {
         let offset = offset.unwrap_or(0);
         let client_id = proj.client_id.clone();
         let wait_timeout = 30;
+        let native_page = self
+            .runner_registry
+            .get_runner_feature_set(&client_id)
+            .await
+            .is_ok_and(|features| {
+                features.supports(crate::runner_http::RunnerFeature::FileListPage)
+            });
+        let page_request = webcodex_core::directory_page::DirectoryPageRequest {
+            offset,
+            limit: max_entries,
+        };
         let (request_id, rx) = match self
             .runner_registry
             .enqueue_file_op(
                 ShellFileOpRequest {
-                    op: "list".to_string(),
+                    op: if native_page { "list_page" } else { "list" }.to_string(),
                     client_id,
                     path: rel_path.clone(),
                     cwd: Some(proj.path.clone()),
-                    content: None,
+                    content: native_page.then(|| {
+                        serde_json::to_string(&page_request)
+                            .expect("bounded page request serializes")
+                    }),
                     max_bytes: None,
                     old_text: None,
                     pattern: None,
@@ -920,7 +1175,18 @@ impl ToolRuntime {
             Ok(r) => r,
             Err(e) => return ToolResult::err(e),
         };
-        match tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await {
+        let mut pending = PendingReadGuard {
+            registry: self.runner_registry.clone(),
+            request_id: Some(request_id.clone()),
+        };
+        let received = tokio::time::timeout(Duration::from_secs(wait_timeout + 2), rx).await;
+        if !matches!(&received, Ok(Ok(_))) {
+            self.runner_registry.cancel_request(&request_id).await;
+        }
+        // A cancellation during the await above still leaves the guard armed.
+        // Normal completion owns the cleanup once, not again from Drop.
+        pending.request_id = None;
+        match received {
             Ok(Ok(resp)) if resp.exit_code == Some(0) && resp.error.is_none() => {
                 let stdout = resp.stdout.unwrap_or_default();
                 if has_leading_runner_result_retention_truncation_marker(&stdout) {
@@ -933,11 +1199,23 @@ impl ToolRuntime {
                         }),
                     );
                 }
-                let all = parse_file_list_entries(&stdout, &rel_path);
-                let total_entries = all.len();
-                let (entries, next_offset) = page_file_list_entries(&all, offset, max_entries);
+                let (entries, total_entries, next_offset) = if native_page {
+                    match parse_directory_page(&stdout, &rel_path, &page_request) {
+                        Ok(page) => page,
+                        Err(error) => {
+                            return ToolResult::err_with_output(
+                                error,
+                                json!({"error_kind":"source_incomplete", "reason_code":"invalid_directory_page", "state_changed":false}),
+                            )
+                        }
+                    }
+                } else {
+                    let all = parse_file_list_entries(&stdout, &rel_path);
+                    let (entries, next) = page_file_list_entries(&all, offset, max_entries);
+                    (entries, all.len(), next)
+                };
                 let returned = entries.len();
-                ToolResult::ok(json!({
+                let mut result = ToolResult::ok(json!({
                     "project": project,
                     "path": rel_path,
                     "entries": entries,
@@ -946,21 +1224,20 @@ impl ToolRuntime {
                     "offset": offset,
                     "next_offset": next_offset,
                     "truncated": next_offset.is_some(),
-                }))
+                }));
+                if let Some(next) = next_offset {
+                    result.output["next_call"] = super::super::SuggestedToolCall::mechanically_followable(
+                        "list_project_files", json!({"project":project, "path":rel_path, "limit":max_entries, "offset":next})).to_value();
+                }
+                result
             }
             Ok(Ok(resp)) => ToolResult::err(
                 resp.error
                     .or(resp.stderr)
                     .unwrap_or_else(|| "Runner list_project_files failed".to_string()),
             ),
-            Ok(Err(_)) => {
-                self.runner_registry.cancel_request(&request_id).await;
-                ToolResult::err("Runner list_project_files waiter was dropped")
-            }
-            Err(_) => {
-                self.runner_registry.cancel_request(&request_id).await;
-                ToolResult::err("timed out waiting for Runner list_project_files")
-            }
+            Ok(Err(_)) => ToolResult::err("Runner list_project_files waiter was dropped"),
+            Err(_) => ToolResult::err("timed out waiting for Runner list_project_files"),
         }
     }
 
@@ -981,10 +1258,20 @@ impl ToolRuntime {
         project: String,
         path: Option<String>,
         globs: Option<Vec<String>>,
+        query: Option<String>,
         depth: Option<usize>,
         limit: Option<usize>,
         offset: Option<usize>,
     ) -> ToolResult {
+        if query
+            .as_ref()
+            .is_some_and(|q| q.chars().count() > 200 || q.contains('\0'))
+        {
+            return list_tracked_error(
+                "invalid_query",
+                "query must be at most 200 characters without NUL".to_string(),
+            );
+        }
         let scope_input = path.as_deref().unwrap_or("").trim().to_string();
         if !scope_input.is_empty() && scope_input != "." {
             if let Err(error) = validate_project_relative_path(&scope_input) {
@@ -1096,12 +1383,19 @@ impl ToolRuntime {
         let (bounded_raw, producer_budget_hit) = bounded_tracked_source(&raw);
         let (paths, unterminated_record) = super::file_listing::parse_nul_separated(bounded_raw);
         let list_truncated = producer_budget_hit || unterminated_record;
-        let listing =
-            super::file_listing::build_listing(&paths, &scope, &globs, depth, limit, offset);
+        let listing = super::file_listing::build_listing_with_query(
+            &paths,
+            &scope,
+            &globs,
+            query.as_deref(),
+            depth,
+            limit,
+            offset,
+        );
         ToolResult::ok(listing.to_json(&project, &scope, list_truncated))
     }
 
-    /// `project_overview`: deterministic, bounded project metadata routed to
+    /// `read_project_overview`: deterministic, bounded project metadata routed to
     /// the owning Runner. The server validates inputs and parses the structured
     /// response but never reads the Runner host's project path.
     pub(crate) async fn project_overview(
@@ -1162,12 +1456,12 @@ impl ToolRuntime {
                         Ok(Value::Object(output)) => Value::Object(output),
                         Ok(_) => {
                             return ToolResult::err(
-                                "Runner project_overview returned a non-object payload",
+                                "Runner read_project_overview returned a non-object payload",
                             )
                         }
                         Err(error) => {
                             return ToolResult::err(format!(
-                                "Runner project_overview returned invalid JSON: {error}"
+                                "Runner read_project_overview returned invalid JSON: {error}"
                             ))
                         }
                     };
@@ -1176,7 +1470,7 @@ impl ToolRuntime {
                     || output["scan"]["limit"] != limit
                 {
                     return ToolResult::err(
-                        "Runner project_overview response did not match the requested bounds",
+                        "Runner read_project_overview response did not match the requested bounds",
                     );
                 }
                 output["project"] = json!(project);
@@ -1186,15 +1480,15 @@ impl ToolRuntime {
                 response
                     .error
                     .or(response.stderr)
-                    .unwrap_or_else(|| "Runner project_overview failed".to_string()),
+                    .unwrap_or_else(|| "Runner read_project_overview failed".to_string()),
             ),
             Ok(Err(_)) => {
                 self.runner_registry.cancel_request(&request_id).await;
-                ToolResult::err("Runner project_overview waiter was dropped")
+                ToolResult::err("Runner read_project_overview waiter was dropped")
             }
             Err(_) => {
                 self.runner_registry.cancel_request(&request_id).await;
-                ToolResult::err("timed out waiting for Runner project_overview")
+                ToolResult::err("timed out waiting for Runner read_project_overview")
             }
         }
     }
@@ -1351,6 +1645,28 @@ mod tests {
         assert_eq!(result.output["start_line"], 2);
         assert_eq!(result.output["limit"], 2);
         assert_eq!(result.output["format"], "numbered");
+    }
+
+    #[test]
+    fn coalesced_read_slice_restores_original_range_and_numbering() {
+        let parent = file_read_range::read_range_from(
+            "one\ntwo\nthree\nfour\nfive".as_bytes(),
+            EffectiveRange::new(Some(1), Some(5)),
+        )
+        .unwrap();
+        let sliced = slice_read_file_range(&parent, Some(2), Some(2), true, "src/lib.rs")
+            .expect("contained range should be sliceable");
+        let output = build_read_file_success(&sliced, true, Some("src/lib.rs")).output;
+
+        assert_eq!(output["path"], "src/lib.rs");
+        assert_eq!(output["text"], "2 | two\n3 | three");
+        assert_eq!(output["format"], "numbered");
+        assert_eq!(sliced.start_line, 2);
+        assert_eq!(sliced.limit, 2);
+        assert_eq!(sliced.returned_lines, 2);
+        assert_eq!(sliced.end_line, Some(3));
+        assert_eq!(sliced.next_start_line, Some(4));
+        assert_eq!(sliced.sha256, parent.sha256);
     }
 
     #[test]
@@ -1679,6 +1995,8 @@ mod tests {
             exit_code: None,
             stdout: None,
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: Some(message.to_string()),
             request_dispatched: Some(true),
@@ -1760,7 +2078,7 @@ mod tests {
                 "risk": u64::MAX
             },
             "highest_priority": "high",
-            "suggested_next_tool": "session_discussion_summary"
+            "suggested_next_tool": "read_session_discussion_summary"
         });
         let serialized = serde_json::to_vec(&result).unwrap();
         assert!(

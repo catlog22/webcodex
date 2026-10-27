@@ -30,6 +30,7 @@ async fn lease_different_online_instance_takes_over_immediately_and_retires_old_
     // passive last_seen grace: it takes over immediately even while A is fresh.
     let view = registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -113,6 +114,7 @@ async fn lease_stale_instance_result_rejected() {
     let (request_id, mut rx) = registry
         .enqueue_run(
             ShellRunRequest {
+                login: false,
                 client_id: "oe".to_string(),
                 cwd: None,
                 command: "echo hi".to_string(),
@@ -147,6 +149,8 @@ async fn lease_stale_instance_result_rejected() {
             exit_code: Some(0),
             stdout: Some("hi".to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -177,6 +181,8 @@ async fn lease_stale_instance_result_rejected() {
             exit_code: Some(0),
             stdout: Some("hi".to_string()),
             stderr: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
             duration_ms: Some(1),
             error: None,
         })
@@ -200,20 +206,10 @@ async fn lease_stale_instance_job_update_rejected() {
     register_with_instance(&registry, "oe", "inst-a").await;
     let job = registry
         .start_job(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("oe", "sleep 10", Some(10)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -246,14 +242,15 @@ async fn lease_stale_instance_job_update_rejected() {
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: false,
         })
@@ -276,14 +273,15 @@ async fn lease_stale_instance_job_update_rejected() {
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: false,
         })
@@ -307,14 +305,15 @@ async fn lease_stale_instance_job_update_rejected() {
             status: "completed".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: Some(0),
             duration_ms: Some(1),
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: true,
         })
@@ -347,20 +346,10 @@ async fn lease_reconcile_disconnect_stale_instance_is_noop() {
     // replaces A, before any disconnect runs.
     let old_job = registry
         .start_job(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("oe", "sleep 10", Some(10)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -380,20 +369,10 @@ async fn lease_reconcile_disconnect_stale_instance_is_noop() {
     // B starts a fresh job of its own after the replacement.
     let b_job = registry
         .start_job(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("oe", "sleep 10", Some(10)),
             "tester".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -448,14 +427,15 @@ async fn lease_reconcile_disconnect_stale_instance_is_noop() {
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: false,
         })
@@ -509,6 +489,7 @@ async fn lease_register_rejects_empty_instance_id() {
     let registry = RunnerRegistry::default();
     let err = registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -548,6 +529,7 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
     };
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -571,33 +553,32 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
         .unwrap();
 
     let job = registry
-        .start_job_with_metadata(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
+        .start_job(
+            JobStartRequest {
                 cwd: Some("/tmp".to_string()),
-                command: Some(String::new()),
-                timeout_secs: Some(60),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
+                timeout_secs: 60,
+                context: JobStartContext {
+                    purpose: Some("test".to_string()),
+                    shell: Some("direct_argv".to_string()),
+                    ..Default::default()
+                },
+                ..JobStartRequest::new(
+                    "oe",
+                    JobStartExecution::DetachedProcess {
+                        process: crate::runner_protocol::ShellProcessArgv {
+                            executable: "/bin/sleep".to_string(),
+                            args: vec!["60".to_string()],
+                        },
+                        stdin: None,
+                        idempotency_key: "lease-detached-transfer".to_string(),
+                        validation_identity: None,
+                        validation_tool: None,
+                    },
+                )
             },
             "tester".to_string(),
-            ShellJobStartMetadata {
-                purpose: Some("test".to_string()),
-                shell: Some("direct_argv".to_string()),
-                structured_execution: Some(StructuredJobExecution::DetachedProcess(
-                    crate::runner_protocol::ShellProcessArgv {
-                        executable: "/bin/sleep".to_string(),
-                        args: vec!["60".to_string()],
-                    },
-                )),
-                detached_idempotency_key: Some("lease-detached-transfer".to_string()),
-                ..Default::default()
-            },
+            None,
+            Some(&DetachedInitiatorIdentity::internal()),
         )
         .await
         .unwrap();
@@ -622,14 +603,15 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: false,
         })
@@ -667,6 +649,9 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
             stdout: Default::default(),
             stderr: Default::default(),
             validation_progress: record.validation_progress.clone(),
+            test_count_evidence: record.test_count_evidence.clone(),
+            format_mutation: record.format_mutation,
+            build_artifacts: record.build_artifacts.clone(),
             activity: record.activity,
         }
     };
@@ -676,6 +661,7 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
         .await;
     let view = registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -721,14 +707,15 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
             status: "running".to_string(),
             stdout_chunk: Some("continued\n".to_string()),
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: false,
         })
@@ -746,14 +733,15 @@ async fn lease_replacement_transfers_exact_detached_inventory_to_new_instance() 
             status: "running".to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: None,
             duration_ms: None,
             error: None,
             command_execution_state: None,
             validation_progress: None,
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity: None,
             finished: false,
         })

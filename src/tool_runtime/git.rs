@@ -13,11 +13,13 @@ pub(crate) use self::diff_hunks::{
 };
 #[cfg(test)]
 pub(crate) use self::log::{
-    git_log_command, git_log_next_skip, normalize_git_log_limit, normalize_git_log_skip,
-    parse_git_log_commits,
+    git_log_command, git_log_command_at_head, git_log_next_skip, normalize_git_log_limit,
+    normalize_git_log_skip, parse_git_log_commits,
 };
 #[cfg(test)]
 pub(crate) use self::mutations::{parse_git_commit_marker, GIT_COMMIT_RESULT_PREFIX};
+#[cfg(all(test, unix))]
+pub(crate) use self::show_changes::SHOW_CHANGES_DIFF_BYTES;
 #[cfg(test)]
 pub(crate) use self::show_changes::{
     apply_show_changes_session, collect_show_changes_untracked_previews_for_root,
@@ -25,9 +27,9 @@ pub(crate) use self::show_changes::{
     non_git_show_changes_payload, parse_show_changes_output,
     parse_show_changes_output_with_observation, parse_show_changes_status_observation,
     parse_status_header, show_changes_command, show_changes_untracked_paths,
-    split_show_changes_stdout, ShowChangesStdout, SHOW_CHANGES_DIFF_BYTES,
-    SHOW_CHANGES_DIFF_STAT_BYTES, SHOW_CHANGES_HEAD_BYTES, SHOW_CHANGES_MAX_STATUS_FILES,
-    SHOW_CHANGES_OUTPUT_BUDGET_BYTES, SHOW_CHANGES_SENTINEL,
+    split_show_changes_stdout, ShowChangesStdout, SHOW_CHANGES_DIFF_STAT_BYTES,
+    SHOW_CHANGES_HEAD_BYTES, SHOW_CHANGES_MAX_STATUS_FILES, SHOW_CHANGES_OUTPUT_BUDGET_BYTES,
+    SHOW_CHANGES_SENTINEL,
 };
 
 pub(crate) fn sparsify_complete_git_review_success(tool_name: &str, result: &mut ToolResult) {
@@ -38,8 +40,10 @@ pub(crate) fn sparsify_complete_git_review_success(tool_name: &str, result: &mut
         return;
     };
     match tool_name {
-        "git_diff_hunks" => self::diff_hunks::sparsify_complete_git_diff_hunks_output(output),
-        "show_changes" => self::show_changes::sparsify_complete_show_changes_output(output),
+        "read_git_diff_hunks" => self::diff_hunks::sparsify_complete_git_diff_hunks_output(output),
+        "read_workspace_changes" => {
+            self::show_changes::sparsify_complete_show_changes_output(output)
+        }
         _ => {}
     }
 }

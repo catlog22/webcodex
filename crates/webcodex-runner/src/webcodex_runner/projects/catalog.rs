@@ -13,7 +13,7 @@ use webcodex_process::{GracefulTermination, ManagedChild};
 use super::super::config::{project_registry_dir, validate_shell_profile_name, RunnerConfig};
 use super::super::shell::canonicalize_existing;
 use super::{RunnerProjectCache, RunnerProjectFile, RunnerProjectShellContext};
-use crate::runner_protocol::{
+use webcodex_core::runner_protocol::{
     RunnerProjectLineage, RunnerProjectSummary, PROJECT_ROOT_FINGERPRINT_PREFIX,
     PROJECT_ROOT_IDENTITY_DOMAIN,
 };
@@ -162,6 +162,7 @@ fn load_runner_project_shell_contexts_from_dir(dir: &Path) -> Vec<RunnerProjectS
         projects.push(RunnerProjectShellContext {
             id: project.id,
             path: project.path,
+            allow_patch: project.allow_patch,
             shell_profile: project.shell_profile,
         });
     }

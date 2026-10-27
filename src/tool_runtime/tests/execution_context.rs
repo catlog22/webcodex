@@ -5,6 +5,7 @@ use super::support::*;
 use crate::runner_protocol::{
     RunnerCapabilities, RunnerResultPayload, RunnerResultRequest, ShellCommandExecutionState,
 };
+use crate::tool_runtime::dispatch::DispatchContext;
 
 fn context(cwd: Option<&str>, shell: Option<ExecutionShell>) -> sessions::SessionExecutionContext {
     sessions::SessionExecutionContext {
@@ -32,7 +33,19 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
     std::fs::create_dir_all(&override_dir).unwrap();
 
     let runtime = test_runtime();
-    let project = register_runner_project_at_path(&runtime, "context-shell", "demo", &root).await;
+    let project = register_runner_project_at_path_with_capabilities(
+        &runtime,
+        "context-shell",
+        "demo",
+        &root,
+        RunnerCapabilities {
+            shell: true,
+            explicit_shell_selection: true,
+            bash_login_shell: true,
+            ..Default::default()
+        },
+    )
+    .await;
     let auth = auth_context(None, true);
     let session = runtime
         .sessions
@@ -56,10 +69,12 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "pwd".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -74,7 +89,14 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
         inherited_request.cwd.as_deref(),
         Some(frontend.to_string_lossy().as_ref())
     );
-    assert!(inherited_request.command.starts_with("exec bash -c "));
+    assert_eq!(inherited_request.command, "pwd");
+    assert_eq!(
+        inherited_request
+            .job_context
+            .as_ref()
+            .and_then(|context| context.shell.as_deref()),
+        Some("bash")
+    );
     complete_patch_agent_request(
         &runtime,
         "context-shell",
@@ -98,10 +120,12 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "pwd".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: Some("override".to_string()),
                         purpose: None,
                         shell: Some(ExecutionShell::Sh),
@@ -116,7 +140,14 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
         override_request.cwd.as_deref(),
         Some(override_dir.to_string_lossy().as_ref())
     );
-    assert!(override_request.command.starts_with("exec sh -c "));
+    assert_eq!(override_request.command, "pwd");
+    assert_eq!(
+        override_request
+            .job_context
+            .as_ref()
+            .and_then(|context| context.shell.as_deref()),
+        Some("sh")
+    );
     complete_patch_agent_request(
         &runtime,
         "context-shell",
@@ -139,10 +170,12 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "pwd".to_string(),
                         session_id: None,
                         timeout_secs: Some(30),
+                        sync_wait_secs: Some(30),
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -158,6 +191,7 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
         Some(root.to_string_lossy().as_ref())
     );
     assert_eq!(no_session_request.command, "pwd");
+    assert!(no_session_request.shell.is_none());
     complete_patch_agent_request(
         &runtime,
         "context-shell",
@@ -169,8 +203,61 @@ async fn run_shell_inherits_session_context_and_explicit_arguments_override_it()
     .await;
     let no_session = no_session_task.await.unwrap();
     assert!(no_session.success, "{:?}", no_session.error);
-    assert_eq!(no_session.output["cwd"], ".");
-    assert_eq!(no_session.output["shell"], "configured");
+    // The Runner request above proves the defaults; the model receipt omits them.
+    assert!(no_session.output.get("cwd").is_none());
+    assert!(no_session.output.get("shell").is_none());
+}
+
+#[tokio::test]
+async fn explicit_local_shell_fails_closed_on_older_runner_without_selector_capability() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    let runtime = test_runtime();
+    let project = register_runner_project_at_path_with_capabilities(
+        &runtime,
+        "context-old-shell",
+        "demo",
+        &root,
+        RunnerCapabilities {
+            shell: true,
+            explicit_shell_selection: false,
+            bash_login_shell: false,
+            ..Default::default()
+        },
+    )
+    .await;
+    let auth = auth_context(None, true);
+
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::RunShell {
+                login: false,
+                project,
+                command: "pwd".to_string(),
+                session_id: None,
+                timeout_secs: Some(30),
+                sync_wait_secs: Some(30),
+                cwd: None,
+                purpose: None,
+                shell: Some(ExecutionShell::Bash),
+            },
+            Some(&auth),
+        )
+        .await;
+
+    assert!(!result.success, "{result:?}");
+    assert_eq!(result.output["execution_state"], "not_started");
+    assert_eq!(result.output["command_started"], false);
+    assert_eq!(result.output["failure_kind"], "capability_unavailable");
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("explicit_shell_selection"));
+    assert!(probe_patch_agent_request(&runtime, "context-old-shell")
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -187,8 +274,19 @@ async fn outer_recorder_does_not_override_business_session_execution_context() {
     std::fs::create_dir_all(&business_dir).unwrap();
 
     let runtime = test_runtime();
-    let project =
-        register_runner_project_at_path(&runtime, "context-recorder", "demo", &root).await;
+    let project = register_runner_project_at_path_with_capabilities(
+        &runtime,
+        "context-recorder",
+        "demo",
+        &root,
+        RunnerCapabilities {
+            shell: true,
+            explicit_shell_selection: true,
+            bash_login_shell: true,
+            ..Default::default()
+        },
+    )
+    .await;
     let auth = auth_context(None, true);
     let recorder = runtime
         .sessions
@@ -230,7 +328,8 @@ async fn outer_recorder_does_not_override_business_session_execution_context() {
                             "project": project,
                             "command": "pwd",
                             "session_id": business_id,
-                            "timeout_secs": 30
+                            "timeout_secs": 30,
+                            "sync_wait_secs": 30
                         }),
                     },
                     ToolCallContext {
@@ -251,10 +350,14 @@ async fn outer_recorder_does_not_override_business_session_execution_context() {
         Some(business_dir.to_string_lossy().as_ref()),
         "business Session cwd must win over recorder context"
     );
-    assert!(
-        request.command.starts_with("exec bash -c "),
-        "business Session shell must win over recorder context: {}",
-        request.command
+    assert_eq!(request.command, "pwd");
+    assert_eq!(
+        request
+            .job_context
+            .as_ref()
+            .and_then(|context| context.shell.as_deref()),
+        Some("bash"),
+        "business Session shell must win over recorder context"
     );
     complete_patch_agent_request(&runtime, "context-recorder", &request.request_id, 0, "", "")
         .await;
@@ -277,6 +380,8 @@ async fn run_job_inherits_session_cwd_and_shell() {
     let auth = open_auth_context();
     let capabilities = RunnerCapabilities {
         async_shell_jobs: true,
+        explicit_shell_selection: true,
+        bash_login_shell: true,
         ..Default::default()
     };
     register_agent_projects_for_auth(
@@ -324,7 +429,14 @@ async fn run_job_inherits_session_cwd_and_shell() {
         request.cwd.as_deref(),
         Some(frontend.to_string_lossy().as_ref())
     );
-    assert!(request.command.starts_with("exec bash -c "));
+    assert_eq!(request.command, "pwd");
+    assert_eq!(
+        request
+            .job_context
+            .as_ref()
+            .and_then(|context| context.shell.as_deref()),
+        Some("bash")
+    );
 }
 
 #[tokio::test]
@@ -367,17 +479,19 @@ async fn session_ssh_resource_uses_remote_cwd_and_safe_agent_context_for_shell_a
         let auth = auth.clone();
         async move {
             runtime
-                .dispatch_with_auth(
+                .dispatch_with_context(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "pwd".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: None,
                         cwd: Some("/remote/override".to_string()),
                         purpose: None,
                         shell: None,
                     },
-                    Some(&auth),
+                    DispatchContext::internal(Some(&auth), sessions::SessionTransport::Mcp, None),
                 )
                 .await
         }
@@ -502,6 +616,7 @@ async fn session_ssh_resource_rejects_structured_cargo_before_direct_sync_start(
                 no_default_features: None,
                 features: None,
                 package: None,
+                packages: None,
                 timeout_secs: Some(30),
                 sync_wait_secs: None,
             },
@@ -615,10 +730,12 @@ async fn session_ssh_resource_requires_runner_ssh_shell_capability() {
     let result = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project,
                 command: "pwd".to_string(),
                 session_id: Some(session.session_id),
                 timeout_secs: Some(30),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -679,10 +796,12 @@ async fn session_ssh_transport_failure_marks_remote_delivery_uncertain() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "printf uncertain".to_string(),
                         session_id: Some(session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: None,
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -697,14 +816,16 @@ async fn session_ssh_transport_failure_marks_remote_delivery_uncertain() {
         .runner_registry
         .complete(RunnerResultPayload {
             result: RunnerResultRequest {
-                client_id: "context-ssh-transport".to_string(),
-                runner_instance_id: "inst-context-ssh-transport".to_string(),
-                request_id: request.request_id,
                 exit_code: Some(255),
                 stdout: Some(String::new()),
                 stderr: Some("connection reset".to_string()),
                 duration_ms: Some(1),
                 error: Some("ssh transport failed after dispatch".to_string()),
+                ..runner_result_request(
+                    "context-ssh-transport".to_string(),
+                    "inst-context-ssh-transport".to_string(),
+                    request.request_id,
+                )
             },
             command_execution_state: Some(ShellCommandExecutionState::OutcomeUnknown),
             mcp_gateway: None,
@@ -757,10 +878,12 @@ async fn mismatch_and_invalid_context_fail_closed_without_root_fallback() {
     let mismatch = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project: second_project,
                 command: "pwd".to_string(),
                 session_id: Some(session.session_id.clone()),
                 timeout_secs: Some(30),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
@@ -822,10 +945,12 @@ async fn nonexistent_inherited_cwd_is_not_retried_at_project_root() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "pwd".to_string(),
                         session_id: Some(session.session_id),
                         timeout_secs: Some(30),
+                        sync_wait_secs: None,
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -843,14 +968,13 @@ async fn nonexistent_inherited_cwd_is_not_retried_at_project_root() {
     runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: "context-missing".to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: request.request_id,
-            exit_code: None,
-            stdout: None,
-            stderr: None,
             duration_ms: Some(1),
             error: Some("cwd does not exist".to_string()),
+            ..runner_result_request(
+                "context-missing".to_string(),
+                "inst".to_string(),
+                request.request_id,
+            )
         })
         .await
         .unwrap();

@@ -1,0 +1,111 @@
+/* Work Result uses the Workbench's opaque, neutral surfaces. Host color-scheme
+   and font variables remain authoritative; status colors keep their meaning. */
+:root {
+  --accent-soft: color-mix(in srgb, var(--accent) 7%, Canvas);
+  --card-header: Canvas;
+  --card-body: Canvas;
+  --surface: color-mix(in srgb, CanvasText 4%, Canvas);
+  --surface-hover: color-mix(in srgb, CanvasText 8%, Canvas);
+  --selection-motion-fill: var(--ui-selection-fill);
+  --selection-motion-ink: var(--ui-selection-ink);
+  --selection-motion-base-ink: CanvasText;
+}
+.card { border-radius: 12px; box-shadow: none; }
+.app-header { min-height: 58px; padding: 10px 14px; gap: 8px 12px; }
+.brand { gap: 9px; }
+.brand-icon {
+  width: 30px; height: 30px; border: 0; border-radius: 7px;
+  background: CanvasText; color: Canvas;
+}
+.brand-icon svg { width: 20px; height: 20px; }
+h1 { font-size: 13px; font-weight: 650; }
+.brand-subtitle { font-family: inherit; }
+.badge, .status-value { border-radius: 6px; font-weight: 550; }
+.actions > .badge { min-height: 32px; padding: 6px 9px; font-size: 12px; }
+.actions > #refresh { min-width: 100px; }
+.refresh, .file-views button, .workflow-stages button {
+  min-height: 32px; padding: 6px 10px; border: 1px solid var(--card-border);
+  border-radius: 7px; background: var(--card-body); color: CanvasText;
+  font: inherit; font-size: 12px; font-weight: 500;
+  transition: background-color 120ms, border-color 120ms;
+}
+.refresh:active:not(:disabled) { transform: none; }
+.refresh:hover:not(:disabled), .file-views button:hover:not(:disabled) { background: var(--surface-hover); }
+button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--ui-selection-color); outline-offset: 2px;
+}
+.content { padding: 12px; gap: 12px; }
+.section { padding: 12px; border-radius: 8px; background: Canvas; gap: 8px; }
+.progress-section { background: var(--surface); }
+h2 { font-size: 11px; font-weight: 600; letter-spacing: 0; text-transform: none; }
+.primary { font-size: 14px; font-weight: 600; line-height: 1.5; }
+.card-tabs {
+  margin: 0 12px; padding: 4px 0; gap: 4px; border: 0; border-bottom: 1px solid var(--divider);
+  border-radius: 0; background: transparent;
+}
+.card-tabs button {
+  min-height: 34px; padding: 7px 10px; border: 0; border-radius: 6px;
+  font: inherit; font-size: 12px; font-weight: 550; color: CanvasText;
+}
+.card-tabs button[aria-selected="true"] { color: var(--ui-selection-color); background: transparent; border-bottom-color: transparent; font-weight: 550; }
+.card-tabs button:hover { background: var(--surface-hover); }
+.card-tabs button:focus-visible { outline: 1px dashed var(--muted); outline-offset: -5px; }
+.workspace-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.workspace-actions:has(> :not([hidden])) { margin-top: 2px; }
+.section > .refresh, .card-panel > .refresh { justify-self: start; max-width: 100%; }
+.file-views[data-work-result-selection] { position: relative; align-items: center; }
+.file-views button[data-view] { border-color: transparent; }
+.file-views button[data-view][aria-pressed="true"] { color: var(--ui-selection-ink); background: var(--ui-selection-fill); }
+.thread-review .file-views .refresh[aria-pressed="true"]:not([data-view]) {
+  background: var(--surface-hover); border-color: var(--card-border); color: CanvasText;
+}
+.details { border-radius: 8px; }
+.details > summary { min-height: 36px; display: list-item; align-content: center; }
+.app-footer { gap: 8px; background: var(--surface); }
+.app-footer > .status { min-width: 0; flex: 1; }
+.app-footer > .card-appearance { flex: 0 0 auto; }
+.app-footer > .card-appearance > summary { min-height: 26px; padding: 3px 8px; border-color: transparent; color: var(--muted); }
+/* Open upward from the footer even before the shared controller measures it. */
+.app-footer > .card-appearance > .card-selection-preference { top: auto; bottom: 44px; left: auto; right: 8px; }
+/* One overview row: each item opens the section that owns its evidence. */
+.summary-strip { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 12px 0; }
+.summary-item {
+  min-height: 28px; padding: 4px 10px; border: 1px solid var(--card-border); border-radius: 999px;
+  background: var(--card-body); color: CanvasText; font: inherit; font-size: 12px; cursor: pointer;
+}
+.summary-item:hover { background: var(--surface-hover); }
+.summary-item.tone-attention { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 35%, var(--card-border)); background: var(--danger-soft); }
+.summary-item.tone-good { color: var(--success); border-color: color-mix(in srgb, var(--success) 35%, var(--card-border)); background: var(--success-soft); }
+.activity-call.observe .call-title { color: var(--muted); font-weight: 500; }
+.live-dot { background: var(--faint); box-shadow: none; }
+[data-unavailable] .live-dot { background: var(--danger); }
+[data-unavailable] #badge { color: var(--danger); background: var(--danger-soft); border-color: var(--divider); }
+select, .conversation-intent select, .file-navigator select, input, textarea {
+  min-height: 34px; max-width: 100%; border: 1px solid var(--card-border);
+  border-radius: 7px; background: var(--card-body); color: CanvasText; font: inherit;
+}
+select, .conversation-intent select, .file-navigator select { padding: 6px 28px 6px 9px; cursor: pointer; }
+select:hover:not(:disabled), input:hover:not(:disabled), textarea:hover:not(:disabled) { border-color: var(--muted); }
+select:disabled { opacity: .48; cursor: default; }
+:root[data-display-mode="fullscreen"] .app-header { padding: 12px 20px; }
+:root[data-display-mode="fullscreen"] h1 { font-size: 14px; }
+:root[data-display-mode="fullscreen"] .card-tabs { padding: 4px; margin: 0 20px; }
+:root[data-display-mode="fullscreen"] .summary-strip { margin-inline: 20px; }
+:root[data-display-mode="fullscreen"] .card-tabs button { padding: 7px 16px; }
+@media (max-width: 620px) {
+  .app-header { align-items: center; }
+  .actions { flex-basis: 100%; justify-content: flex-start; gap: 6px; }
+  .actions > #refresh { min-width: 96px; }
+  .actions > .badge { padding-inline: 6px; }
+  .card-appearance > summary { padding-inline: 7px; }
+  .brand-icon { width: 30px; height: 30px; }
+  .card-tabs button { padding: 7px 4px; }
+  :root[data-display-mode="fullscreen"] .app-header { padding: 12px; }
+  :root[data-display-mode="fullscreen"] .card-tabs { margin: 0 12px; }
+  :root[data-display-mode="fullscreen"] .card-tabs button { flex: 1; padding: 7px 4px; }
+}
+@media (pointer: coarse) {
+  .actions > .badge { min-height: 44px; }
+  .refresh, .card-tabs button, .file-views button, .summary-item, .app-footer > .card-appearance > summary, select, .conversation-intent select, .file-navigator select { min-height: 44px; }
+}
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; } }

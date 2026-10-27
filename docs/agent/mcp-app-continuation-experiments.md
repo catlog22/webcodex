@@ -1,6 +1,26 @@
 # MCP App presentation and autonomous-continuation findings
 
+> Historical version notes below record earlier experiments. The unreleased v0.5
+> [pruning pass](../implementation/v05-pruning.md) removes old resource read
+> aliases and advances the current App cache identities; those historical alias
+> descriptions are not the current admission contract.
+
 This note records durable findings from the September 11-12, 2026 MCP App presentation and continuation investigation. The experiments ran in a temporary `mcp-stream-probe` deployment rather than the production WebCodex runtime. They establish Host behavior and design constraints; they do **not** make the temporary probe state machine a production contract.
+
+## October 11 restoration and acceptance boundary
+
+Issues #1018 and #1013 report missing continuation presentation entries.
+[PR #1028](https://github.com/yyjeqhc/webcodex/pull/1028) restored both Agent and
+Job presentation tools as dedicated Direct tools, retaining the existing App
+protocol, generation fences and uncertainty
+handling. Current resources are Agent v20 and Job v2. After presenting, output a
+normal assistant final response to complete the original turn; the tool result
+and card alone are insufficient. That source change does not establish current
+ChatGPT automatic-resume support. The [acceptance procedure](../implementation/mcp-app-auto-resume-restoration.md)
+requires fresh-turn evidence for both card families, exact Agent Wake consume,
+and exact Job wait delivery followed by Job observation, including foreground
+and background delays. Keep the default Host policy `unknown` until
+the deployment's behavior has actually been verified.
 
 ## Why this investigation existed
 
@@ -121,7 +141,7 @@ The run was inspected from the other window before foregrounding the carrier tab
 
 These results split the product surface into two intentional patterns:
 
-- result/report cards such as Work Result are sparse and explicitly admitted, render the authoritative `present_work_result` snapshot once, and stay static until the user presses Refresh; they do not need background timers merely because the Host can run them;
+- result/report cards such as Work Result remain sparse and explicitly admitted, but the mounted Work Result now performs bounded visible/hidden App-only refreshes so a single card can follow live Session progress without model-visible polling;
 - controller cards such as Durable Agent continuation may deliberately remain live carriers when automatic continuation is a product requirement, but removing a production visibility gate is a separate policy choice and must retain exact Endpoint/generation, lease/fence, `delivery_unknown`, and consume protections.
 
 The capability result therefore supports long-lived Agent carriers without turning every MCP App into a polling surface. Presentation density, refresh cost, and autonomous scheduling remain separate design decisions.
@@ -159,9 +179,15 @@ A production workflow presentation should therefore prefer:
 
 Do not copy the temporary timer/map implementation into production. Reuse the authoritative Workflow Session, Job lifecycle/observation, ActionAudit/window correlation, and durable Agent continuation primitives that already own persistence, authority, and recovery semantics.
 
-The coding result surface follows the same sparsity rule, but production Host probing tightened the admission model further: an unbound descriptor does not create an App later merely because its ToolResult contains `ui.resourceUri` or `openai/outputTemplate`. Ordinary tools therefore have no Work App descriptor binding at all, including `show_changes`, Job observation, validation execution/summary, committed-range review, and coding closeout. A model explicitly calls `present_work_result(project, session_id)` only when one persistent user-visible summary is useful; that binds `ui://webcodex/work-result/v1` once and returns the initial authoritative snapshot. The mounted View then remains static: only an explicit user Refresh performs one ModelHidden/app-only `work_result_state(project, session_id)` exact read. Each refresh re-authorizes the exact Session and Project, reads bounded current worktree status/numstat plus existing Session validation/review evidence, requests no diff hunks, runs no validation/review, and deliberately does not append refresh events to the observed Session ledger. There is no Work Result background timer, visibility-triggered read, or retry loop. The old Changes/Result resources and bounded result projections remain hidden-readable compatibility paths for cached descriptors; compatibility does not imply current descriptor-level admission.
+The coding result surface follows the same sparse-admission rule: an unbound descriptor does not create an App later merely because an ordinary ToolResult contains presentation metadata. Ordinary tools therefore have no Work App descriptor binding, including `read_workspace_changes`, Job observation, validation execution/summary, committed-range review, and coding closeout. For substantial coding the model explicitly calls `present_work_result(project, session_id)` at most once after the Session becomes materially stateful; that binds the currently advertised Work Result resource from the [canonical App registry](../../src/mcp/app_registry/builtin.rs). The mounted View performs bounded ModelHidden/app-only `get_work_result_state(project, session_id)` reads at a faster cadence while visible and a slower cadence while hidden, with idle backoff and eventual pause. Each read re-authorizes the exact Session and Project, reads bounded current worktree status/numstat plus existing Session validation/review evidence, requests no diff hunks, runs no validation/review, and does not append refresh events to the observed Session ledger. This presentation polling is deliberately separate from model continuation or scheduling.
 
-The production Durable Goal G2 implementation applies the same presentation findings to a server-owned Goal: one explicit `present_goal_plan(goal_id)` binds `ui://webcodex/goal-plan/v2`, while the existing View uses the ModelHidden/app-only `goal_plan_state(goal_id)` exact read to converge on SQLite Goal revision. G3 does **not** change that contract: Goal still has no Wake, `ui/message`, model resume, dispatch fence, consume token, background model scheduler, Agent owner/controller relation, or automatic Goal/work execution transition.
+The Activity view places active background executions under current activity and folds terminal executions into recent background results, with outcome counts visible before expansion. These executions belong to the exact task Session; the separate call history belongs to the Window. A retained terminal Job never overrides current Window activity or implies that the coding task is complete. Queued, reconnecting, and stopping executions retain their own state labels. Truncated snapshots disclose that additional active or finished executions may be omitted.
+
+Work Result also owns sealed final changes, but live presentation and final sealing are separate phases. Before a non-blocking current-attempt `finish_coding_task`, presentation/state reads expose only live progress domains. When closeout returns `task_outcome.blocking=false`, `finish_coding_task` itself may seal one immutable snapshot of the complete final workspace tree against the Session Git baseline, provided first-class repository Edit provenance exists and the trees differ. The snapshot is keyed to the exact current task-instruction attempt and stored only in the bounded process-local presentation cache; App-only `get_work_result_state` never creates or replaces it, it only exposes the retained snapshot. Repeated refreshes therefore reuse one snapshot identity instead of following later workspace drift. `read_changed_file_diff(project, session_id, snapshot_id, path)` remains ModelHidden/app-only, independently re-authorizes Project and Session, and fences caller/snapshot/advertised path before reading the two sealed trees. Snapshot expiry never falls back to a live diff. A clean committed worktree can still have final changes relative to the Session baseline; no-op, shell-only, validation/review-only, and blocking closeouts remain ineligible.
+
+Retired resource URIs fail closed: cached `ui://webcodex/work-result/v1`, `ui://webcodex/work-result/v2`, and `ui://webcodex/changes/v3` readers must be reopened from current descriptors. They are not aliases for the current template. See the [retired-resource regression](../../src/mcp_tests/retired_app_resources.rs) and [compatibility policy](../compatibility-policy.md). Old `changes` payloads are not translated or trusted as Work Result state; the View rejects them. Resource discovery and reads retain the current registry, protocol and authority checks.
+
+The production Durable Goal G2 implementation applies the same presentation findings to a server-owned Goal: one explicit `present_goal_plan(goal_id)` binds `ui://webcodex/goal-plan/v2`, while the existing View uses the ModelHidden/app-only `goal_plan_sync(goal_id)` exact read to converge on SQLite Goal revision. G3 does **not** change that contract: Goal still has no Wake, `ui/message`, model resume, dispatch fence, consume token, background model scheduler, Agent owner/controller relation, or automatic Goal/work execution transition.
 
 ## Production G3 mapping
 
@@ -185,7 +211,9 @@ agent_continuation_wake_finish    # dispatch_accepted | delivery_unknown
 later model turn exact-consumes Wake
 ```
 
-The only card-creating entry is the explicit read `present_agent_continuation(agent_id, endpoint_id, expected_controller_generation)`, bound to the current `ui://webcodex/agent-continuation/v16` resource. Bind/recover/state/acquire/prepare/finish/unbind are globally ModelHidden and are projected only as App-visible tools on eligible Stateless MCP 2026 operator surfaces. They do not bind the resource again, so polling/coordination does not create a stream of custom cards. Ordinary communication and coding tools keep native Host presentation.
+The only card-creating entry is the explicit read `present_agent_continuation(agent_id, endpoint_id, expected_controller_generation)`, bound to the current `ui://webcodex/agent-continuation/v24` resource. Bind/recover/state/acquire/prepare/finish/unbind are globally ModelHidden and are projected only as App-visible tools on eligible Stateless MCP 2026 operator surfaces. They do not bind the resource again, so polling/coordination does not create a stream of custom cards. Ordinary communication and coding tools keep native Host presentation.
+
+The setup invariant is `create_agent_identity -> rotate_agent_continuation_endpoint -> present_agent_continuation -> normal final assistant response`; the card/tool result alone does not finish the presenting turn. The presentation response precedes any guaranteed View bind, and the presenting turn has no authoritative fully-mounted signal; continuing long coordinator work after presentation can therefore outlive the bounded Endpoint lease before a carrier exists. Verify the later exact-generation carrier with `list_agent_identities.production_auto_resume_available`; do not treat presentation success or ClientWindow activity as readiness/model-liveness proof.
 
 The View binding is process-local fencing, not durable authority. Every App-only operation re-authorizes the normal communication principal and exact Agent/Endpoint/controller generation. `binding_id` identifies only the current iframe/process instance. For MCP Apps, the Store retains both the v11 SHA-256 fingerprint of the exact current binding fence and, when the Host supplied valid request-scoped identity, the already-domain-separated SHA-256 `ClientWindow` key. Raw `_meta["openai/session"]` is never persisted. Server takeover clears process-local carriers and durable `wake_capable` but preserves both bounded restart-recovery values. The exact old binding fingerprint remains the fallback when no valid ClientWindow exists. With a canonical ClientWindow, the same authenticated principal + exact Endpoint/generation + same Window may restore or replace a lost iframe fence after restart; refresh unbind clears the iframe fingerprint but preserves that same-Window continuity while the Endpoint remains current. Natural lease expiry clears wake capability and the binding fingerprint; v15 preserves only the hashed Window key as a bounded input to the dedicated expired-Endpoint replacement operation and its exact one-hop replay chain, while ordinary bind/state still reject the expired Endpoint. Explicit detach, ordinary Endpoint replacement, or transition to a push carrier clears the continuity value. Push adapters still require a fresh current-process attachment and never inherit Window recovery. On replacement/loss, existing Store reconciliation handles the durable state: pre-fence claim -> revoked Attempt + pending Wake; post-fence prepared/delivered -> `delivery_unknown`.
 
@@ -219,14 +247,56 @@ Visible status distinguishes script activity, Host initialization, exact identit
 selection, and live binding/polling, with separate initialization, binding, and
 identity errors. Diagnostics do not display binding ids, claim fences, or consume
 tokens. `tools/list` and `resources/list` advertise only the canonical
-`ui://webcodex/agent-continuation/v16` and `ui://webcodex/goal-plan/v2` resources.
-Agent continuation v1-v15 are hidden read aliases serving the same current template. Reading an alias does not revive an expired Endpoint or bypass exact generation/authorization fencing; the same current template must still complete explicit Server-authorized one-hop replacement transitions. The v11 fingerprint-proven restart fallback, v12 strict restart projection, v13 canonical Host-window refresh fence, v14 expired-Endpoint replacement, and v15 bounded successor replay remain intact; v16 changes only visibility eligibility for automatic dispatch.
+`ui://webcodex/agent-continuation/v24` and `ui://webcodex/goal-plan/v10` resources. Goal Plan now uses only its current resource (wire version 3), with no old Goal-resource aliases. The G5 projection keeps production carrier readiness, exact Goal-stall Wake lifecycle, Host delivery outcome, and exact-consume fresh-turn proof as separate bounded facts; it exposes no Wake/Attempt/Endpoint identifiers or continuation proofs.
+
+The v20 Agent View also accepts a valid `agent_continuation_ref` presentation
+input without treating its absent tuple as an invalid identity. That opaque ref
+does not select an Agent locally: the View waits for the Server's validated
+initial ToolResult to supply the exact Agent/Endpoint/generation. A later matching
+input or initial result cannot duplicate binding. Invalid refs, mixed selectors
+and conflicting resolved identities still fail closed. The View also fences the
+original presentation ref; a later different ref is a terminal conflict.
+A tool-input notification with omitted `arguments` leaves the selected identity unchanged and waits for
+a valid selector; the [MCP Apps notification contract](https://apps.extensions.modelcontextprotocol.io/api/interfaces/app.McpUiToolInputNotification.html)
+permits this omission. It cannot select an Agent or trigger binding. The App URI and
+`appInfo.version` advance together; no wire protocol or permission changes.
+Earlier experiments kept Agent continuation v1-v15 as hidden read aliases serving the then-current template; the current v0.5 registry rejects retired URIs. Those alias reads did not revive an expired Endpoint or bypass exact generation/authorization fencing; the template still had to complete explicit Server-authorized one-hop replacement transitions. The v11 fingerprint-proven restart fallback, v12 strict restart projection, v13 canonical Host-window refresh fence, v14 expired-Endpoint replacement, and v15 bounded successor replay remain intact; v16 changed only visibility eligibility for automatic dispatch.
 
 ## Goal-correlated terminal attention carrier
 
-The production carrier now has one additional durable Wake source without changing its Host correctness state machine. An exact current AgentTaskAttempt terminal transition may atomically persist a narrow `agent_task_terminal` Event and pending `attention_event` Wake for each currently active caller-owned Goal correlation, targeting that Task's explicit assignee Agent. The Event carries only exact semantic identities plus terminal Task state; the Wake carries only `source_event_id`. Neither copies Task result/instruction or Goal objective, and neither grants Task, Goal, Project, Session, Endpoint, or filesystem authority.
+The production carrier has durable Goal attention and AgentWait Wake sources without changing its Host correctness state machine. In the default path, an exact current AgentTaskAttempt terminal transition atomically persists a narrow `agent_task_terminal` attention Event and pending `attention_event` Wake for each currently active caller-owned Goal correlation, targeting the Goal's explicit controller when present (otherwise the legacy Task-assignee fallback). Generic AgentWaits do not suppress that path. An explicit Goal-scoped AgentWait registered before its selected exact Tasks terminalize owns terminal attention for only those exact Goal/Task sources while the Wait is active: ANY emits the Wait Wake instead of duplicate Goal attention on its first match; ALL partials emit neither Wake, and the final required match emits the single Wait-origin Wake. The Event/Wait records carry only exact semantic identities and bounded terminal-state references; neither copies Task result/instruction or Goal objective, and neither grants Task, Goal, Project, Session, Endpoint, or filesystem authority.
 
-This source deliberately does **not** use the A4b `agent_task_attempt` contract: its source Attempt is already terminal, so attention acquire/prepare never depends on Attempt heartbeat/lease/controller liveness. It still reuses exact Agent/Endpoint/generation/binding fences, the durable Wake claim/prepare fence, one-dispatched-Wake-per-Agent bound, `dispatchStarted` anti-resend behavior, Host outcome uncertainty, and exact consume proof. The Server-generated automatic message tells the resumed model to bootstrap the exact Event/Goal/Task/Attempt identities, consume only after actual takeover, independently call normal `get_goal` and `read_agent_task`, and explicitly decide Goal progression. A Goal already completed/cancelled by another turn remains terminal and the attention continuation safely no-ops; there is no automatic Goal completion, reopening, or next-Task generation.
+These sources deliberately do **not** reuse A4b's active-Attempt correctness contract: the source Attempt is already terminal, so attention/Wait acquire and prepare never depend on Attempt heartbeat/lease/controller liveness. Both reuse exact Agent/Endpoint/generation/binding fences, the durable Wake claim/prepare fence, one-dispatched-Wake-per-Agent bound, `dispatchStarted` anti-resend behavior, Host outcome uncertainty, and exact consume proof. Goal-scoped Wait registration itself is linearized before terminalization with SQLite IMMEDIATE transactions and requires the exact active Goal, its explicit current controller, exact pre-terminal correlated Tasks, and an explicit 1..8 source list. The Server-generated Goal-scoped automatic message names `goal_id` but copies no objective/result body; it tells the resumed model to bootstrap the exact Wake, consume immediately, read the Wait, independently call normal `get_goal`, re-read every source AgentTask, and explicitly decide/update Goal state. Cancellation restores ordinary Goal attention only for future terminals and never synthesizes past attention. There is still no automatic Goal completion, reopening, Task discovery, scheduler, dependency DAG, or next-Task generation.
+
+## G4 — Goal workflow stall detector
+
+The next concrete dogfood need is implemented as `goal_workflow_stalled`, the
+second narrow attention kind. Goal Plan shows bounded mechanical progress and uses one App-only `goal_plan_sync`;
+the Server requires an active owned Goal,
+explicit exact controller, authorized correlated current Session, fresh exact-Goal
+card observation, complete evidence and no active meaningful request. It reuses the
+existing Window activity ledger/registry and Agent attention/Wake transactions.
+Same-epoch polling cannot mint repeated turns. The separate Agent Continuation
+card remains the only `ui/message` carrier; accepted dispatch is not resume, and
+uncertain delivery is not an automatic retry. The same Agent may be both callable
+Worker and Goal controller. No repository `AGENTS.md` is required for this workflow.
+
+The first production dogfood of the single-RPC Goal Plan design exposed a resource
+identity failure rather than a stall-detector failure. The Server had deployed the
+new `goal_plan_sync` wire, but the Goal Plan URI remained v4. During the armed
+five-minute window the Server received **234** stale `goal_plan_state` calls from
+the Host, all rejected as `direct_route_denied`, and **zero** `goal_plan_sync`
+calls; no Goal-stall Wake was created. This proves an already-open Host View may continue running its old same-URI
+Goal Plan template across a Server deploy until that App is refreshed/recreated.
+The run did not test a newly opened View. The canonical Goal Plan resource is still
+advanced to v5 for the incompatible wire change, v4 is not served as an alias, and
+the descriptor/resource tests lock that resource identity together with the v5 App
+self-version.
+
+The [G4 dogfood guide](goal-workflow-continuity-dogfood.md) distinguishes deterministic
+regression coverage from manual verification in a real, separately authorized Host.
+Stalled is not offline; fresh-turn recovery consumes the exact Wake and recovers the
+current Goal/Session checkpoint instead of replaying a disappeared turn's effects.
 
 ## Remaining verification boundary
 

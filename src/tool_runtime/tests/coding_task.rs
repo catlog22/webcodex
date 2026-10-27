@@ -1,3 +1,4 @@
+use super::support::record_session_tool_event as record_coding_task_tool_event;
 use super::support::*;
 use crate::auth::AuthContext;
 use crate::runner_protocol::RunnerPolicySummary;
@@ -20,11 +21,11 @@ async fn service_agent_task_until_finished(
     task: &tokio::task::JoinHandle<ToolResult>,
     label: &str,
 ) {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + CODING_WORKFLOW_FIXTURE_TIMEOUT;
     while !task.is_finished() {
         assert!(
             Instant::now() < deadline,
-            "{label} did not finish within the 10-second test deadline"
+            "{label} did not finish within the {CODING_WORKFLOW_FIXTURE_TIMEOUT:?} test deadline"
         );
         if let Some(request) = probe_patch_agent_request(runtime, client_id).await {
             complete_agent_request_by_running_locally(runtime, client_id, request).await;
@@ -35,7 +36,7 @@ async fn service_agent_task_until_finished(
 }
 
 #[test]
-fn coding_task_tools_are_registered_in_metadata_and_openapi() {
+fn coding_task_tools_are_registered_in_metadata() {
     let specs = registered_tool_specs();
     let names: Vec<&str> = specs.iter().map(|spec| spec.name.as_str()).collect();
     assert!(
@@ -133,18 +134,14 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
     assert!(work_props["base_ref"]["description"]
         .as_str()
         .is_some_and(|description| description.contains("Runner resolves")));
-    for phrase in [
-        "mode=worktree",
-        "exact Git base",
-        "isolated worktree",
-        "Project authority",
-    ] {
-        assert!(
-            work.description.contains(phrase),
-            "work_on_project description should retain {phrase}: {}",
-            work.description
-        );
-    }
+    assert_eq!(
+        work.description,
+        crate::tool_runtime::tool_definition::lookup_tool_definition("work_on_project")
+            .expect("canonical work_on_project")
+            .model_spec
+            .expect("model-visible work_on_project")
+            .description
+    );
     let work_output = crate::tool_runtime::registry::output_schema_for_tool("work_on_project");
     assert!(work_output["properties"]["output"]["properties"]
         .as_object()
@@ -227,57 +224,10 @@ fn coding_task_tools_are_registered_in_metadata_and_openapi() {
         );
     }
 
-    let openapi = crate::openapi::build_openapi_spec();
-    let work = &openapi["paths"]["/api/actions/work_on_project"]["post"];
-    assert_eq!(work["operationId"], "work_on_project");
-    let work_properties = work["requestBody"]["content"]["application/json"]["schema"]
-        ["properties"]
-        .as_object()
-        .unwrap();
-    for field in ["project", "client_id", "path", "mode", "base_ref"] {
-        assert!(
-            work_properties.contains_key(field),
-            "work_on_project missing {field}"
-        );
-    }
-    for field in [
-        "temporary_project_name",
-        "deny_write_tools",
-        "deny_shell_tools",
-        "detail",
-        "resume_session_id",
-        "bind_current",
-        "new_session",
-    ] {
-        assert!(
-            !work_properties.contains_key(field),
-            "retired work_on_project field {field}"
-        );
-    }
-
-    let finish = &openapi["paths"]["/api/actions/finish_coding_task"]["post"];
-    assert_eq!(finish["operationId"], "finish_coding_task");
-    let finish_properties = finish["requestBody"]["content"]["application/json"]["schema"]
-        ["properties"]
-        .as_object()
-        .unwrap();
-    for field in [
-        "project",
-        "session_id",
-        "include_hygiene",
-        "include_handoff",
-        "include_workspace",
-        "include_validation_summary",
-        "summary_only",
-    ] {
-        assert!(
-            finish_properties.contains_key(field),
-            "finish_coding_task missing {field}"
-        );
-    }
-    assert!(openapi["paths"]
-        .get("/api/actions/start_coding_task")
-        .is_none());
+    assert_eq!(
+        webcodex_tool_contracts::runtime_tool_adaptive_direct_rank("finish_coding_task"),
+        None
+    );
 }
 
 #[tokio::test]
@@ -371,15 +321,17 @@ async fn coding_workflow_full_diagnostic_has_no_binding_projection() {
         .unwrap();
     assert!(contains_string(inspect, "read_files"));
     assert!(contains_string(inspect, "search_project_texts"));
-    assert!(contains_string(inspect, "show_changes"));
+    assert!(contains_string(inspect, "review_changes"));
+    assert!(!contains_string(inspect, "read_workspace_changes"));
     assert!(!contains_string(inspect, "read_file"));
     assert!(!contains_string(inspect, "search_project_text"));
     let edit = result.output["recommended_flow"]["edit"]
         .as_array()
         .unwrap();
-    assert!(contains_string(edit, "apply_text_edits"));
-    assert!(contains_string(edit, "apply_unified_diff"));
-    assert!(contains_string(edit, "write_project_file"));
+    assert!(contains_string(edit, "edit_project_files"));
+    for specialist in ["apply_patch", "apply_unified_diff", "write_project_file"] {
+        assert!(!contains_string(edit, specialist), "{specialist}");
+    }
     assert!(!contains_string(edit, "replace_line_range"));
     assert!(!contains_string(edit, "insert_at_line"));
     assert!(!contains_string(edit, "delete_line_range"));
@@ -612,11 +564,11 @@ async fn coding_workflow_full_startup_verdict_accepts_clean_workspace() {
     assert_startup_verdict_shape(verdict);
     assert_eq!(verdict["status"], "pass");
     assert_eq!(verdict["blocking"], false);
-    assert_check_status(verdict, "runtime_status", "pass");
+    assert_check_status(verdict, "get_runtime_status", "pass");
     assert_check_status(verdict, "workspace", "pass");
     assert_check_status(verdict, "jobs", "pass");
     assert_check_status(verdict, "agent", "pass");
-    assert_check_status(verdict, "tool_manifest", "pass");
+    assert_check_status(verdict, "read_tool_manifest", "pass");
     assert_compact_verdict_safe(verdict, "startup clean verdict");
 }
 
@@ -716,8 +668,7 @@ async fn work_on_project_serviced(
                         base_ref: None,
                         instruction,
                         session_id: None,
-                        include_project_instructions: true,
-                        include_workflow_guidance: true,
+                        guidance_profile: Default::default(),
                         include_extension_catalog: false,
                     },
                     Some(&auth),
@@ -727,6 +678,197 @@ async fn work_on_project_serviced(
     });
     service_agent_task_until_finished(runtime, client_id, &task, "work_on_project").await;
     task.await.unwrap()
+}
+
+#[tokio::test]
+async fn work_on_project_captures_repository_native_unborn_empty_tree_baseline() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let project = register_runner_project_at_path_with_auth(
+        &runtime,
+        "changes-unborn-baseline",
+        "demo",
+        tmp.path(),
+        &auth,
+    )
+    .await;
+
+    let start = work_on_project_serviced(
+        &runtime,
+        "changes-unborn-baseline",
+        &project,
+        "unborn baseline",
+        &auth,
+    )
+    .await;
+    assert!(start.success, "{:?}", start.error);
+    let session_id = start.output["session_id"].as_str().unwrap();
+    let summary = runtime.sessions.summary(session_id, None).unwrap();
+    let baseline = summary
+        .git_baseline_tree
+        .as_deref()
+        .expect("unborn Git repository must capture its native empty tree");
+
+    let expected = std::process::Command::new("git")
+        .arg("mktree")
+        .stdin(std::process::Stdio::null())
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(expected.status.success());
+    assert_eq!(baseline, String::from_utf8(expected.stdout).unwrap().trim());
+    assert!(matches!(baseline.len(), 40 | 64));
+}
+
+#[tokio::test]
+async fn work_on_project_non_git_startup_never_retroactively_acquires_baseline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let project = register_runner_project_at_path_with_auth(
+        &runtime,
+        "changes-non-git-baseline",
+        "demo",
+        tmp.path(),
+        &auth,
+    )
+    .await;
+
+    let start = work_on_project_serviced(
+        &runtime,
+        "changes-non-git-baseline",
+        &project,
+        "non Git baseline",
+        &auth,
+    )
+    .await;
+    assert!(start.success, "{:?}", start.error);
+    let session_id = start.output["session_id"].as_str().unwrap().to_string();
+    assert_eq!(
+        runtime
+            .sessions
+            .summary(&session_id, None)
+            .unwrap()
+            .git_baseline_tree,
+        None
+    );
+
+    init_git_repo(tmp.path());
+    fs::write(tmp.path().join("README.md"), "created after startup\n").unwrap();
+    let edit = runtime.sessions.record_tool_call_started(
+        Some(&session_id),
+        SessionTransport::Mcp,
+        "edit_project_files",
+        &json!({
+            "project": project,
+            "changes": [{"kind": "create", "path": "README.md"}]
+        }),
+        crate::tool_runtime::sessions::session_tool_contract("edit_project_files"),
+    );
+    runtime.sessions.record_tool_call_finished(
+        edit,
+        true,
+        &json!({"state_changed": true}),
+        None,
+        None,
+    );
+    let summary = runtime.sessions.summary(&session_id, None).unwrap();
+    assert!(summary.repository_edit_observed);
+    assert_eq!(summary.git_baseline_tree, None);
+    assert!(!runtime
+        .final_changes_presentation_needed(&project, &summary)
+        .await
+        .unwrap());
+}
+
+#[tokio::test]
+async fn exact_work_on_project_resume_preserves_original_git_baseline_after_head_moves() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "base\n", "base");
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let project = register_runner_project_at_path_with_auth(
+        &runtime,
+        "changes-resume-baseline",
+        "demo",
+        tmp.path(),
+        &auth,
+    )
+    .await;
+    let start = work_on_project_serviced(
+        &runtime,
+        "changes-resume-baseline",
+        &project,
+        "resume baseline",
+        &auth,
+    )
+    .await;
+    assert!(start.success, "{:?}", start.error);
+    let session_id = start.output["session_id"].as_str().unwrap().to_string();
+    let original = runtime
+        .sessions
+        .summary(&session_id, None)
+        .unwrap()
+        .git_baseline_tree
+        .expect("baseline");
+
+    commit_file(tmp.path(), "later.txt", "later\n", "move head");
+    let current_tree = {
+        let output = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD^{tree}"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    assert_ne!(current_tree, original);
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let session_id = session_id.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::WorkOnProject {
+                        project,
+                        client_id: None,
+                        path: None,
+                        mode: None,
+                        base_ref: None,
+                        instruction: "exact resume".to_string(),
+                        session_id: Some(session_id),
+                        guidance_profile: Default::default(),
+                        include_extension_catalog: false,
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    service_agent_task_until_finished(
+        &runtime,
+        "changes-resume-baseline",
+        &task,
+        "exact work_on_project resume",
+    )
+    .await;
+    let resumed = task.await.unwrap();
+    assert!(resumed.success, "{:?}", resumed.error);
+    assert_eq!(
+        runtime
+            .sessions
+            .summary(&session_id, None)
+            .unwrap()
+            .git_baseline_tree
+            .as_deref(),
+        Some(original.as_str())
+    );
 }
 
 fn assert_startup_nonblocking_dirty(result: &ToolResult, workspace_reason: &str) {
@@ -824,6 +966,7 @@ async fn coding_workflow_tracked_modified_is_nonblocking_and_allows_continued_ed
             new_text: Some("    println!(\"user-wip-plus-agent\");".to_string()),
             anchor_text: None,
             occurrence: None,
+            expected_match_count: None,
             line_scope: None,
         }],
         None,
@@ -853,6 +996,7 @@ async fn coding_workflow_tracked_modified_is_nonblocking_and_allows_continued_ed
             new_text: Some("    println!(\"user-wip-plus-agent\");".to_string()),
             anchor_text: None,
             occurrence: None,
+            expected_match_count: None,
             line_scope: None,
         }],
         None,
@@ -1155,6 +1299,7 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
             runtime
                 .dispatch_with_auth(
                     ToolCall::FinishCodingTask {
+                        outputs: Vec::new(),
                         project,
                         session_id,
                         summary_only: false,
@@ -1211,10 +1356,15 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
     assert_eq!(result.output["llm_summary"], false);
     assert_eq!(result.output["workspace"]["clean"], false);
     assert_eq!(result.output["changes"]["hunks_truncated"], false);
-    assert!(result.output["changes"]["show_changes"].is_object());
+    assert!(result.output["changes"]["read_workspace_changes"].is_object());
     let validation = &result.output["validation"];
     assert_eq!(validation["available"], false);
     assert_eq!(validation["status"], "not_run");
+    assert_eq!(result.output["acceptance"]["state"], "needs_evidence");
+    assert!(result.output["acceptance"]["reason_codes"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("validation_not_run")));
     assert_eq!(validation["reason"], "no_validation_tool_invoked");
     assert_eq!(validation["source"], "session_ledger");
     assert_eq!(validation["events_total"], 0);
@@ -1244,7 +1394,7 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
     );
     assert_eq!(
         result.output["review_evidence"]["tools"],
-        json!(["show_changes"])
+        json!(["read_workspace_changes"])
     );
     assert_review_evidence_tools_safe(&result.output["review_evidence"]);
     assert!(result.output["hygiene"].is_null());
@@ -1265,6 +1415,176 @@ async fn finish_coding_task_requires_explicit_session_and_returns_structured_fie
         .iter()
         .any(|reason| reason == "workspace_dirty"));
     assert_finish_uses_canonical_outcomes(&result.output);
+}
+
+#[tokio::test]
+async fn finish_coding_task_emits_one_parser_ready_changes_presentation_in_full_and_summary_only() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "base\n", "base");
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let project = register_runner_project_at_path_with_auth(
+        &runtime,
+        "coding-finish-changes",
+        "demo",
+        tmp.path(),
+        &auth,
+    )
+    .await;
+    let start = work_on_project_serviced(
+        &runtime,
+        "coding-finish-changes",
+        &project,
+        "changes closeout",
+        &auth,
+    )
+    .await;
+    assert!(start.success, "{:?}", start.error);
+    let session_id = start.output["session_id"].as_str().unwrap().to_string();
+    record_coding_task_tool_event(
+        &runtime,
+        &session_id,
+        "edit_project_files",
+        json!({
+            "project": project,
+            "changes": [{"kind": "edit", "path": "README.md"}]
+        }),
+        true,
+        json!({"state_changed": true}),
+    );
+    fs::write(tmp.path().join("README.md"), "final task state\n").unwrap();
+
+    let mut sealed_snapshot_id: Option<String> = None;
+    for summary_only in [false, true] {
+        let result = finish_coding_task_with_agent(
+            &runtime,
+            "coding-finish-changes",
+            project.clone(),
+            session_id.clone(),
+            auth.clone(),
+            summary_only,
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output["presentation"]["suggested_call"],
+            json!({
+                "follow_up_kind": "fallback_recovery",
+                "tool": "present_work_result",
+                "arguments": {
+                    "project": project,
+                }
+            })
+        );
+        webcodex_tool_contracts::test_support::validate_generated_tool_call_against_registered_input_schema(
+            &result.output["presentation"]["suggested_call"],
+        )
+        .expect("result presentation fallback must pass present_work_result registered inputSchema");
+        assert!(result.output["suggested_next_actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|action| !action
+                .as_str()
+                .unwrap_or_default()
+                .contains("present_work_result")));
+        assert_eq!(result.output["task_outcome"]["blocking"], false);
+        let summary = runtime.sessions.summary(&session_id, None).unwrap();
+        let sealed = runtime
+            .sealed_work_result_changes(&project, &summary, Some(&auth))
+            .unwrap()
+            .expect("non-blocking finish must seal eligible final changes");
+        let snapshot_id = sealed["snapshot_id"].as_str().unwrap().to_string();
+        if let Some(expected) = sealed_snapshot_id.as_ref() {
+            assert_eq!(&snapshot_id, expected);
+        } else {
+            sealed_snapshot_id = Some(snapshot_id);
+        }
+    }
+
+    let restore = std::process::Command::new("git")
+        .args(["restore", "--source=HEAD", "--", "README.md"])
+        .current_dir(tmp.path())
+        .output()
+        .unwrap();
+    assert!(restore.status.success());
+    let reverted = finish_coding_task_with_agent(
+        &runtime,
+        "coding-finish-changes",
+        project,
+        session_id,
+        auth,
+        true,
+    )
+    .await;
+    assert!(reverted.success, "{:?}", reverted.error);
+    assert!(reverted.output.get("presentation").is_none());
+}
+
+#[tokio::test]
+async fn finish_coding_task_blocking_closeout_does_not_seal_final_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "base\n", "base");
+    let runtime = test_runtime();
+    let auth = auth_context(None, true);
+    let project = register_runner_project_at_path_with_auth(
+        &runtime,
+        "coding-finish-blocked-changes",
+        "demo",
+        tmp.path(),
+        &auth,
+    )
+    .await;
+    let start = work_on_project_serviced(
+        &runtime,
+        "coding-finish-blocked-changes",
+        &project,
+        "blocked changes closeout",
+        &auth,
+    )
+    .await;
+    assert!(start.success, "{:?}", start.error);
+    let session_id = start.output["session_id"].as_str().unwrap().to_string();
+    record_coding_task_tool_event(
+        &runtime,
+        &session_id,
+        "edit_project_files",
+        json!({
+            "project": project,
+            "changes": [{"kind": "edit", "path": "README.md"}]
+        }),
+        true,
+        json!({"state_changed": true}),
+    );
+    fs::write(tmp.path().join("README.md"), "blocked task state\n").unwrap();
+    record_coding_task_tool_event(
+        &runtime,
+        &session_id,
+        "cargo_fmt",
+        json!({"project": project, "check": true}),
+        false,
+        json!({"exit_code": 1, "failure_kind": "validation_failed"}),
+    );
+
+    let result = finish_coding_task_with_agent(
+        &runtime,
+        "coding-finish-blocked-changes",
+        project.clone(),
+        session_id.clone(),
+        auth.clone(),
+        true,
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["task_outcome"]["blocking"], true);
+    assert!(result.output.get("presentation").is_some());
+    let summary = runtime.sessions.summary(&session_id, None).unwrap();
+    assert!(runtime
+        .sealed_work_result_changes(&project, &summary, Some(&auth))
+        .unwrap()
+        .is_none());
 }
 
 #[tokio::test]
@@ -1291,6 +1611,7 @@ async fn finish_coding_task_summary_only_is_compact_for_clean_project() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::FinishCodingTask {
+                        outputs: Vec::new(),
                         project,
                         session_id,
                         summary_only: true,
@@ -1396,9 +1717,80 @@ async fn finish_coding_task_summary_only_is_compact_for_clean_project() {
     }
     assert_no_raw_validation_output_fields(&result.output, "summary_only finish structured output");
     assert!(
-        !serialized.contains("\"show_changes\":"),
-        "summary_only finish leaked raw show_changes payload: {serialized}"
+        !serialized.contains("\"read_workspace_changes\":"),
+        "summary_only finish leaked raw read_workspace_changes payload: {serialized}"
     );
+}
+
+#[tokio::test]
+async fn finish_coding_task_summary_only_omits_diff_generation_even_when_requested() {
+    let tmp = tempfile::tempdir().unwrap();
+    init_git_repo(tmp.path());
+    commit_file(tmp.path(), "README.md", "hello\n", "add readme");
+    let runtime = test_runtime();
+    let project = register_runner_project_at_path(
+        &runtime,
+        "coding-finish-compact-no-diff",
+        "demo",
+        tmp.path(),
+    )
+    .await;
+    let auth = auth_context(None, true);
+    let session = runtime
+        .sessions
+        .start_session(Some(project.clone()), Some("compact no diff".to_string()));
+    let session_id = session.session_id.clone();
+
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let session_id = session_id.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::FinishCodingTask {
+                        outputs: Vec::new(),
+                        project,
+                        session_id,
+                        summary_only: true,
+                        include_diff: Some(true),
+                        include_workspace: Some(false),
+                        include_hygiene: Some(false),
+                        include_handoff: Some(false),
+                        include_validation_summary: Some(false),
+                    },
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, "coding-finish-compact-no-diff").await;
+    assert_internal_posix_script_contains(&request, "git status --porcelain=v1 -b");
+    let script = &request
+        .script
+        .as_ref()
+        .expect("summary_only workspace observation script")
+        .script;
+    assert!(
+        !script.contains("diff_hunks_returned="),
+        "summary_only must not spend a Git observation budget on a diff body it cannot return: {script}"
+    );
+    let show_changes_stdout =
+        crate::tool_runtime::framed_clean_show_changes_test_stdout("add readme", false);
+    complete_patch_agent_request(
+        &runtime,
+        "coding-finish-compact-no-diff",
+        &request.request_id,
+        0,
+        &show_changes_stdout,
+        "",
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(result.output["summary_only"], true);
+    assert!(result.output.get("changes").is_none());
 }
 
 #[tokio::test]
@@ -1438,7 +1830,7 @@ async fn finish_coding_task_summary_only_uses_review_evidence_without_projecting
     record_coding_task_tool_event(
         &runtime,
         &session_id,
-        "show_changes",
+        "read_workspace_changes",
         json!({"project": project, "include_diff": false}),
         true,
         json!({}),
@@ -1453,6 +1845,7 @@ async fn finish_coding_task_summary_only_uses_review_evidence_without_projecting
             runtime
                 .dispatch_with_auth(
                     ToolCall::FinishCodingTask {
+                        outputs: Vec::new(),
                         project,
                         session_id,
                         summary_only: true,
@@ -1520,6 +1913,7 @@ async fn finish_coding_task_summary_only_treats_dirty_workspace_as_advisory() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::FinishCodingTask {
+                        outputs: Vec::new(),
                         project,
                         session_id,
                         summary_only: true,
@@ -1601,6 +1995,7 @@ async fn finish_coding_task_does_not_resolve_a_different_validation_identity() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::FinishCodingTask {
+                        outputs: Vec::new(),
                         project,
                         session_id,
                         summary_only: true,
@@ -1660,7 +2055,7 @@ async fn finish_coding_task_historical_unresolved_current_pass_does_not_request_
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": fixture.project.clone(),
             "changes": [{"kind": "edit", "path": "src/lib.rs"}]
@@ -1689,7 +2084,7 @@ async fn finish_coding_task_historical_unresolved_current_pass_does_not_request_
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["validation"]["status"], "mixed");
     assert_eq!(result.output["validation"]["unresolved_failure_count"], 1);
-    assert_eq!(result.output["validation"]["current_status"], "passed");
+    assert_eq!(result.output["validation"]["current_status"], "unproven");
     assert_eq!(
         result.output["validation"]["current_unresolved_failure_count"],
         0
@@ -1704,7 +2099,7 @@ async fn finish_coding_task_historical_unresolved_current_pass_does_not_request_
         result.output["tool_failures"]["actionable_unexpected_count"],
         0
     );
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
     assert_action_list_not_contains(
         &result.output["suggested_next_actions"],
@@ -1792,7 +2187,7 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
     );
     assert_eq!(result.output["validation"]["status"], "mixed");
     assert_eq!(result.output["validation"]["latest_status"], "passed");
-    assert_eq!(result.output["validation"]["current_status"], "passed");
+    assert_eq!(result.output["validation"]["current_status"], "unproven");
     assert_eq!(
         result.output["validation"]["current_unresolved_failure_count"],
         0
@@ -1800,13 +2195,13 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
     assert_eq!(full.output["validation"]["status"], "mixed");
     assert_eq!(
         full.output["validation"]["current_evidence"]["status"],
-        "passed"
+        "unproven"
     );
     assert!(handoff.success, "{:?}", handoff.error);
     assert_eq!(handoff.output["validation"]["status"], "mixed");
     assert_eq!(
         handoff.output["validation"]["current_evidence"]["status"],
-        "passed"
+        "unproven"
     );
     assert_eq!(
         handoff.output["validation"]["resolved_failures"]["count"],
@@ -1818,9 +2213,19 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_f
     );
     assert_eq!(result.output["validation"]["resolved_failure_count"], 1);
     assert_eq!(result.output["validation"]["unresolved_failure_count"], 0);
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
     assert!(result.output.get("advisories").is_none());
+    assert_reason_list_contains(
+        &result.output["task_outcome"],
+        "warning_reasons",
+        "validation_inconclusive",
+    );
+    assert!(
+        serde_json::to_string(&result.output["suggested_next_actions"])
+            .unwrap()
+            .contains("rerunning validation alone cannot prove current source")
+    );
     assert!(result.output.get("informational_notes").is_none());
     assert!(result.output.get("evidence_history").is_none());
     assert_eq!(result.output["evidence_integrity"]["status"], "clean");
@@ -2050,7 +2455,7 @@ async fn finish_coding_task_summary_only_passes_with_resolved_unexpected_cargo_c
     assert_eq!(result.output["validation"]["latest_status"], "passed");
     assert_eq!(result.output["validation"]["resolved_failure_count"], 1);
     assert_eq!(result.output["validation"]["unresolved_failure_count"], 0);
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert!(result.output.get("evidence_history").is_none());
     assert_eq!(result.output["evidence_integrity"]["status"], "clean");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
@@ -2077,7 +2482,7 @@ async fn finish_coding_task_combined_early_fmt_and_test_failures_resolve_without
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": fixture.project.clone(),
             "changes": [{"kind": "edit", "path": "src/lib.rs"}]
@@ -2122,7 +2527,7 @@ async fn finish_coding_task_combined_early_fmt_and_test_failures_resolve_without
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({
             "project": fixture.project.clone(),
             "changes": [{"kind": "edit", "path": "src/lib.rs"}]
@@ -2198,12 +2603,12 @@ async fn finish_coding_task_combined_early_fmt_and_test_failures_resolve_without
     assert_eq!(result.output["validation"]["status"], "mixed");
     assert_eq!(result.output["validation"]["resolved_failure_count"], 2);
     assert_eq!(result.output["validation"]["unresolved_failure_count"], 0);
-    assert_eq!(result.output["validation"]["current_status"], "passed");
+    assert_eq!(result.output["validation"]["current_status"], "unproven");
     assert_eq!(
         result.output["validation"]["current_unresolved_failure_count"],
         0
     );
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
     assert_reason_list_not_contains(
         &result.output["task_outcome"],
@@ -2256,7 +2661,7 @@ async fn finish_coding_task_resolved_history_keeps_real_workspace_advisory() {
     assert_eq!(result.output["validation"]["latest_status"], "passed");
     assert_eq!(result.output["validation"]["resolved_failure_count"], 1);
     assert_eq!(result.output["validation"]["unresolved_failure_count"], 0);
-    assert_eq!(result.output["validation"]["current_status"], "passed");
+    assert_eq!(result.output["validation"]["current_status"], "unproven");
     assert_eq!(
         result.output["validation"]["current_unresolved_failure_count"],
         0
@@ -2303,7 +2708,7 @@ async fn finish_coding_task_resolved_history_keeps_real_tool_failure_blocking() 
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({"project": fixture.project.clone(), "changes": []}),
         false,
         json!({"failure_kind": "stale_precondition"}),
@@ -2323,7 +2728,7 @@ async fn finish_coding_task_resolved_history_keeps_real_tool_failure_blocking() 
     assert_eq!(result.output["validation"]["latest_status"], "passed");
     assert_eq!(result.output["validation"]["resolved_failure_count"], 1);
     assert_eq!(result.output["validation"]["unresolved_failure_count"], 0);
-    assert_eq!(result.output["validation"]["current_status"], "passed");
+    assert_eq!(result.output["validation"]["current_status"], "unproven");
     assert_eq!(
         result.output["validation"]["current_unresolved_failure_count"],
         0
@@ -2361,7 +2766,7 @@ async fn failure_history_fail_closed_attempts_do_not_block_clean_finish() {
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({"project": fixture.project.clone(), "changes": []}),
         false,
         json!({
@@ -2416,7 +2821,7 @@ async fn failure_history_fail_closed_attempts_do_not_block_clean_finish() {
         0
     );
     assert_eq!(result.output["validation"]["status"], "passed");
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
     assert_eq!(result.output["evidence_integrity"]["status"], "clean");
     assert_reason_list_not_contains(
@@ -2606,7 +3011,7 @@ async fn failure_history_outcome_unknown_remains_actionable() {
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({"project": fixture.project.clone(), "changes": []}),
         false,
         json!({
@@ -2650,7 +3055,7 @@ async fn failure_history_missing_effect_proof_remains_actionable() {
     record_coding_task_tool_event(
         &fixture.runtime,
         &fixture.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({"project": fixture.project.clone(), "changes": []}),
         false,
         json!({"failure_kind": "stale_precondition"}),
@@ -2663,7 +3068,7 @@ async fn failure_history_missing_effect_proof_remains_actionable() {
     let failed = summary
         .events
         .iter()
-        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "apply_text_edits")
+        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "edit_project_files")
         .expect("failed guarded mutation event");
     assert!(
         failed.effect_evidence.is_none(),
@@ -3018,7 +3423,7 @@ async fn finish_coding_task_summary_only_treats_read_failure_as_historical_non_a
     );
     assert_eq!(result.output["validation"]["status"], "passed");
     assert_eq!(result.output["validation"]["latest_status"], "passed");
-    assert_eq!(result.output["task_outcome"]["status"], "pass");
+    assert_eq!(result.output["task_outcome"]["status"], "warn");
     assert_eq!(result.output["task_outcome"]["blocking"], false);
     assert_reason_list_not_contains(
         &result.output["task_outcome"],
@@ -3266,22 +3671,6 @@ fn assert_check_status(verdict: &Value, name: &str, status: &str) {
     assert_eq!(check["status"], status);
 }
 
-fn assert_reason_list_contains(verdict: &Value, key: &str, reason: &str) {
-    let reasons = verdict[key].as_array().expect("reason list");
-    assert!(
-        reasons.iter().any(|value| value.as_str() == Some(reason)),
-        "{key} should contain {reason}: {verdict}"
-    );
-}
-
-fn assert_reason_list_not_contains(verdict: &Value, key: &str, reason: &str) {
-    let reasons = verdict[key].as_array().expect("reason list");
-    assert!(
-        !reasons.iter().any(|value| value.as_str() == Some(reason)),
-        "{key} should not contain {reason}: {verdict}"
-    );
-}
-
 fn assert_startup_verdict_shape(verdict: &Value) {
     assert_status_string(verdict);
     assert!(verdict["blocking"].is_boolean(), "blocking bool: {verdict}");
@@ -3336,40 +3725,6 @@ fn assert_finish_uses_canonical_outcomes(output: &Value) {
     assert!(output.get("finish_verdict").is_none(), "{output}");
 }
 
-fn assert_action_list_contains(actions: &Value, action: &str) {
-    assert!(
-        actions
-            .as_array()
-            .expect("suggested_next_actions array")
-            .iter()
-            .any(|candidate| candidate.as_str() == Some(action)),
-        "suggested_next_actions should contain {action}: {actions}"
-    );
-}
-
-fn assert_action_list_not_contains(actions: &Value, action: &str) {
-    assert!(
-        !actions
-            .as_array()
-            .expect("suggested_next_actions array")
-            .iter()
-            .any(|candidate| candidate.as_str() == Some(action)),
-        "suggested_next_actions should not contain {action}: {actions}"
-    );
-}
-
-fn assert_compact_verdict_safe(value: &Value, context: &str) {
-    let serialized = serde_json::to_string(value).unwrap();
-    for forbidden in [
-        "stdout", "stderr", "tail", "excerpt", "command", "token", "secret", "env",
-    ] {
-        assert!(
-            !serialized.contains(forbidden),
-            "{context} leaked {forbidden}: {serialized}"
-        );
-    }
-}
-
 fn assert_review_evidence_tools_safe(review_evidence: &Value) {
     let tools = review_evidence["tools"]
         .as_array()
@@ -3387,11 +3742,11 @@ fn assert_review_evidence_tools_safe(review_evidence: &Value) {
                 "read_files"
                     | "list_project_files"
                     | "search_project_texts"
-                    | "git_diff_hunks"
-                    | "git_review_summary"
-                    | "show_changes"
-                    | "git_status"
-                    | "workspace_hygiene_check"
+                    | "read_git_diff_hunks"
+                    | "read_git_review_summary"
+                    | "read_workspace_changes"
+                    | "get_git_status"
+                    | "check_workspace_hygiene"
             ),
             "unexpected review evidence tool name {tool}"
         );
@@ -3404,54 +3759,6 @@ fn assert_review_evidence_tools_safe(review_evidence: &Value) {
             );
         }
     }
-}
-
-fn json_contains_key(value: &Value, key: &str) -> bool {
-    match value {
-        Value::Object(map) => {
-            map.contains_key(key) || map.values().any(|value| json_contains_key(value, key))
-        }
-        Value::Array(values) => values.iter().any(|value| json_contains_key(value, key)),
-        _ => false,
-    }
-}
-
-fn assert_no_raw_validation_output_fields(value: &Value, context: &str) {
-    for key in [
-        "stdout",
-        "stderr",
-        "stdout_tail",
-        "stderr_tail",
-        "stdout_tail_excerpt",
-        "stderr_tail_excerpt",
-        "validation_output_summary",
-    ] {
-        assert!(
-            !json_contains_key(value, key),
-            "{context} must not include {key}: {value}"
-        );
-    }
-}
-
-fn record_coding_task_tool_event(
-    runtime: &ToolRuntime,
-    session_id: &str,
-    tool_name: &str,
-    arguments: Value,
-    success: bool,
-    output: Value,
-) {
-    let start = runtime.sessions.record_tool_call_started(
-        Some(session_id),
-        SessionTransport::Api,
-        tool_name,
-        &arguments,
-        crate::tool_runtime::sessions::session_tool_contract(tool_name),
-    );
-    let error = (!success).then_some("tool failed");
-    runtime
-        .sessions
-        .record_tool_call_finished(start, success, &output, error, None);
 }
 
 struct FinishSummaryFixture {
@@ -3495,6 +3802,7 @@ async fn finish_coding_task_jobs_projection(fixture: &FinishSummaryFixture) -> T
             runtime
                 .dispatch_with_auth(
                     ToolCall::FinishCodingTask {
+                        outputs: Vec::new(),
                         project,
                         session_id,
                         summary_only: false,
@@ -3551,6 +3859,7 @@ async fn finish_coding_task_with_agent(
             runtime
                 .dispatch_with_auth(
                     ToolCall::FinishCodingTask {
+                        outputs: Vec::new(),
                         project,
                         session_id,
                         summary_only,
@@ -3602,7 +3911,7 @@ async fn session_handoff_summary_only_with_agent_limit(
                         include_workspace: Some(true),
                         include_checkpoints: Some(false),
                         include_validation: Some(true),
-                        summary_only: true,
+                        diagnostic: true,
                         limit,
                     },
                     Some(&auth),
@@ -3614,7 +3923,7 @@ async fn session_handoff_summary_only_with_agent_limit(
         runtime,
         client_id,
         &task,
-        "session_handoff_summary summary_only",
+        "read_session_handoff summary_only",
     )
     .await;
     task.await.unwrap()
@@ -3640,7 +3949,7 @@ async fn coding_workflow_full_diagnostic_recommended_flow_projects_to_visible_ma
 
     let manifest_tools: std::collections::BTreeSet<&str> = result.output["tool_manifest"]["tools"]
         .as_array()
-        .expect("tool_manifest.tools")
+        .expect("read_tool_manifest.tools")
         .iter()
         .filter_map(|tool| tool["name"].as_str())
         .collect();

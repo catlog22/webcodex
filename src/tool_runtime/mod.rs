@@ -1,15 +1,30 @@
-//! Tool Runtime — unified execution layer for MCP and GPT Actions.
+//! Tool Runtime — unified execution layer for MCP.
 //!
 //! Both protocol adapters call `ToolRuntime::dispatch()`.
 //! No HTTP framework types here — pure Rust input/output.
 
+mod acceptance_evidence;
 pub mod activity;
+pub(crate) mod admin_dashboard;
 mod agent_task;
 mod agent_wait;
+mod artifact_transfer;
+mod browser_tools;
 mod cargo;
 mod cargo_tools;
+mod changes;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoint;
+#[cfg(feature = "experimental-code-mode")]
+mod code_mode;
+#[cfg(feature = "experimental-code-mode")]
+mod orchestration_host;
+mod validation;
+#[cfg(feature = "experimental-code-mode")]
+pub(crate) use code_mode::is_admitted_nested_tool as code_mode_nested_tool_is_admitted;
+mod closeout_evidence;
+mod closeout_facts;
+mod closeout_projection;
 mod coding_agent;
 mod coding_task;
 mod coding_task_tools;
@@ -17,64 +32,92 @@ mod communication;
 mod computer_tools;
 pub(crate) mod context_projection;
 mod continuation_feedback;
+pub(crate) mod control_sidecar;
 pub(crate) mod conversation_import;
 mod discovery_tools;
 mod dispatch;
+mod docx_document;
 mod edit_tool_telemetry;
-mod file_listing;
 mod file_tools;
 pub(crate) mod files;
 mod git;
 mod runner_authorization;
 mod runner_config;
+mod runner_instructions;
+mod task_outputs;
+mod trace_diagnostics;
 #[cfg(test)]
 pub(crate) use git::{framed_clean_show_changes_test_stdout, framed_show_changes_test_block};
 mod git_committed;
 mod git_review;
+mod git_review_snapshot;
 mod git_tools;
 mod goal;
+mod guidance;
 mod handoff;
 mod handoff_brief;
 mod handoff_tools;
 mod helpers;
-#[cfg(test)]
-pub(crate) use helpers::test_shell;
+pub(crate) use helpers::{bounded_tail, COMMAND_STDIO_TAIL_CHARS};
 mod hygiene;
 mod hygiene_tools;
+mod instruction_projection;
+mod job_attention;
+pub(crate) mod job_audit;
+mod job_input;
+mod job_query;
+mod job_terminal_wait;
 mod job_tools;
 mod jobs;
 pub(crate) mod kernel;
 mod lsp_tools;
+mod mcp_timing;
+mod review_changes;
 pub(crate) use lsp_tools::runner_local_project_id;
 pub(crate) mod memory;
-pub(crate) mod metadata;
 pub(crate) mod model_ergonomics_telemetry;
+mod model_references;
 pub(crate) mod observations;
 mod observe_jobs;
 mod patch;
 mod patch_tools;
+pub(crate) mod peer_collaboration;
 pub(crate) mod permissions;
+mod presentation;
 mod process;
-pub(crate) mod project_instructions;
+mod project_build;
+mod project_format;
 mod project_resolution;
+mod projection_text;
+pub(crate) mod window_collaboration;
 pub(crate) use project_resolution::ResolvedProject;
 mod project_tools;
 mod projects;
+mod read_cache;
 mod read_files;
-mod registry;
+mod read_revisions;
+mod workspace_reads;
+#[cfg(test)]
+pub(crate) use read_revisions::ReadRevisionTarget;
+mod optional_enrichment;
+pub(crate) mod resource_references;
+mod result_projection;
+mod return_timing;
 mod runtime;
+mod runtime_compatibility;
 mod runtime_info;
 pub(crate) mod runtime_metrics;
 mod script;
+mod search_and_read;
 mod search_project_texts;
 mod semantic_navigation;
 mod session_context;
 pub(crate) use session_context::runtime_observation_principal;
+pub(crate) use session_context::SESSION_ATTENTION_MAX_MESSAGES;
 pub(crate) use window_activity::{
     ToolCallCorrelation, WindowActivityGuard, WindowLoopTransition, WorkflowSessionCorrelation,
     WorkflowSessionCorrelationRelation,
 };
-mod session_projects;
 mod session_shell;
 mod session_tools;
 pub(crate) mod sessions;
@@ -83,24 +126,30 @@ mod shell_tools;
 pub(crate) mod skills;
 pub(crate) mod specialized;
 pub(crate) mod startup_brief;
+mod startup_catalog;
 mod structured_execution;
 mod surface;
-mod todo;
-mod tool_audit;
-mod tool_exposure;
 pub(crate) use tool_audit::session_log_result_for_tool as audit_safe_result_for_tool;
-mod tool_call;
-mod tool_catalog;
-pub(crate) mod tool_definition;
-mod tool_inputs;
-mod tool_policy;
-mod tool_result;
-mod tool_spec;
+mod current_window_activity;
 mod validation_events;
-pub(crate) mod validation_parser;
 pub(crate) mod validation_profile;
+mod validation_source;
 pub(crate) mod window_activity;
+pub(crate) mod window_activity_projection;
+pub(crate) use webcodex_core::{
+    project_instructions, project_listing as file_listing, validation_evidence as validation_parser,
+};
+pub(crate) use webcodex_tool_contracts::{
+    metadata, registry, tool_call, tool_catalog, tool_definition, tool_inputs,
+};
+#[cfg(test)]
+pub(crate) use webcodex_tool_runtime_contracts::recorder_metadata::parse_tool_call_with_recorder_metadata;
+pub(crate) use webcodex_tool_runtime_contracts::{tool_audit, tool_result};
+mod pdf_document;
 mod work_result;
+mod work_result_workspace;
+mod workbench_execution;
+mod workbench_state;
 pub(crate) use window_activity::{ActiveWindowRequest, MAX_ACTIVE_REQUESTS_PER_WINDOW};
 
 #[cfg(test)]
@@ -113,29 +162,21 @@ pub use crate::apply_edits_shared::ApplyTextLineScope;
 pub(crate) use files::MAX_PROJECT_ARTIFACT_BYTES;
 pub(crate) use files::{
     validate_project_artifact_export_snapshot, ProjectArtifactExportSnapshot,
-    MAX_PROJECT_ARTIFACT_EXPORT_BYTES, MAX_READ_PROJECT_ARTIFACT_LENGTH,
+    INTERNAL_ARTIFACT_TRANSFER_CHUNK_BYTES, MAX_PROJECT_ARTIFACT_EXPORT_BYTES,
 };
 #[cfg(test)]
 pub(crate) use permissions::{AuthorityMode, PermissionEvaluator};
+pub(crate) use projects::{ProjectInventoryPage, ProjectInventoryRow};
 #[cfg(test)]
 pub(crate) use runner_authorization::required_runner_capability;
 pub use runtime::ToolRuntime;
+pub(crate) use runtime_compatibility::build_alignment_name;
 pub use runtime_info::RuntimeInfo;
+pub(crate) use runtime_info::{ListRunnersOptions, RunnerInventoryPage, RunnerInventoryRow};
 #[cfg(test)]
 pub(crate) use session_context::workflow_session_authority_fingerprint;
 #[cfg(test)]
 pub(crate) use sessions::{SessionCreateOptions, SessionGuards, SessionSummary};
-#[cfg(feature = "workspace-checkpoints")]
-pub use tool_call::CheckpointToolCall;
-pub use tool_call::{
-    AgentWaitEventSelectorCall, GoalToolCall, HostFileImportProvenance, LspToolCall,
-    ObserveJobsItem, ObserveJobsWakeOn, PluginToolCall, ReadFilesItem, SearchPatternMode,
-    SearchProjectTextsQuery, SearchResultMode, SessionToolCall, SshResourceToolCall, TodoToolCall,
-    ToolCall, ValidateToolCall,
-};
-pub(crate) use tool_call::{
-    TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD, TOOL_CALL_WRAPPER_FIELDS,
-};
 #[cfg(test)]
 pub use tool_definition::is_known_tool_name;
 #[cfg(test)]
@@ -143,33 +184,39 @@ pub(crate) use tool_definition::{
     known_tool_names, model_hidden_tool_names, runtime_tool_category as tool_manifest_category,
     RunnerCapabilityRequirement,
 };
-pub use tool_exposure::ToolExposure;
+pub use webcodex_tool_contracts::tool_call::{
+    AgentWaitEventSelectorCall, AgentWaitModeCall, HostFileImportProvenance, ObserveJobsItem,
+    ObserveJobsWakeOn, PluginToolCall, ProjectArtifactAction, ReadFilesItem, SearchPatternMode,
+    SearchProjectTextsQuery, SearchResultMode, SshResourceToolCall, ToolCall,
+};
+pub(crate) use webcodex_tool_contracts::tool_call::{TOOL_CALL_PARAMS_FIELD, TOOL_CALL_TOOL_FIELD};
 #[cfg(test)]
-pub use tool_inputs::ApplyFileChangeInput;
+pub use webcodex_tool_contracts::tool_inputs::ApplyFileChangeInput;
 #[cfg(all(test, feature = "workspace-checkpoints"))]
-pub use tool_inputs::CheckpointValidationInput;
-pub use tool_inputs::{default_true, ExecutionPurpose, ExecutionShell, ListToolsOptions};
+pub use webcodex_tool_contracts::tool_inputs::CheckpointValidationInput;
 #[cfg(test)]
-pub use tool_inputs::{
+pub use webcodex_tool_contracts::tool_inputs::{
     ApplyFileChangeKind, ApplyTextEditInput, ApplyTextEditKind, SessionMode, StartupDetail,
 };
-pub use tool_result::ToolResult;
-pub(crate) use tool_result::{
+pub use webcodex_tool_contracts::tool_inputs::{
+    ExecutionPurpose, ExecutionShell, ListToolsOptions,
+};
+pub use webcodex_tool_contracts::ToolSpec;
+pub use webcodex_tool_runtime_contracts::tool_result::ToolResult;
+pub(crate) use webcodex_tool_runtime_contracts::tool_result::{
     ContinuationCarrier, ContinuationKind, ContinuationSemantics, RecoveryKind, SuggestedToolCall,
     RECOVERY_KIND_VALUES,
 };
-pub use tool_spec::ToolSpec;
 
+pub(crate) use model_references::SessionSelectorError;
 #[cfg(test)]
 pub(crate) use project_resolution::ProjectResolverErrorKind;
 pub(crate) use project_resolution::{runner_project_runtime_id, ProjectResolverError};
-pub(crate) use registry::{
-    agent_continuation_app_tool_specs, goal_plan_app_tool_specs, registered_tool_specs,
-    stateless_operator_extension_tool_specs, work_result_app_tool_specs,
-};
 #[cfg(test)]
 pub(crate) use registry::{
-    memory_management_tool_specs, memory_runtime_tool_specs, skill_management_tool_specs,
+    goal_plan_app_tool_specs, memory_management_tool_specs, memory_runtime_tool_specs,
+    registered_tool_specs, skill_management_tool_specs, stateless_operator_extension_tool_specs,
+    work_result_app_tool_specs,
 };
 pub(crate) use session_context::{add_session_hint, unknown_session_result};
 pub(crate) use session_shell::SessionShellRegistry;
@@ -178,3 +225,8 @@ pub(crate) use surface::registered_tool_categories;
 
 #[cfg(test)]
 mod tests;
+
+mod edit_outcome;
+pub(crate) mod execution_control;
+mod execution_outcome;
+mod external_observations;

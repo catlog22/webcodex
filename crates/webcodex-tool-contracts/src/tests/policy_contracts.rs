@@ -1,90 +1,55 @@
 use super::*;
 
 #[test]
-fn tool_definitions_are_context_continuity_ssot() {
-    use crate::metadata::ToolEffect;
-    use crate::tool_definition::{
-        runtime_tool_accepts_context_ack, runtime_tool_advances_context_checkpoint,
-        runtime_tool_context_continuity_policy,
-    };
-    use crate::tool_policy::lookup_tool_definition;
+fn app_presentation_is_derived_without_granting_execution_or_host_review() {
+    use crate::tool_definition::ToolDirectReason;
+    for definition in tool_definitions() {
+        let expected = matches!(
+            definition.adaptive_runtime_direct_reason(),
+            Some(ToolDirectReason::Presentation | ToolDirectReason::Continuation)
+        );
+        assert_eq!(definition.presents_app(), expected, "{}", definition.name);
+        if definition.presents_app() {
+            assert!(definition.model_spec.is_some(), "{}", definition.name);
+            assert!(definition.execution.is_none(), "{}", definition.name);
+            assert!(
+                !definition.requires_individual_host_review(),
+                "{}",
+                definition.name
+            );
+        }
+    }
+    assert!(lookup_tool_definition("present_pdf")
+        .unwrap()
+        .presents_app());
+    assert!(lookup_tool_definition("present_agent_continuation")
+        .unwrap()
+        .presents_app());
+    assert!(lookup_tool_definition("open_webcodex_workbench")
+        .unwrap()
+        .presents_app());
+    assert!(!lookup_tool_definition("run_process")
+        .unwrap()
+        .presents_app());
+}
 
-    for (name, accepts_ack, advances_checkpoint) in [
-        ("read_files", false, false),
-        ("search_project_texts", false, false),
-        ("tool_manifest", false, false),
-        ("show_changes", false, false),
-        ("work_on_project", false, false),
-        ("session_handoff_summary", true, false),
-        ("list_jobs", false, false),
-        ("runtime_status", false, false),
-        ("workspace_hygiene_check", false, false),
-        ("git_diff_hunks", false, false),
-        ("hover", false, false),
-        ("apply_text_edits", true, true),
-        ("apply_patch", true, true),
-        ("cargo_test", true, true),
-        ("cargo_check", true, true),
-        ("cargo_fmt", true, true),
-        ("run_shell", true, true),
-        ("run_script", true, true),
-        ("run_process", true, true),
-        ("observe_jobs", true, true),
-    ] {
-        let definition =
-            lookup_tool_definition(name).unwrap_or_else(|| panic!("missing definition for {name}"));
-        let direct = definition.context_continuity_policy();
+#[test]
+fn object_tool_arguments_keep_null_normalization_and_required_fields() {
+    for name in ["list_jobs", "list_projects", "get_runtime_status"] {
+        let null = ToolCall::from_tool_name(name, Value::Null).unwrap();
+        let empty = ToolCall::from_tool_name(name, json!({})).unwrap();
         assert_eq!(
-            runtime_tool_context_continuity_policy(name),
-            direct,
-            "{name}"
-        );
-        assert_eq!(direct.accepts_context_ack, accepts_ack, "{name}");
-        assert_eq!(
-            direct.advances_context_checkpoint(),
-            advances_checkpoint,
-            "{name}"
-        );
-        assert_eq!(
-            runtime_tool_accepts_context_ack(name),
-            accepts_ack,
-            "{name}"
-        );
-        assert_eq!(
-            runtime_tool_advances_context_checkpoint(name),
-            advances_checkpoint,
-            "{name}"
+            serde_json::to_value(null).unwrap(),
+            serde_json::to_value(empty).unwrap()
         );
     }
-
-    assert_eq!(
-        lookup_tool_definition("work_on_project")
-            .unwrap()
-            .metadata()
-            .effect,
-        ToolEffect::Mutate
-    );
-    assert_eq!(
-        lookup_tool_definition("show_changes")
-            .unwrap()
-            .metadata()
-            .effect,
-        ToolEffect::Observe
-    );
-    assert_eq!(
-        lookup_tool_definition("observe_jobs")
-            .unwrap()
-            .metadata()
-            .effect,
-        ToolEffect::Observe
-    );
-    assert!(!runtime_tool_advances_context_checkpoint("show_changes"));
-    assert!(runtime_tool_advances_context_checkpoint("observe_jobs"));
-
-    assert!(runtime_tool_accepts_context_ack("unknown_open_world_tool"));
-    assert!(runtime_tool_advances_context_checkpoint(
-        "unknown_open_world_tool"
-    ));
+    for name in ["run_process", "run_job", "read_files", "edit_project_files"] {
+        assert!(
+            ToolCall::from_tool_name(name, Value::Null).is_err(),
+            "{name}"
+        );
+        assert!(ToolCall::from_tool_name(name, json!({})).is_err(), "{name}");
+    }
 }
 
 #[test]
@@ -117,7 +82,8 @@ fn tool_definitions_are_session_evidence_policy_ssot() {
             ToolExplorationEvidence::Read
             | ToolExplorationEvidence::ReadBatch
             | ToolExplorationEvidence::Search
-            | ToolExplorationEvidence::SearchBatch => {
+            | ToolExplorationEvidence::SearchBatch
+            | ToolExplorationEvidence::SearchCompound => {
                 assert_eq!(
                     definition.category, TOOL_CATEGORY_FILE,
                     "{}",
@@ -182,7 +148,7 @@ fn tool_definitions_are_session_evidence_policy_ssot() {
     );
     #[cfg(feature = "workspace-checkpoints")]
     assert_eq!(
-        lookup_tool_definition("workspace_checkpoint_create")
+        lookup_tool_definition("create_workspace_checkpoint")
             .unwrap()
             .session_evidence
             .failure,
@@ -196,7 +162,7 @@ fn tool_definitions_are_session_evidence_policy_ssot() {
         ToolExplorationEvidence::ReadBatch
     );
     assert_eq!(
-        lookup_tool_definition("goto_definition")
+        lookup_tool_definition("find_definition")
             .unwrap()
             .session_evidence
             .exploration,
@@ -210,28 +176,28 @@ fn tool_definitions_are_session_evidence_policy_ssot() {
         ToolChangedPathEvidence::ResultField("affected_files")
     );
     assert_eq!(
-        lookup_tool_definition("session_shell_exec")
+        lookup_tool_definition("execute_session_shell")
             .unwrap()
             .session_evidence
             .persistent_shell,
         Some(PersistentShellEvidenceAction::Exec)
     );
     assert_eq!(
-        lookup_tool_definition("show_changes")
+        lookup_tool_definition("read_workspace_changes")
             .unwrap()
             .session_evidence
             .diff_review,
         ToolDiffReviewEvidence::ArgumentBool("include_diff")
     );
     assert_eq!(
-        lookup_tool_definition("show_changes")
+        lookup_tool_definition("read_workspace_changes")
             .unwrap()
             .session_evidence
             .review,
         ToolReviewEvidence::WorkspaceReview
     );
     assert_eq!(
-        lookup_tool_definition("workspace_hygiene_check")
+        lookup_tool_definition("check_workspace_hygiene")
             .unwrap()
             .session_evidence
             .review,
@@ -260,28 +226,20 @@ fn tool_definitions_drive_session_and_permission_policy() {
         runtime_tool_session_risk_class, tool_definitions, PERMISSION_RISK_ARTIFACT_WRITE,
         PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_JOB, PERMISSION_RISK_PATCH,
         PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE,
-        TOOL_DISCOVERY_GROUPS, TOOL_DISCOVERY_GROUP_GIT,
+        TOOL_CATEGORY_GIT,
     };
     use crate::tool_policy::lookup_tool_definition;
 
-    let text_input = lookup_tool_definition("computer_input_text").expect("computer input tool");
-    assert!(text_input.is_write_like());
-    assert!(text_input.requires_permission());
-    assert_eq!(text_input.metadata().risk, ToolRisk::ComputerControl);
-
-    let application_launch = lookup_tool_definition("computer_launch_application")
-        .expect("computer application launch tool");
-    assert!(application_launch.is_write_like());
-    assert!(application_launch.requires_permission());
-    assert_eq!(
-        application_launch.metadata().risk,
-        ToolRisk::ComputerControl
-    );
+    let computer_control =
+        lookup_tool_definition("control_computer").expect("computer control gateway");
+    assert!(computer_control.is_write_like());
+    assert!(computer_control.requires_permission());
+    assert_eq!(computer_control.metadata().risk, ToolRisk::ComputerControl);
 
     for (name, effect, risk) in [
         ("apply_patch", ToolEffect::Mutate, ToolRisk::ProjectWrite),
         (
-            "apply_text_edits",
+            "edit_project_files",
             ToolEffect::Mutate,
             ToolRisk::ProjectWrite,
         ),
@@ -293,7 +251,7 @@ fn tool_definitions_drive_session_and_permission_policy() {
         ("run_shell", ToolEffect::Execute, ToolRisk::JobRun),
         ("cargo_check", ToolEffect::Execute, ToolRisk::JobRun),
         (
-            "computer_control",
+            "control_computer",
             ToolEffect::Execute,
             ToolRisk::ComputerControl,
         ),
@@ -324,13 +282,11 @@ fn tool_definitions_drive_session_and_permission_policy() {
     assert_eq!(patch_metadata.approval, ToolApprovalPolicy::Standard);
     assert_eq!(patch_metadata.idempotency, ToolIdempotency::NonIdempotent);
 
-    let git_group = TOOL_DISCOVERY_GROUPS
-        .iter()
-        .find(|group| group.name == TOOL_DISCOVERY_GROUP_GIT)
-        .expect("git discovery group")
-        .tools
-        .iter()
-        .copied()
+    let git_group = tool_definitions()
+        .filter(|definition| {
+            definition.visibility.is_model_visible() && definition.category == TOOL_CATEGORY_GIT
+        })
+        .map(|definition| definition.name)
         .collect::<BTreeSet<_>>();
 
     for retired_primitive in ["git_diff", "git_diff_summary"] {
@@ -507,7 +463,12 @@ fn tool_definitions_drive_session_and_permission_policy() {
         .collect::<Vec<_>>();
     assert_eq!(
         change_summary_tools,
-        vec!["git_review_summary", "show_changes", "git_diff_hunks",]
+        vec![
+            "read_git_review_summary",
+            "review_changes",
+            "read_workspace_changes",
+            "read_git_diff_hunks",
+        ]
     );
 
     let validation_output_tools = tool_definitions()
@@ -517,11 +478,11 @@ fn tool_definitions_drive_session_and_permission_policy() {
     assert_eq!(
         validation_output_tools,
         vec![
-            "validate",
             "cargo_fmt",
             "cargo_check",
             "cargo_test",
-            "go_test"
+            "project_validate",
+            "go_test",
         ]
     );
 
@@ -532,32 +493,34 @@ fn tool_definitions_drive_session_and_permission_policy() {
     assert_eq!(
         explicit_business_session_tools,
         vec![
+            "record_external_observation",
+            "list_external_observations",
             "finish_coding_task",
-            "present_work_result",
-            "session_summary",
+            "read_session_summary",
             "update_session_context",
             "close_session",
-            "validation_summary",
+            "read_validation_summary",
             "post_session_message",
             "list_session_messages",
             "get_session_assignment",
             "observe_session_messages",
             "resolve_session_message",
             "complete_session_message",
-            "session_discussion_summary",
-            "session_handoff_summary",
+            "read_session_discussion_summary",
+            "read_session_handoff",
+            "get_session_handoff_state",
+            #[cfg(feature = "experimental-code-mode")]
+            "execute_code_mode",
+            #[cfg(feature = "experimental-code-mode")]
+            "execute_effectful_code_mode",
+            #[cfg(feature = "experimental-code-mode")]
+            "execute_mutating_code_mode",
             "open_session_shell",
-            "session_shell_exec",
-            "session_shell_status",
+            "execute_session_shell",
+            "get_session_shell_status",
             "close_session_shell"
         ]
     );
-
-    let unit_argument_tools = tool_definitions()
-        .filter(|definition| definition.uses_unit_arguments())
-        .map(|definition| definition.name)
-        .collect::<Vec<_>>();
-    assert_eq!(unit_argument_tools, vec!["computer_list_targets"]);
 
     let artifact_upload_path_binding_tools = tool_definitions()
         .filter(|definition| definition.requires_artifact_upload_path_binding())
@@ -566,9 +529,9 @@ fn tool_definitions_drive_session_and_permission_policy() {
     assert_eq!(
         artifact_upload_path_binding_tools,
         vec![
-            "artifact_upload_chunk",
-            "artifact_upload_finish",
-            "artifact_upload_abort"
+            "upload_artifact_chunk",
+            "finish_artifact_upload",
+            "abort_artifact_upload"
         ]
     );
 
@@ -583,33 +546,29 @@ fn tool_definitions_drive_session_and_permission_policy() {
         ("close_session_shell", PERMISSION_RISK_JOB),
         ("delete_project_files", PERMISSION_RISK_DESTRUCTIVE),
         ("save_project_artifact", PERMISSION_RISK_ARTIFACT_WRITE),
-        (
-            "import_conversation_files_to_project",
-            PERMISSION_RISK_ARTIFACT_WRITE,
-        ),
-        ("artifact_upload_finish", PERMISSION_RISK_ARTIFACT_WRITE),
-        ("artifact_upload_abort", PERMISSION_RISK_ARTIFACT_WRITE),
-        ("computer_save_snapshot", PERMISSION_RISK_ARTIFACT_WRITE),
+        ("import_host_files", PERMISSION_RISK_ARTIFACT_WRITE),
+        ("transfer_project_artifact", PERMISSION_RISK_ARTIFACT_WRITE),
+        ("import_artifact_handoff", PERMISSION_RISK_ARTIFACT_WRITE),
+        ("finish_artifact_upload", PERMISSION_RISK_ARTIFACT_WRITE),
+        ("abort_artifact_upload", PERMISSION_RISK_ARTIFACT_WRITE),
+        ("save_computer_snapshot", PERMISSION_RISK_ARTIFACT_WRITE),
         ("apply_patch", PERMISSION_RISK_PATCH),
         ("apply_unified_diff", PERMISSION_RISK_PATCH),
         #[cfg(feature = "workspace-checkpoints")]
-        ("workspace_checkpoint_restore", PERMISSION_RISK_PATCH),
+        ("restore_workspace_checkpoint", PERMISSION_RISK_PATCH),
         ("write_project_file", PERMISSION_RISK_WRITE),
-        ("apply_text_edits", PERMISSION_RISK_WRITE),
+        ("edit_project_files", PERMISSION_RISK_WRITE),
         ("assign_agent_task", PERMISSION_RISK_WRITE),
         ("reconcile_agent_task_coding_run", PERMISSION_RISK_WRITE),
         ("heartbeat_agent_task_attempt", PERMISSION_RISK_WRITE),
         ("complete_agent_task_attempt", PERMISSION_RISK_WRITE),
         ("update_agent_identity", PERMISSION_RISK_WRITE),
         ("rotate_agent_continuation_endpoint", PERMISSION_RISK_WRITE),
-        ("attach_agent_endpoint", PERMISSION_RISK_WRITE),
         ("detach_agent_endpoint", PERMISSION_RISK_WRITE),
         ("consume_agent_deliveries", PERMISSION_RISK_WRITE),
         ("consume_agent_wake", PERMISSION_RISK_WRITE),
-        ("coding_agent_cancel", PERMISSION_RISK_WRITE),
-        ("computer_write_clipboard", PERMISSION_RISK_WRITE),
-        ("computer_pointer_click", PERMISSION_RISK_WRITE),
-        ("computer_control", PERMISSION_RISK_WRITE),
+        ("cancel_coding_agent", PERMISSION_RISK_WRITE),
+        ("control_computer", PERMISSION_RISK_WRITE),
         ("computer_key_input", PERMISSION_RISK_WRITE),
         ("update_session_context", PERMISSION_RISK_WRITE),
         ("close_session", PERMISSION_RISK_WRITE),
@@ -624,14 +583,14 @@ fn tool_definitions_drive_session_and_permission_policy() {
     assert_eq!(close_session.approval, ToolApprovalPolicy::None);
     assert!(!runtime_tool_requires_permission("close_session"));
 
-    let cancel = lookup_tool_definition("coding_agent_cancel")
+    let cancel = lookup_tool_definition("cancel_coding_agent")
         .unwrap()
         .metadata();
     assert_eq!(cancel.effect, ToolEffect::Mutate);
     assert_eq!(cancel.risk, ToolRisk::RunControl);
     assert_eq!(cancel.approval, ToolApprovalPolicy::InheritFromStart);
     assert_eq!(cancel.idempotency, ToolIdempotency::DesiredState);
-    assert!(!runtime_tool_requires_permission("coding_agent_cancel"));
+    assert!(!runtime_tool_requires_permission("cancel_coding_agent"));
 
     assert_eq!(
         runtime_tool_session_risk_class("__unknown__"),
@@ -657,331 +616,25 @@ fn tool_definitions_drive_session_and_permission_policy() {
 }
 
 #[test]
-fn required_runner_capability_matches_metadata_risk_table() {
-    use crate::metadata::{lookup_tool_metadata, ToolRisk, TOOL_PROVIDER_RUNNER};
-    use crate::tool_definition::is_model_visible_tool_name;
-
-    let cases = [
-        (
-            "run_process",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::StructuredProcess,
-        ),
-        (
-            "run_detached_process",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::DetachedProcess,
-        ),
-        (
-            "run_script",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::StructuredScript,
-        ),
-        (
-            "coding_agent_start",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::CodingAgentRuns,
-        ),
-        (
-            "start_agent_task_coding_run",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::CodingAgentRuns,
-        ),
-        (
-            "run_shell",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "open_session_shell",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::PersistentShell,
-        ),
-        (
-            "session_shell_exec",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::PersistentShell,
-        ),
-        (
-            "session_shell_status",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::PersistentShell,
-        ),
-        (
-            "close_session_shell",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::PersistentShell,
-        ),
-        (
-            "apply_patch",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::ApplyPatch,
-        ),
-        (
-            "apply_unified_diff",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "delete_project_files",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "git_restore_paths",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::StructuredProcess,
-        ),
-        (
-            "git_commit_paths",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "discard_untracked",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::StructuredProcess,
-        ),
-        (
-            "write_project_file",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "save_project_artifact",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "computer_save_snapshot",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "read_project_artifact_metadata",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        (
-            "read_project_artifact",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        (
-            "artifact_upload_begin",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "artifact_upload_chunk",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "artifact_upload_finish",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "artifact_upload_abort",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "apply_text_edits",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        (
-            "git_status",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "git_diff_hunks",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "git_review_summary",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "git_log",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "cargo_fmt",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "validate",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "cargo_check",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "cargo_test",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "go_test",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::OwnerOnly,
-        ),
-        (
-            "read_files",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        (
-            "lsp",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "lsp_status",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "document_symbols",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "document_diagnostics",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "hover",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "workspace_symbols",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "goto_definition",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "find_references",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspReadOnlyNavigation,
-        ),
-        (
-            "call_hierarchy",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::LspCallHierarchy,
-        ),
-        (
-            "run_job",
-            ToolRisk::JobRun,
-            RunnerCapabilityRequirement::AsyncJobs,
-        ),
-        (
-            "project_overview",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        (
-            "list_project_files",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        (
-            "list_project_tracked_files",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "search_project_texts",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::Shell,
-        ),
-        (
-            "show_changes",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        (
-            "workspace_hygiene_check",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::GitOrShell,
-        ),
-        #[cfg(feature = "workspace-checkpoints")]
-        (
-            "workspace_checkpoint_create",
-            ToolRisk::CheckpointManage,
-            RunnerCapabilityRequirement::FileRead,
-        ),
-        #[cfg(feature = "workspace-checkpoints")]
-        (
-            "workspace_checkpoint_restore",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::FileWrite,
-        ),
-        #[cfg(feature = "workspace-checkpoints")]
-        (
-            "workspace_checkpoint_list",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::OwnerOnly,
-        ),
-        #[cfg(feature = "workspace-checkpoints")]
-        (
-            "workspace_checkpoint_show",
-            ToolRisk::Read,
-            RunnerCapabilityRequirement::OwnerOnly,
-        ),
-        #[cfg(feature = "workspace-checkpoints")]
-        (
-            "workspace_checkpoint_delete",
-            ToolRisk::ProjectWrite,
-            RunnerCapabilityRequirement::OwnerOnly,
-        ),
-    ];
-
-    let specs = registered_tool_specs();
-    let expected_project_tools = specs
-        .iter()
-        .filter_map(|spec| {
-            let metadata = lookup_tool_metadata(&spec.name).unwrap();
-            ((metadata.provider_id == TOOL_PROVIDER_RUNNER
-                || spec.name.starts_with("workspace_checkpoint_")
-                || spec.name == "computer_save_snapshot")
-                && metadata.requires_project)
-                .then_some(spec.name.as_str())
-        })
-        .collect::<BTreeSet<_>>();
-    let table_project_tools = cases
-        .iter()
-        .map(|(name, _, _)| *name)
-        .filter(|name| is_model_visible_tool_name(name))
-        .collect::<BTreeSet<_>>();
-    assert_eq!(table_project_tools, expected_project_tools);
-
-    for (name, risk, capability) in cases {
-        let metadata = lookup_tool_metadata(name).unwrap();
-        assert_eq!(metadata.risk, risk, "{name} metadata risk");
+fn policy_lookups_match_all_tool_definitions() {
+    for definition in tool_definitions() {
         assert_eq!(
-            lookup_tool_definition(name).unwrap().runner_capability,
-            Some(capability),
-            "{name} declarative Runner capability"
+            crate::metadata::lookup_tool_metadata(definition.name),
+            Some(&definition.metadata()),
+            "{}",
+            definition.name
+        );
+        assert_eq!(
+            crate::runtime_tool_runner_capability(definition.name),
+            definition.runner_capability,
+            "{}",
+            definition.name
         );
     }
+    assert!(
+        std::panic::catch_unwind(|| crate::runtime_tool_runner_capability("__unknown_tool__"))
+            .is_err()
+    );
 }
 
 #[test]
@@ -1063,15 +716,20 @@ fn assert_agent_capability_lookup_rejects_non_runtime_name(name: &str) {
 fn workspace_checkpoints_disabled_registry_and_discovery() {
     assert!(registered_tool_specs()
         .iter()
-        .all(|spec| !spec.name.starts_with("workspace_checkpoint_")));
-    assert!(crate::tool_catalog::TOOL_DISCOVERY_GROUPS
-        .iter()
-        .all(|group| group.name != "checkpoint"
-            && group
-                .tools
-                .iter()
-                .all(|name| !name.starts_with("workspace_checkpoint_"))));
-    for suffix in ["create", "list", "show", "restore", "delete"] {
-        assert!(lookup_tool_definition(&format!("workspace_checkpoint_{suffix}")).is_none());
+        .all(|spec| crate::lookup_tool_definition(&spec.name)
+            .is_none_or(|d| d.category != crate::TOOL_CATEGORY_CHECKPOINT)));
+    assert!(crate::tool_catalog::group_tool_names_by_category(
+        model_visible_tool_definitions().map(|definition| definition.name)
+    )
+    .get("checkpoint")
+    .is_none());
+    for name in [
+        "create_workspace_checkpoint",
+        "list_workspace_checkpoints",
+        "read_workspace_checkpoint",
+        "restore_workspace_checkpoint",
+        "delete_workspace_checkpoint",
+    ] {
+        assert!(lookup_tool_definition(name).is_none());
     }
 }

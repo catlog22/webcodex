@@ -33,6 +33,8 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     <span>Wake revision <b id="revision">—</b></span>
     <span>Dispatch <b id="dispatch">Idle</b></span>
   </div>
+  <button id="timing-toggle" type="button">Enable timing diagnostics</button>
+  <pre id="timing-log" hidden style="max-height:12em;overflow:auto;white-space:pre-wrap;font-size:11px"></pre>
 </main>
 <script>
 (() => {
@@ -41,11 +43,12 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   // Keep transport/projection diagnostics available for dogfood builds without
   // exposing protocol internals in the normal product card.
   const DEBUG_DIAGNOSTICS = false;
-  const AGENT_ID = /^wc_dagent_[0-9a-f]{32}$/;
-  const ENDPOINT_ID = /^wc_endpoint_[0-9a-f]{32}$/;
-  const WAIT_ID = /^wc_agent_wait_[0-9a-f]{32}$/;
-  const WAKE_ID = /^wc_wake_[0-9a-f]{32}$/;
-  const ATTEMPT_ID = /^wc_wake_attempt_[0-9a-f]{32}$/;
+  const AGENT_ID = /^wc_dagent_[A-Za-z0-9_-]{16}$/;
+  const ENDPOINT_ID = /^wc_endpoint_[A-Za-z0-9_-]{16}$/;
+  const CONTINUATION_REF = /^~ac[1-9][0-9]{0,18}$/;
+  const WAIT_ID = /^wc_agent_wait_[A-Za-z0-9_-]{16}$/;
+  const WAKE_ID = /^wc_wake_[A-Za-z0-9_-]{16}$/;
+  const ATTEMPT_ID = /^wc_wake_attempt_[A-Za-z0-9_-]{16}$/;
   const APP_CALL_ID = /^wc_app_call_[0-9a-f]{16}_[1-9][0-9]{0,5}$/;
   const SAFE_RESULT_SHAPE = /^(nested-)?(null|array|string|number|boolean|undefined|function|symbol|bigint|structured|structured-direct|content-json|content-only|empty-object|other-object)$/;
   const SAFE_RESULT_SEMANTICS = new Set([
@@ -63,7 +66,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   const MAX_ENDPOINT_RECOVERY_ATTEMPTS = 2;
   const MAX_ENDPOINT_SUCCESSOR_HOPS = 8;
   const RESTART_RECOVERY_KIND = "host_binding_missing_in_process";
-  const MAX_AUTOMATIC_MESSAGE_CHARS = 4096;
+  const MAX_AUTOMATIC_MESSAGE_CHARS = 1536;
   const VISIBLE_POLL_MS = 3000;
   const HIDDEN_HEARTBEAT_MS = 15000;
   const DISPATCH_STATES = new Set(["dispatch_prepared", "dispatch_accepted", "dispatch_unknown", "continuation_consumed"]);
@@ -73,6 +76,8 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   let appCallPrefix = null;
   const resultAppCallIds = new WeakMap();
   let identity = null;
+  let presentationRef = null;
+  let initialResultUnavailable = false;
   let identityEpoch = 0;
   let endpointRecoveryProbeEpoch = -1;
   let bindingId = null;
@@ -94,6 +99,23 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   let waitRevision = 0;
   let waitMatchCount = 0;
   const el = id => document.getElementById(id);
+  let timingEnabled = false;
+  const timingRing = [];
+  function timing(event, fields = {}) {
+    if (!timingEnabled) return;
+    // Only call-site supplied timing numbers, closed labels and validated App ids.
+    timingRing.push(JSON.stringify(Object.assign({ event, at_ms: performance.now(), hidden: document.hidden }, fields)));
+    if (timingRing.length > 64) timingRing.shift();
+    el("timing-log").textContent = timingRing.join("\n");
+  }
+  el("timing-toggle").onclick = () => {
+    timingEnabled = !timingEnabled;
+    timingRing.length = 0;
+    el("timing-log").textContent = "";
+    el("timing-log").hidden = !timingEnabled;
+    el("timing-toggle").textContent = timingEnabled ? "Disable timing diagnostics" : "Enable timing diagnostics";
+  };
+
   el("diagnostics").hidden = !DEBUG_DIAGNOSTICS;
   el("status").textContent = "Connecting…";
   // One secure random fence per View, stable across response-loss retries.
@@ -103,7 +125,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     const bytes = new Uint8Array(24);
     crypto.getRandomValues(bytes);
     const hex = Array.from(bytes, byte => byte.toString(16).padStart(2, "0")).join("");
-    viewBindingId = "wc_host_binding_" + hex.slice(0, 32);
+    viewBindingId = "wc_host_binding_" + btoa(String.fromCharCode(...bytes.slice(0, 16))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
     appCallPrefix = hex.slice(32);
   } catch (_) {} // Secure randomness unavailable: bind fails closed.
 
@@ -405,6 +427,22 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     return value;
   }
 
+  function acceptWaitReference(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)
+      || !WAIT_ID.test(value.wait_id || "") || !WAIT_STATES.has(value.state)
+      || (waitId && waitId !== value.wait_id)) {
+      teardown();
+      el("binding").textContent = "Unavailable";
+      el("status").textContent = "Invalid or conflicting Wait identity";
+      return false;
+    }
+    // The model result supplies only a selector. The existing App-only poll
+    // validates the durable target and revision before displaying Wait state.
+    // Delayed initial results cannot replace a newer authoritative observation.
+    waitId = value.wait_id;
+    return true;
+  }
+
   function acceptWaitProjection(value) {
     const wait = validWaitProjection(value);
     if (!wait || (waitId && waitId !== wait.wait_id)
@@ -448,7 +486,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
 
   async function refreshWaitState() {
     if (!waitId || tornDown) return;
-    const response = await callTool("agent_wait_state", { wait_id: waitId });
+    const response = await callTool("get_agent_wait_state", { wait_id: waitId });
     const output = outputOf(response);
     if (!toolCallSucceeded(response) || !output || !acceptWaitProjection(output.agent_wait)) {
       throw new Error("Wait state was not accepted");
@@ -511,13 +549,17 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
 
   async function callTool(name, args) {
     const diagnostic = appCallArguments(args);
+    const startedAt = performance.now();
+    timing("rpc_start", { app_call_id: diagnostic.appCallId });
     try {
       const result = await request("tools/call", { name, arguments: diagnostic.arguments });
+      timing("rpc_complete", { app_call_id: diagnostic.appCallId, duration_ms: performance.now() - startedAt });
       if (diagnostic.appCallId && result && typeof result === "object") {
         resultAppCallIds.set(result, diagnostic.appCallId);
       }
       return result;
     } catch (error) {
+      timing("rpc_error", { app_call_id: diagnostic.appCallId, duration_ms: performance.now() - startedAt });
       if (diagnostic.appCallId && error && typeof error === "object") error.appCallId = diagnostic.appCallId;
       throw error;
     }
@@ -547,6 +589,10 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     el("binding").textContent = "Connected";
     if (projection.dispatch_observation === "continuation_consumed") {
       el("status").textContent = "Work resumed successfully";
+    } else if (projection.dispatch_observation === "dispatch_unknown") {
+      el("status").textContent = "Host delivery unconfirmed · no automatic retry";
+    } else if (projection.dispatch_observation === "dispatch_accepted") {
+      el("status").textContent = "Host accepted follow-up · awaiting a fresh turn";
     } else if (document.hidden) {
       el("status").textContent = projection.wake ? "Continuing queued work in background…" : "Connected in background";
     } else if (projection.wake) {
@@ -565,11 +611,15 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     if (tornDown) return;
     if (timer !== null) clearTimeout(timer);
     const scheduledEpoch = identityEpoch;
+    const scheduledAt = performance.now();
+    const delayMs = document.hidden ? HIDDEN_HEARTBEAT_MS : VISIBLE_POLL_MS;
+    timing("poll_scheduled", { delay_ms: delayMs });
     timer = setTimeout(() => {
       timer = null;
+      timing("poll_actual", { delay_ms: delayMs, timer_gap_ms: performance.now() - scheduledAt - delayMs });
       if (scheduledEpoch !== identityEpoch) return scheduleNext();
       if (bindingId) void reconcile(); else void maybeStartBinding();
-    }, document.hidden ? HIDDEN_HEARTBEAT_MS : VISIBLE_POLL_MS);
+    }, delayMs);
   }
 
   async function bind() {
@@ -577,7 +627,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     const selector = identitySnapshot();
     if (!selector) throw definitiveFailure();
     bindAttempts++;
-    const response = await callTool("agent_continuation_bind", exactArgsFor(selector, { binding_id: viewBindingId }));
+    const response = await callTool("bind_agent_continuation", exactArgsFor(selector, { binding_id: viewBindingId }));
     if (tornDown || !snapshotIsCurrent(selector)) return false;
     const callResult = callToolResultOf(response);
     const structured = structuredOf(callResult);
@@ -603,7 +653,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   async function heartbeat() {
     const selector = identitySnapshot();
     if (!selector) return null;
-    const response = await callTool("agent_continuation_state", exactArgsFor(selector, { binding_id: bindingId }));
+    const response = await callTool("get_agent_continuation_state", exactArgsFor(selector, { binding_id: bindingId }));
     if (tornDown || !snapshotIsCurrent(selector)) return null;
     const projection = projectionOf(response);
     if (!toolCallSucceeded(response) || !projection || !acceptIdentity(projection)) {
@@ -627,7 +677,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
       outcome,
     });
     try {
-      const response = await callTool("agent_continuation_wake_finish", args);
+      const response = await callTool("finish_agent_continuation_wake", args);
       if (!toolCallSucceeded(response)) throw new Error("Continuation finish was not accepted");
       pendingFinish = null;
       return true;
@@ -651,14 +701,14 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   }
 
   async function acquire() {
-    const response = await callTool("agent_continuation_wake_acquire", exactArgs({ binding_id: bindingId }));
+    const response = await callTool("acquire_agent_continuation_wake", exactArgs({ binding_id: bindingId }));
     if (!toolCallSucceeded(response)) throw new Error("Continuation acquire was not accepted");
     const output = outputOf(response);
     return validAcquiredWake(output && output.wake);
   }
 
   async function prepare(wake) {
-    const response = await callTool("agent_continuation_wake_prepare", exactArgs({
+    const response = await callTool("prepare_agent_continuation_wake", exactArgs({
       binding_id: bindingId,
       wake_id: wake.wake_id,
       attempt_id: wake.attempt_id,
@@ -699,16 +749,32 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
     // This process-local marker is set before the Host call. Reload/loss cannot
     // cause a blind resend: replacement binding reconciles prepared -> unknown.
     dispatchStarted = wake.attempt_id;
+    const hostDispatchStartedAt = performance.now();
     let outcome = "delivery_unknown";
+    timing("host_dispatch_start");
     try {
-      await request("ui/message", {
+      const hostMessageResult = await request("ui/message", {
         role: "user",
         content: [{ type: "text", text: automaticMessage }],
       });
+      // A Host can resolve ui/message with isError:true instead of rejecting.
+      // Acceptance is not a new model turn and never licenses a blind retry.
+      if (!hostMessageResult || typeof hostMessageResult !== "object" || Array.isArray(hostMessageResult)
+        || ![undefined, false].includes(hostMessageResult.isError)) {
+        throw hostFailure("malformed-result");
+      }
       outcome = "dispatch_accepted";
-    } catch (_) {
+      timing("host_dispatch_complete", { outcome, duration_ms: performance.now() - hostDispatchStartedAt });
+    } catch (error) {
+      // Closed labels only: never retain the automatic message, tokens or raw error.
+      const failureKind = tornDown ? "bridge-cancelled"
+        : SAFE_HOST_FAILURE_KINDS.has(error && error.hostFailureKind) ? error.hostFailureKind : "bridge-error";
+      timing("host_dispatch_error", { outcome, failure_kind: failureKind, duration_ms: performance.now() - hostDispatchStartedAt });
       // After prepare, Host rejection/timeout/response loss is conservatively unknown.
     }
+    // Observation only: acceptance is not proof of a new turn or Wake consumption.
+    // Do not log the prepared message, private Attempt ids, or Host errors.
+    timing("host_dispatch_result", { outcome, duration_ms: performance.now() - hostDispatchStartedAt });
     await finishAttempt(wake, outcome);
   }
 
@@ -731,7 +797,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
       let accepted = null;
       for (let attempt = 0; attempt < MAX_ENDPOINT_RECOVERY_ATTEMPTS; attempt++) {
         try {
-          const response = await callTool("agent_continuation_recover_endpoint", exactArgsFor(stale, {
+          const response = await callTool("recover_agent_continuation_endpoint", exactArgsFor(stale, {
             binding_id: viewBindingId,
           }));
           if (tornDown || !snapshotIsCurrent(stale)) return false;
@@ -823,7 +889,28 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   function acceptToolInput(params) {
     // MCP Apps 2026-01-26: complete tool input is params.arguments.
     // This is an exact selector only; every tool call is reauthorized by Server.
+    // The protocol permits omitted arguments. This notification supplies no
+    // selector and must not revoke an identity verified by another message.
+    if (params && typeof params === "object" && !Array.isArray(params)
+      && !Object.prototype.hasOwnProperty.call(params, "arguments")) return;
     const args = params && params.arguments;
+    if (args && !Array.isArray(args) && args.agent_continuation_ref != null) {
+      const reference = args.agent_continuation_ref;
+      if (typeof reference !== "string" || reference.trim() !== reference
+        || !CONTINUATION_REF.test(reference)
+        || args.agent_id != null || args.endpoint_id != null
+        || args.expected_controller_generation != null
+        || (presentationRef !== null && presentationRef !== reference)) {
+        acceptIdentity(null);
+        return;
+      }
+      // The reference has no client-resolvable identity or authority. Await the
+      // exact authorized Server projection on this presentation's tool-result;
+      // it is also authoritative when the Host delivers result before input.
+      presentationRef = reference;
+      if (initialResultUnavailable && !identity) acceptIdentity(null);
+      return;
+    }
     if (!acceptIdentity(args && !Array.isArray(args) && {
       agent_id: args.agent_id,
       endpoint_id: args.endpoint_id,
@@ -833,11 +920,22 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   }
 
   function acceptToolResult(result) {
-    const projection = projectionOf(result);
-    if (!projection || !acceptIdentity(projection)) return;
+    if (tornDown || initialResultUnavailable) return;
+    const projection = toolCallSucceeded(result) ? projectionOf(result) : null;
+    if (!projection) {
+      // A final result without identity cannot leave a ref-only carrier waiting.
+      // Remember result-first failure; explicit canonical input keeps its bind
+      // fallback, and a late failed result cannot revoke an established binding.
+      if (!identity) {
+        initialResultUnavailable = true;
+        if (presentationRef !== null) acceptIdentity(null);
+      }
+      return;
+    }
+    if (!acceptIdentity(projection)) return;
     const output = outputOf(result);
     if (output && Object.prototype.hasOwnProperty.call(output, "agent_wait")
-      && !acceptWaitProjection(output.agent_wait)) return;
+      && !acceptWaitReference(output.agent_wait)) return;
     // A delayed initial result must not overwrite newer bind/heartbeat state.
     if (!bindingStarted && bindAttempts === 0) renderWithWait(projection);
     void maybeStartBinding();
@@ -885,13 +983,14 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
       id,
       method: "tools/call",
       params: {
-        name: "agent_continuation_unbind",
+        name: "unbind_agent_continuation",
         arguments: diagnostic.arguments,
       },
     }, "*");
   }
 
   function teardown() {
+    timing("teardown");
     if (tornDown) return;
     bestEffortUnbind();
     tornDown = true;
@@ -938,6 +1037,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
   });
 
   addEventListener("visibilitychange", () => {
+    timing("visibility");
     el("visibility").textContent = document.hidden ? "Background" : "Foreground";
     if (timer !== null) clearTimeout(timer);
     timer = null;
@@ -948,7 +1048,7 @@ h1 { margin: 0; font-size: 15px; font-weight: 650; overflow-wrap: anywhere; }
 
   request("ui/initialize", {
     protocolVersion: APP_PROTOCOL,
-    appInfo: { name: "webcodex-agent-continuation-app", title: "WebCodex Agent Continuation", version: "17.0.0" },
+    appInfo: { name: "webcodex-agent-continuation-app", title: "WebCodex Agent Continuation", version: "24.0.0" },
     appCapabilities: {},
   }).then(() => {
     if (tornDown) return;

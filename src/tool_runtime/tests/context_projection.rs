@@ -2,18 +2,69 @@ use super::super::kernel::{
     HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
     ToolProtocolCapabilities, ToolTransport,
 };
-use super::super::sessions::{
-    SessionContextRevisionAck, SessionTransport, ToolCallRecorderMetadata,
-};
+use super::super::sessions::SessionTransport;
 use super::super::{ToolCall, ToolResult, ToolRuntime};
 use super::support::*;
-use crate::runner_protocol::{RunnerCapabilities, RunnerResultPayload, RunnerResultRequest};
+use crate::runner_protocol::{RunnerCapabilities, RunnerResultPayload};
+use crate::tool_runtime::dispatch::DispatchContext;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
 use webcodex_core::plugin::{
     PluginGatewayRequest, PluginGatewayResponse, PluginGatewayResponsePayload,
     PluginSelectionAnnotations, ProjectPluginCatalog, ProjectPluginCatalogEntry,
 };
+
+mod bootstrap_budget;
+mod jobs_attention;
+
+#[tokio::test]
+async fn cli_bootstrap_reuses_observed_instructions_and_returns_full_bounded_body() {
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    let instructions = "Repository instruction that must be retained in its entirety. ".repeat(200);
+    std::fs::write(root.path().join("AGENTS.md"), &instructions).unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client = "cli-bootstrap";
+    let project = register_runner_project_at_path(&runtime, client, "demo", root.path()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            crate::mcp::cli_call_for_test(
+                &runtime,
+                "work_on_project",
+                json!({"project":project,"instruction":"Inspect repository"}),
+                &auth_context(None, true),
+            )
+            .await
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut instruction_reads = 0;
+    while !task.is_finished() {
+        assert!(Instant::now() < deadline, "CLI bootstrap fixture timed out");
+        if let Some(request) = probe_patch_agent_request(&runtime, client).await {
+            if request.kind == "file_read" {
+                instruction_reads += 1;
+            }
+            complete_agent_request_by_running_locally(&runtime, client, request).await;
+        } else {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+    let result = task.await.unwrap();
+    assert_eq!(result["result"]["isError"], false, "{result}");
+    assert!(result["result"].get("structuredContent").is_none());
+    let text = result["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains(&instructions));
+    assert!(text.contains("workspace:"));
+    assert!(text.contains("session_id:"));
+    assert!(!text.contains("webcodex.workflow"));
+    assert!(!text.contains("present_work_result"));
+    assert!(
+        instruction_reads <= webcodex_core::project_instructions::INSTRUCTION_CANDIDATE_PATHS.len(),
+        "context projection must reuse startup's instruction observation"
+    );
+}
 
 fn context_material<'a>(result: &'a ToolResult, key: &str) -> &'a Value {
     result.output["context_projection"]["materials"]
@@ -32,16 +83,11 @@ async fn complete_plugin_catalog_request(
     runtime
         .runner_registry
         .complete(RunnerResultPayload {
-            result: RunnerResultRequest {
-                client_id: request.client_id,
-                runner_instance_id: "inst".to_string(),
-                request_id: request.request_id,
-                exit_code: None,
-                stdout: None,
-                stderr: None,
-                duration_ms: None,
-                error: None,
-            },
+            result: runner_result_request(
+                request.client_id,
+                "inst".to_string(),
+                request.request_id,
+            ),
             command_execution_state: None,
             mcp_gateway: None,
             plugin_gateway: Some(PluginGatewayResponse::success(
@@ -55,7 +101,7 @@ async fn complete_plugin_catalog_request(
 
 fn plugin_catalog(entries: usize) -> ProjectPluginCatalog {
     ProjectPluginCatalog {
-        catalog_revision: format!("wc_plugcat_{}", "a".repeat(64)),
+        catalog_revision: format!("wc_plugcat_{}", webcodex_core::compact::encode([0xaa; 32])),
         total_count: entries,
         entries: (0..entries)
             .map(|index| ProjectPluginCatalogEntry {
@@ -84,20 +130,33 @@ async fn dispatch_with_context_and_local_agent(
     call: ToolCall,
     context_request: Vec<String>,
 ) -> ToolResult {
+    dispatch_with_context_in_window_and_local_agent(runtime, client_id, call, context_request, None)
+        .await
+}
+
+async fn dispatch_with_context_in_window_and_local_agent(
+    runtime: &ToolRuntime,
+    client_id: &str,
+    call: ToolCall,
+    context_request: Vec<String>,
+    window_id: Option<&str>,
+) -> ToolResult {
     let auth = auth_context(None, true);
+    let window = window_id.map(crate::client_window::ClientWindow::for_test);
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
             runtime
-                .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
+                .dispatch_with_context(
                     call,
-                    Some(&auth),
-                    SessionTransport::Mcp,
-                    ToolCallRecorderMetadata::default(),
-                    None,
-                    true,
-                    context_request,
-                    super::super::context_projection::ContextMaterialCapabilities::default(),
+                    DispatchContext {
+                        context_request: context_request,
+                        ..DispatchContext::internal(
+                            Some(&auth),
+                            SessionTransport::Mcp,
+                            window.as_ref(),
+                        )
+                    },
                 )
                 .await
         }
@@ -134,15 +193,9 @@ async fn context_projection_is_explicit_deduped_open_ended_and_nonfatal() {
     let runtime = ToolRuntime::new_for_tests();
     let call = ToolCall::from_tool_name("list_tools", json!({})).unwrap();
     let without = runtime
-        .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
+        .dispatch_with_context(
             call,
-            None,
-            SessionTransport::Mcp,
-            Default::default(),
-            None,
-            true,
-            Vec::new(),
-            super::super::context_projection::ContextMaterialCapabilities::default(),
+            DispatchContext::internal(None, SessionTransport::Mcp, None),
         )
         .await;
     assert!(without.success);
@@ -150,36 +203,33 @@ async fn context_projection_is_explicit_deduped_open_ended_and_nonfatal() {
 
     let call = ToolCall::from_tool_name("list_tools", json!({})).unwrap();
     let result = runtime
-        .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
+        .dispatch_with_context(
             call,
-            None,
-            SessionTransport::Mcp,
-            Default::default(),
-            None,
-            true,
-            vec![
-                "webcodex.workflow".to_string(),
-                "future.material".to_string(),
-                "webcodex.workflow".to_string(),
-                "project.instructions".to_string(),
-            ],
-            super::super::context_projection::ContextMaterialCapabilities::default(),
+            DispatchContext {
+                context_request: vec![
+                    "webcodex.workflow".to_string(),
+                    "future.material".to_string(),
+                    "workflow.resume".to_string(),
+                    "webcodex.workflow".to_string(),
+                    "project.instructions".to_string(),
+                ],
+                ..DispatchContext::internal(None, SessionTransport::Mcp, None)
+            },
         )
         .await;
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        result.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
+    assert!(result.output["context_projection"].get("timing").is_none());
+    assert!(result.output["context_projection"]
+        .get("applies_to_current_effect")
+        .is_none());
     let materials = result.output["context_projection"]["materials"]
         .as_array()
         .unwrap();
-    assert_eq!(materials.len(), 3, "duplicates must be projected once");
+    assert_eq!(materials.len(), 4, "duplicates must be projected once");
     assert_eq!(materials[0]["key"], "webcodex.workflow");
     assert_eq!(
         materials[0]["projection"],
-        crate::tool_runtime::startup_brief::builtin_coding_workflow_projection(),
+        crate::tool_runtime::startup_brief::builtin_coding_workflow_projection(Default::default()),
         "context recovery must return the same guidance as coding startup"
     );
     assert_eq!(materials[0]["status"], "available");
@@ -189,14 +239,132 @@ async fn context_projection_is_explicit_deduped_open_ended_and_nonfatal() {
     );
     assert_eq!(materials[1]["key"], "future.material");
     assert_eq!(materials[1]["status"], "unsupported");
-    assert_eq!(materials[2]["key"], "project.instructions");
+    assert_eq!(materials[2]["key"], "workflow.resume");
     assert_eq!(materials[2]["status"], "unavailable");
-    assert_eq!(materials[2]["reason_code"], "project_target_unavailable");
+    assert_eq!(materials[2]["reason_code"], "client_window_unavailable");
+    assert_eq!(materials[3]["key"], "project.instructions");
+    assert_eq!(materials[3]["status"], "unavailable");
+    assert_eq!(materials[3]["reason_code"], "project_target_unavailable");
     assert!(
         serde_json::to_vec(&result.output["context_projection"])
             .unwrap()
             .len()
             <= crate::tool_runtime::context_projection::MAX_CONTEXT_PROJECTION_BYTES
+    );
+}
+
+#[tokio::test]
+async fn coding_guidance_is_an_explicit_chapter_without_changing_canonical_results() {
+    use crate::tool_runtime::guidance::{coding_guidance_projection, CODING_GUIDANCE_CONTEXT_KEY};
+    let runtime = ToolRuntime::new_for_tests();
+    let mut baseline = None;
+    for requested in [false, true] {
+        let mut context_request = vec!["webcodex.workflow".to_owned()];
+        if requested {
+            context_request.push(CODING_GUIDANCE_CONTEXT_KEY.to_owned());
+        }
+        let mut result = runtime
+            .dispatch_with_context(
+                ToolCall::from_tool_name("list_tools", json!({})).unwrap(),
+                DispatchContext {
+                    context_request,
+                    ..DispatchContext::internal(None, SessionTransport::Mcp, None)
+                },
+            )
+            .await;
+        assert!(result.success, "{:?}", result.error);
+        let materials = result.output["context_projection"]["materials"]
+            .as_array()
+            .unwrap();
+        assert_eq!(materials.len(), if requested { 2 } else { 1 });
+        let workflow = context_material(&result, "webcodex.workflow");
+        assert!(workflow["projection"].get("roles").is_none());
+        assert!(workflow["projection"].get("role_selection").is_none());
+        assert!(workflow["projection"]["model_protocol"]["coding_guidance"]
+            .as_str()
+            .unwrap()
+            .contains(CODING_GUIDANCE_CONTEXT_KEY));
+        if requested {
+            let chapter = context_material(&result, CODING_GUIDANCE_CONTEXT_KEY);
+            assert_eq!(chapter["status"], "available");
+            assert_eq!(chapter["projection"], coding_guidance_projection());
+        }
+        result
+            .output
+            .as_object_mut()
+            .unwrap()
+            .remove("context_projection");
+        if let Some(expected) = &baseline {
+            assert_eq!(&result.output, expected);
+        } else {
+            baseline = Some(result.output);
+        }
+    }
+}
+
+#[tokio::test]
+async fn model_workflow_context_refresh_changes_guidance_only_and_chapters_are_explicit() {
+    use crate::model_workflow::{ModelWorkflowPolicy, GOAL_WORKFLOW_CONTEXT_KEY};
+    let base_runtime = ToolRuntime::new_for_tests();
+    let mut canonical_output = None;
+    for preference in ["on_demand", "preferred"] {
+        for mode in ["unknown", "user_confirmed", "unattended"] {
+            let policy = ModelWorkflowPolicy::from_values(Some(preference), Some(mode)).unwrap();
+            let runtime = base_runtime.clone().with_model_workflow_policy(policy);
+            for chapter in [false, true] {
+                let mut keys = vec!["webcodex.workflow".to_string()];
+                if chapter {
+                    keys.push(GOAL_WORKFLOW_CONTEXT_KEY.to_string());
+                }
+                let mut result = runtime
+                    .dispatch_with_context(
+                        ToolCall::from_tool_name("list_tools", json!({})).unwrap(),
+                        DispatchContext {
+                            context_request: keys,
+                            ..DispatchContext::internal(None, SessionTransport::Mcp, None)
+                        },
+                    )
+                    .await;
+                assert!(result.success, "{:?}", result.error);
+                let material = context_material(&result, "webcodex.workflow");
+                assert_eq!(material["status"], "available");
+                assert_eq!(
+                    material["projection"]["model_protocol"]["goal_workflow"],
+                    policy.goal_selection_guidance()
+                );
+                for key in ["goal_continuation", "goal_checkpoint"] {
+                    assert!(material["projection"]["model_protocol"].get(key).is_none());
+                }
+                assert_eq!(
+                    result.output["context_projection"]["materials"]
+                        .as_array()
+                        .unwrap()
+                        .len(),
+                    if chapter { 2 } else { 1 }
+                );
+                if chapter {
+                    assert_eq!(
+                        context_material(&result, GOAL_WORKFLOW_CONTEXT_KEY)["projection"],
+                        policy.goal_workflow_projection()
+                    );
+                }
+                result
+                    .output
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("context_projection");
+                if let Some(expected) = &canonical_output {
+                    assert_eq!(&result.output, expected);
+                } else {
+                    canonical_output = Some(result.output);
+                }
+            }
+        }
+    }
+    assert_eq!(
+        base_runtime.model_workflow_policy,
+        ModelWorkflowPolicy::default(),
+        "a request must not rewrite another runtime snapshot"
     );
 }
 
@@ -219,11 +387,13 @@ async fn private_context_marker_requires_explicit_sidecar_capability() {
                 host_file_import_trust: HostFileImportTrust::Untrusted,
             },
             ToolInvocationMetadata {
-                context_request: vec!["webcodex.workflow".to_string()],
+                context_request: vec![
+                    "webcodex.workflow".to_string(),
+                    crate::model_workflow::GOAL_WORKFLOW_CONTEXT_KEY.to_string(),
+                ],
                 ..Default::default()
             },
             ToolProtocolCapabilities {
-                context_continuity: true,
                 context_sidecar: false,
                 ..Default::default()
             },
@@ -234,6 +404,127 @@ async fn private_context_marker_requires_explicit_sidecar_capability() {
     assert!(
         result.output.get("context_projection").is_none(),
         "private wrapper marker must not enable context sidecars on a non-capable surface"
+    );
+}
+
+#[tokio::test]
+async fn work_on_project_static_context_is_explicit_and_primary_output_stays_compact() {
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    std::fs::write(
+        root.path().join("AGENTS.md"),
+        "# Project rules\n\nWORK_ON_PROJECT_CONTEXT_RULE\n",
+    )
+    .unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "context-work-on-project";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+
+    let omitted = dispatch_with_context_and_local_agent(
+        &runtime,
+        client_id,
+        ToolCall::from_tool_name(
+            "work_on_project",
+            json!({
+                "project": project,
+                "instruction": "inspect without repeated static context",
+                "include_extension_catalog": false
+            }),
+        )
+        .unwrap(),
+        Vec::new(),
+    )
+    .await;
+    assert!(omitted.success, "{:?}", omitted.error);
+    assert!(omitted.output.get("context_projection").is_none());
+    assert!(omitted.output.get("workflow").is_none());
+    assert!(omitted.output["instructions"]
+        .get("content_included")
+        .is_none());
+    assert!(omitted.output["instructions"]["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|source| source.get("content").is_none()));
+
+    let requested = dispatch_with_context_and_local_agent(
+        &runtime,
+        client_id,
+        ToolCall::from_tool_name(
+            "work_on_project",
+            json!({
+                "project": project,
+                "instruction": "inspect with requested static context",
+                "include_extension_catalog": false
+            }),
+        )
+        .unwrap(),
+        vec![
+            "project.instructions".to_string(),
+            "webcodex.workflow".to_string(),
+        ],
+    )
+    .await;
+    assert!(requested.success, "{:?}", requested.error);
+    assert!(requested.output.get("workflow").is_none());
+    assert!(requested.output["instructions"]
+        .get("content_included")
+        .is_none());
+
+    let instructions = context_material(&requested, "project.instructions");
+    assert_eq!(instructions["status"], "available");
+    assert_eq!(instructions["projection"]["content_included"], true);
+    assert!(instructions["projection"]
+        .to_string()
+        .contains("WORK_ON_PROJECT_CONTEXT_RULE"));
+
+    let workflow = context_material(&requested, "webcodex.workflow");
+    assert_eq!(workflow["status"], "available");
+    assert_eq!(workflow["projection"]["tool_strategy"]["profile"], "direct");
+    let facts = serde_json::to_value(
+        super::super::model_ergonomics_telemetry::invocation::BootstrapFacts::from_output(
+            &requested.output,
+        ),
+    )
+    .unwrap();
+    assert_eq!(facts["instructions_available"], true);
+    assert_eq!(facts["instructions_content_included"], true);
+    assert_eq!(facts["instructions_truncated"], false);
+    assert_eq!(facts["instruction_source_count"], 1);
+    assert_eq!(facts["workflow_available"], true);
+    assert!(!facts.to_string().contains("WORK_ON_PROJECT_CONTEXT_RULE"));
+}
+
+#[cfg(feature = "experimental-code-mode")]
+#[tokio::test]
+async fn work_on_project_workflow_context_uses_request_local_code_mode_profile() {
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    let runtime = ToolRuntime::new_for_tests();
+    let client_id = "context-work-on-project-code-mode";
+    let project = register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+
+    let result = dispatch_with_context_and_local_agent(
+        &runtime,
+        client_id,
+        ToolCall::from_tool_name(
+            "work_on_project",
+            json!({
+                "project": project,
+                "instruction": "inspect with code mode guidance",
+                "guidance_profile": "code_mode",
+                "include_extension_catalog": false
+            }),
+        )
+        .unwrap(),
+        vec!["webcodex.workflow".to_string()],
+    )
+    .await;
+    assert!(result.success, "{:?}", result.error);
+    assert!(result.output.get("workflow").is_none());
+    assert_eq!(
+        context_material(&result, "webcodex.workflow")["projection"]["tool_strategy"]["profile"],
+        "code_mode"
     );
 }
 
@@ -298,23 +589,22 @@ async fn project_instructions_context_projection_is_authorized_scoped_and_bounde
         .start_session(Some(alpha), Some("cross-project sidecar fence".to_string()));
     let auth = auth_context(None, true);
     let cross_project = runtime
-        .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
+        .dispatch_with_context(
             ToolCall::RunShell {
+                login: false,
                 project: bravo,
                 command: "pwd".to_string(),
                 session_id: Some(session.session_id),
                 timeout_secs: Some(30),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,
             },
-            Some(&auth),
-            SessionTransport::Mcp,
-            Default::default(),
-            None,
-            true,
-            vec!["project.instructions".to_string()],
-            super::super::context_projection::ContextMaterialCapabilities::default(),
+            DispatchContext {
+                context_request: vec!["project.instructions".to_string()],
+                ..DispatchContext::internal(Some(&auth), SessionTransport::Mcp, None)
+            },
         )
         .await;
     assert!(!cross_project.success);
@@ -337,18 +627,15 @@ async fn project_instructions_context_projection_is_authorized_scoped_and_bounde
 
     let auth = auth_context(None, true);
     let wrong_project = runtime
-        .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
+        .dispatch_with_context(
             ToolCall::GitStatus {
                 project: "agent:context-bravo:missing".to_string(),
                 session_id: None,
             },
-            Some(&auth),
-            SessionTransport::Mcp,
-            Default::default(),
-            None,
-            true,
-            vec!["project.instructions".to_string()],
-            super::super::context_projection::ContextMaterialCapabilities::default(),
+            DispatchContext {
+                context_request: vec!["project.instructions".to_string()],
+                ..DispatchContext::internal(Some(&auth), SessionTransport::Mcp, None)
+            },
         )
         .await;
     assert!(!wrong_project.success);
@@ -383,18 +670,15 @@ async fn unavailable_project_instructions_provider_does_not_change_main_success(
         let runtime = runtime.clone();
         async move {
             runtime
-                .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
+                .dispatch_with_context(
                     ToolCall::GitStatus {
                         project,
                         session_id: None,
                     },
-                    Some(&auth),
-                    SessionTransport::Mcp,
-                    Default::default(),
-                    None,
-                    true,
-                    vec!["project.instructions".to_string()],
-                    super::super::context_projection::ContextMaterialCapabilities::default(),
+                    DispatchContext {
+                        context_request: vec!["project.instructions".to_string()],
+                        ..DispatchContext::internal(Some(&auth), SessionTransport::Mcp, None)
+                    },
                 )
                 .await
         }
@@ -481,22 +765,19 @@ async fn mutation_context_projection_is_post_tool_and_does_not_change_authority_
         let project = project.clone();
         async move {
             runtime
-                .dispatch_with_auth_transport_options_and_metadata_with_recording_mode_and_context(
+                .dispatch_with_context(
                     ToolCall::WriteProjectFile {
                         project,
                         path: "written.txt".to_string(),
                         content: "written before sidecar\n".to_string(),
                         session_id: None,
                         overwrite: None,
-                        expected_sha256: None,
+                        expected_read_revision: None,
                     },
-                    Some(&auth),
-                    SessionTransport::Mcp,
-                    Default::default(),
-                    None,
-                    true,
-                    vec!["project.instructions".to_string()],
-                    super::super::context_projection::ContextMaterialCapabilities::default(),
+                    DispatchContext {
+                        context_request: vec!["project.instructions".to_string()],
+                        ..DispatchContext::internal(Some(&auth), SessionTransport::Mcp, None)
+                    },
                 )
                 .await
         }
@@ -549,11 +830,6 @@ async fn mutation_context_projection_is_post_tool_and_does_not_change_authority_
     assert!(result.success, "{:?}", result.error);
     assert_eq!(result.output["permission"]["status"], "auto_approved");
     assert_eq!(result.output["permission"]["risk"], "write");
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
-    assert_eq!(
-        result.output["context_projection"]["applies_to_current_effect"],
-        false
-    );
     assert!(context_material(&result, "project.instructions")
         .to_string()
         .contains("RECOVER_BEFORE_MUTATION"));
@@ -736,7 +1012,54 @@ fn plugins_catalog_selection_projection_has_independent_hard_bound() {
 }
 
 #[tokio::test]
-async fn context_projection_coexists_with_session_continuity_and_attention() {
+async fn workflow_context_uses_mcp_host_profile_only_for_mcp_omission() {
+    let runtime = ToolRuntime::new_for_tests().with_mcp_host_policy(
+        crate::mcp_host::McpHostConfig {
+            profile: crate::mcp_host::McpHostProfile::HostCodeMode,
+            host_budget_secs: None,
+        }
+        .runtime_policy(),
+    );
+    for (transport, expected) in [
+        (ToolTransport::Mcp, "host_code_mode"),
+        (ToolTransport::Api, "direct"),
+    ] {
+        let outcome = runtime
+            .call_tool_with_invocation_metadata(
+                ToolCallRequest {
+                    tool_name: "list_tools".to_string(),
+                    arguments: json!({}),
+                },
+                ToolCallContext {
+                    transport,
+                    session_id: None,
+                    auth: None,
+                    window: None,
+                    record_oauth_scope_denials: false,
+                    host_file_import_trust: HostFileImportTrust::Untrusted,
+                },
+                ToolInvocationMetadata {
+                    context_request: vec!["webcodex.workflow".to_string()],
+                    ..Default::default()
+                },
+                ToolProtocolCapabilities {
+                    context_sidecar: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let result = outcome.result.expect("model-facing result");
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            context_material(&result, "webcodex.workflow")["projection"]["tool_strategy"]
+                ["profile"],
+            expected
+        );
+    }
+}
+
+#[tokio::test]
+async fn context_projection_coexists_without_context_ack_and_with_attention() {
     use crate::tool_runtime::sessions::{
         PostSessionMessageInput, SessionMessageKind, SessionMessagePriority,
     };
@@ -774,11 +1097,10 @@ async fn context_projection_coexists_with_session_continuity_and_attention() {
             },
             ToolInvocationMetadata {
                 context_request: vec!["webcodex.workflow".to_string()],
-                ack_session_context_revision: SessionContextRevisionAck::Revision(0),
+
                 ..Default::default()
             },
             ToolProtocolCapabilities {
-                context_continuity: true,
                 context_sidecar: true,
                 ..Default::default()
             },
@@ -790,7 +1112,6 @@ async fn context_projection_coexists_with_session_continuity_and_attention() {
     assert!(result.output.get("session_continuity").is_none());
     assert!(result.output.get("session_recovery").is_none());
     assert!(result.output["session_attention"]["requires_ack"].as_bool() == Some(true));
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
     assert_eq!(
         context_material(&result, "webcodex.workflow")["status"],
         "available"
@@ -807,4 +1128,354 @@ async fn context_projection_coexists_with_session_continuity_and_attention() {
     assert!(!audit.contains("__webcodex_stateless_context_request"));
     assert!(!audit.contains("context_projection"));
     assert!(!audit.contains("webcodex.coding_workflow"));
+}
+
+async fn configured_instruction_context_fixture(source_count: usize, rich: bool) -> ToolResult {
+    configured_instruction_context_fixture_inner(source_count, rich, false, true).await
+}
+
+async fn configured_instruction_context_fixture_inner(
+    source_count: usize,
+    rich: bool,
+    bootstrap: bool,
+    complete: bool,
+) -> ToolResult {
+    use webcodex_core::project_instructions::{
+        InstructionSourceScope, LoadedInstructionCandidate, ProjectInstructionsSnapshot,
+    };
+    use webcodex_core::runner_instruction::{
+        RunnerInstructionSnapshotResponse, RUNNER_INSTRUCTION_REQUEST_KIND,
+        RUNNER_INSTRUCTION_RESPONSE_FORMAT,
+    };
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    std::fs::write(root.path().join("AGENTS.md"), "local sidecar rule").unwrap();
+    let runtime = ToolRuntime::new_for_tests();
+    register_agent_with_projects(
+        &runtime,
+        "context-global",
+        None,
+        RunnerCapabilities {
+            shell: true,
+            git: true,
+            file_read: true,
+            internal_posix_script: true,
+            instruction_runtime: true,
+            ..Default::default()
+        },
+        vec![registered_project("demo", &root.path().to_string_lossy())],
+    )
+    .await;
+    let project = crate::tool_runtime::runner_project_runtime_id("context-global", "demo");
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_context(
+if bootstrap {
+                        ToolCall::from_tool_name("work_on_project", json!({
+                            "project": project, "instruction": "inspect instructions", "include_extension_catalog": false
+                        })).unwrap()
+                    } else {
+                        ToolCall::GitStatus { project, session_id: None }
+                    },
+DispatchContext {
+context_request: if rich {
+                        vec!["webcodex.workflow".into(), "project.instructions".into()]
+                    } else {
+                        vec!["project.instructions".into()]
+                    },
+..DispatchContext::internal(Some(&auth_context(None, true)), SessionTransport::Mcp, None)
+},
+)
+                .await
+        }
+    });
+    let snapshot = ProjectInstructionsSnapshot::from_candidates(
+        (0..source_count)
+            .map(|index| LoadedInstructionCandidate {
+                source_scope: InstructionSourceScope::Runner,
+                path: format!("runner/{index}/global.md"),
+                content: if rich {
+                    format!("# {}\n", "h".repeat(158)).repeat(6)
+                } else {
+                    "global sidecar rule".into()
+                },
+                total_lines: if rich { 6 } else { 1 },
+                full_sha256: None,
+            })
+            .collect(),
+        true,
+    );
+    let stdout = serde_json::to_string(&RunnerInstructionSnapshotResponse {
+        format: RUNNER_INSTRUCTION_RESPONSE_FORMAT.into(),
+        generation: 1,
+        scan_complete: complete,
+        files: snapshot.files,
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut instruction_reads = 0;
+    while !task.is_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "global context fixture timed out"
+        );
+        if let Some(request) = probe_patch_agent_request(&runtime, "context-global").await {
+            if request.kind == RUNNER_INSTRUCTION_REQUEST_KIND {
+                instruction_reads += 1;
+                complete_patch_agent_request(
+                    &runtime,
+                    "context-global",
+                    &request.request_id,
+                    0,
+                    &stdout,
+                    "",
+                )
+                .await;
+            } else {
+                complete_agent_request_by_running_locally(&runtime, "context-global", request)
+                    .await;
+            }
+        } else {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+    assert_eq!(
+        instruction_reads, 1,
+        "bootstrap and context must share the observation"
+    );
+    task.await.unwrap()
+}
+
+#[tokio::test]
+async fn project_instructions_context_includes_runner_global_sources() {
+    let result = configured_instruction_context_fixture(1, false).await;
+    assert!(result.success, "{:?}", result.error);
+    let material = context_material(&result, "project.instructions");
+    assert_eq!(material["status"], "available");
+    assert_eq!(
+        material["projection"]["sources"][0]["content"],
+        "global sidecar rule"
+    );
+    assert!(material["projection"]["sources"][0]["read_more"].is_null());
+    assert_eq!(
+        material["projection"]["sources"][1]["content"],
+        "local sidecar rule"
+    );
+}
+
+#[tokio::test]
+async fn maximum_runner_sources_fit_shared_context_budget_without_losing_project_rules() {
+    let result = configured_instruction_context_fixture(16, true).await;
+    assert!(result.success, "{:?}", result.error);
+    let context = &result.output["context_projection"];
+    assert!(
+        serde_json::to_vec(context).unwrap().len()
+            <= super::super::context_projection::MAX_CONTEXT_PROJECTION_BYTES
+    );
+    assert_eq!(
+        context_material(&result, "webcodex.workflow")["status"],
+        "available"
+    );
+    let material = context_material(&result, "project.instructions");
+    assert_eq!(material["status"], "available");
+    let sources = material["projection"]["sources"].as_array().unwrap();
+    assert_eq!(sources.len(), 17);
+    assert!(sources[..16]
+        .iter()
+        .all(|source| source["read_more"].is_null()));
+    assert_eq!(sources[16]["content"], "local sidecar rule");
+}
+
+#[tokio::test]
+async fn bootstrap_context_reuses_complete_and_incomplete_instruction_observations() {
+    for complete in [true, false] {
+        let result = configured_instruction_context_fixture_inner(1, false, true, complete).await;
+        assert!(result.success, "{:?}", result.error);
+        assert_eq!(
+            result.output["resolved_project"],
+            "agent:context-global:demo"
+        );
+        let material = context_material(&result, "project.instructions");
+        assert_eq!(
+            material["status"],
+            if complete { "available" } else { "unavailable" }
+        );
+        if !complete {
+            assert_eq!(
+                material["reason_code"],
+                "project_instructions_observation_incomplete"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_instruction_snapshot_does_not_bypass_material_scope() {
+    let runtime = ToolRuntime::new_for_tests();
+    let root = tempfile::tempdir().unwrap();
+    let project =
+        register_runner_project_at_path(&runtime, "bootstrap-scope", "demo", root.path()).await;
+    let mut auth = auth_context(None, true);
+    let resolved = runtime
+        .resolve_project_input_for_auth(&project, Some(&auth))
+        .await
+        .unwrap();
+    auth = auth_context(None, false);
+    auth.scopes.clear();
+    let snapshot =
+        webcodex_core::project_instructions::ProjectInstructionsSnapshot::from_candidates(
+            vec![
+                webcodex_core::project_instructions::LoadedInstructionCandidate {
+                    source_scope:
+                        webcodex_core::project_instructions::InstructionSourceScope::Project,
+                    path: "AGENTS.md".into(),
+                    content: "PRIVATE_BOOTSTRAP_RULE".into(),
+                    total_lines: 1,
+                    full_sha256: None,
+                },
+            ],
+            true,
+        );
+    let mut result = ToolResult::ok(json!({}));
+    runtime
+        .add_requested_context_projection_with_guidance(
+            &mut result,
+            crate::tool_runtime::context_projection::ContextProjectionRequest {
+                prefer_full_instruction_content: false,
+                requested: &["project.instructions".into()],
+                resolved_project: Some(&resolved),
+                auth: Some(&auth),
+                capabilities: Default::default(),
+                guidance_profile: Default::default(),
+                window: None,
+                instructions: Some(&snapshot),
+            },
+        )
+        .await;
+    assert_eq!(
+        context_material(&result, "project.instructions")["status"],
+        "unavailable"
+    );
+    assert!(!result.output.to_string().contains("PRIVATE_BOOTSTRAP_RULE"));
+}
+
+#[tokio::test]
+async fn bootstrap_explicit_context_refresh_is_not_suppressed_by_window_or_session() {
+    let root = tempfile::tempdir().unwrap();
+    init_git_repo(root.path());
+    let runtime = ToolRuntime::new_for_tests();
+    let client = "context-refresh";
+    let project = register_runner_project_at_path(&runtime, client, "demo", root.path()).await;
+    let mut session_id = None;
+    // Same body after context loss, then changed instructions, all in the same Window/Session.
+    for body in ["INITIAL_RULE", "INITIAL_RULE", "CHANGED_RULE"] {
+        std::fs::write(root.path().join("AGENTS.md"), body).unwrap();
+        let result = dispatch_with_context_in_window_and_local_agent(
+            &runtime,
+            client,
+            ToolCall::from_tool_name(
+                "work_on_project",
+                json!({
+                    "project": project, "instruction": "refresh required context",
+                    "session_id": session_id, "include_extension_catalog": false,
+                }),
+            )
+            .unwrap(),
+            vec!["project.instructions".into(), "webcodex.workflow".into()],
+            Some("retained-window"),
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        let current_session = result.output["session_id"].as_str().unwrap().to_string();
+        if let Some(previous) = &session_id {
+            assert_eq!(previous, &current_session);
+        }
+        session_id = Some(current_session);
+        let instructions = context_material(&result, "project.instructions");
+        assert_eq!(instructions["status"], "available");
+        assert_eq!(instructions["projection"]["content_included"], true);
+        assert!(instructions["projection"].to_string().contains(body));
+        assert_eq!(
+            context_material(&result, "webcodex.workflow")["status"],
+            "available"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bootstrap_project_switch_and_return_keep_context_requests_explicit() {
+    let runtime = ToolRuntime::new_for_tests();
+    let a = tempfile::tempdir().unwrap();
+    let b = tempfile::tempdir().unwrap();
+    for (root, rule) in [(a.path(), "PROJECT_A_RULE"), (b.path(), "PROJECT_B_RULE")] {
+        init_git_repo(root);
+        std::fs::write(root.join("AGENTS.md"), rule).unwrap();
+    }
+    let project_a = register_runner_project_at_path(&runtime, "switch-a", "a", a.path()).await;
+    let project_b = register_runner_project_at_path(&runtime, "switch-b", "b", b.path()).await;
+    // Fresh A, another task in retained A, first B with retained global workflow, return to A.
+    // Catalog behavior is covered independently by the startup discovery fixture.
+    for (client, project, keys, expected_rule) in [
+        (
+            "switch-a",
+            &project_a,
+            vec!["project.instructions", "webcodex.workflow"],
+            Some("PROJECT_A_RULE"),
+        ),
+        ("switch-a", &project_a, vec![], None),
+        (
+            "switch-b",
+            &project_b,
+            vec!["project.instructions"],
+            Some("PROJECT_B_RULE"),
+        ),
+        ("switch-a", &project_a, vec![], None),
+    ] {
+        let result = dispatch_with_context_in_window_and_local_agent(
+            &runtime,
+            client,
+            ToolCall::from_tool_name(
+                "work_on_project",
+                json!({
+                    "project": project, "instruction": "work in selected project",
+                    "include_extension_catalog": false,
+                }),
+            )
+            .unwrap(),
+            keys.iter().map(|key| (*key).to_string()).collect(),
+            Some("project-switch-window"),
+        )
+        .await;
+        assert!(result.success, "{:?}", result.error);
+        if let Some(rule) = expected_rule {
+            let material = context_material(&result, "project.instructions");
+            assert_eq!(material["status"], "available");
+            assert_eq!(material["projection"]["content_included"], true);
+            let body = material["projection"].to_string();
+            assert!(body.contains(rule));
+            let other_rule = if rule == "PROJECT_A_RULE" {
+                "PROJECT_B_RULE"
+            } else {
+                "PROJECT_A_RULE"
+            };
+            assert!(!body.contains(other_rule));
+        } else {
+            assert!(result.output.get("context_projection").is_none());
+            assert!(!result.output.to_string().contains("PROJECT_A_RULE"));
+            assert!(!result.output.to_string().contains("PROJECT_B_RULE"));
+        }
+        if keys.contains(&"webcodex.workflow") {
+            assert_eq!(
+                context_material(&result, "webcodex.workflow")["status"],
+                "available"
+            );
+        } else {
+            assert!(!result
+                .output
+                .to_string()
+                .contains("webcodex.coding_workflow"));
+        }
+    }
 }

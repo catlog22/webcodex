@@ -8,6 +8,7 @@ use crate::db::{
     ProjectMemoryScopeRecord, MAX_MEMORIES_GLOBAL, MAX_MEMORY_BOOTSTRAP_BYTES,
     MAX_MEMORY_SCOPE_LIST_LIMIT, MAX_MEMORY_SEARCH_LIMIT, MAX_MEMORY_SEARCH_RESULT_BYTES,
 };
+use crate::json_measurement::serialized_json_len;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -34,7 +35,10 @@ fn memory_scope_id_from_parts(project_runtime_id: &str, client_id: &str, root: &
     ] {
         memory_hash_field(&mut hasher, value);
     }
-    format!("wc_memscope_{:x}", hasher.finalize())
+    format!(
+        "wc_memscope_{}",
+        webcodex_core::compact::encode(hasher.finalize())
+    )
 }
 
 pub(crate) fn memory_scope_id(project: &ResolvedProject) -> String {
@@ -49,7 +53,10 @@ pub(crate) fn memory_root_fingerprint(root: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"webcodex-project-memory-root-v1\0");
     memory_hash_field(&mut hasher, root.as_bytes());
-    format!("wc_memroot_{:x}", hasher.finalize())
+    format!(
+        "wc_memroot_{}",
+        webcodex_core::compact::encode(hasher.finalize())
+    )
 }
 
 fn memory_scope_attribution(project: &ResolvedProject) -> MemoryScopeAttribution {
@@ -329,8 +336,8 @@ impl ToolRuntime {
                 "truncated": true,
                 "memories": candidate,
             });
-            if serde_json::to_vec(&probe)
-                .map(|bytes| bytes.len() <= MAX_MEMORY_SEARCH_RESULT_BYTES)
+            if serialized_json_len(&probe)
+                .map(|bytes| bytes <= MAX_MEMORY_SEARCH_RESULT_BYTES)
                 .unwrap_or(false)
             {
                 returned.push(descriptor);
@@ -720,8 +727,8 @@ impl ToolRuntime {
                 "truncated": candidate.len() < total_count,
                 "memories": candidate,
             });
-            if serde_json::to_vec(&projection)
-                .map(|bytes| bytes.len() <= MAX_MEMORY_BOOTSTRAP_BYTES)
+            if serialized_json_len(&projection)
+                .map(|bytes| bytes <= MAX_MEMORY_BOOTSTRAP_BYTES)
                 .unwrap_or(false)
             {
                 memories.push(descriptor);
@@ -739,8 +746,8 @@ impl ToolRuntime {
             "memories": memories,
         });
         debug_assert!(
-            serde_json::to_vec(&projection)
-                .map(|bytes| bytes.len() <= MAX_MEMORY_BOOTSTRAP_BYTES)
+            serialized_json_len(&projection)
+                .map(|bytes| bytes <= MAX_MEMORY_BOOTSTRAP_BYTES)
                 .unwrap_or(false),
             "memory.bootstrap projection must remain independently bounded"
         );
@@ -780,11 +787,14 @@ mod tests {
     #[test]
     fn incomplete_bounded_inventory_never_proves_not_current() {
         let attributed = ProjectMemoryScopeRecord {
-            memory_scope_id: format!("wc_memscope_{}", "a".repeat(64)),
+            memory_scope_id: format!("wc_memscope_{}", webcodex_core::compact::encode([0xaa; 32])),
             identity_state: "attributed".to_string(),
             project_runtime_id: Some("agent:runner:demo".to_string()),
             runner_client_id: Some("runner".to_string()),
-            root_fingerprint: Some(format!("wc_memroot_{}", "b".repeat(64))),
+            root_fingerprint: Some(format!(
+                "wc_memroot_{}",
+                webcodex_core::compact::encode([0xbb; 32])
+            )),
             created_at_unix_ms: 1,
             last_mutated_at_unix_ms: 1,
         };
@@ -798,7 +808,7 @@ mod tests {
     #[test]
     fn body_match_is_discoverable_without_body_projection() {
         let record = ProjectMemoryRecord {
-            memory_id: "wc_mem_0123456789abcdef0123456789abcdef".to_string(),
+            memory_id: "wc_mem_iavN7wEjRWeJq83v".to_string(),
             memory_key: "policy".to_string(),
             summary: "release guidance".to_string(),
             body: "Use hidden canary phrase".to_string(),
@@ -811,7 +821,7 @@ mod tests {
             updated_by_kind: "test".to_string(),
             updated_by_principal_digest: Some(format!("wc_memprincipal_{}", "1".repeat(64))),
             generation: 1,
-            revision: format!("wc_memrev_{}", "a".repeat(64)),
+            revision: format!("wc_memrev_{}", webcodex_core::compact::encode([0xaa; 32])),
             created_at_unix_ms: 1,
             updated_at_unix_ms: 1,
         };

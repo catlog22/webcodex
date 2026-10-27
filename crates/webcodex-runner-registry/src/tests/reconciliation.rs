@@ -1,4 +1,4 @@
-use super::job_updates::{ShellJobStartMetadata, StructuredJobExecution};
+use super::job_updates::{JobShellTarget, JobStartContext, JobStartExecution, JobStartRequest, JobValidationCorrelation, JobValidationPlan};
 use super::reconciliation::{
     reconcile_inventory_locked, recovery_timeout_sweep, validate_job_inventory,
     validate_job_inventory_without_project_membership, RECOVERY_SWEEP_PASS_CAP,
@@ -9,7 +9,7 @@ use super::state::{
 };
 use super::{
     clamp_grace, job_recovery_grace_secs, now_ts, RunnerRegistry, RUNNER_ONLINE_WINDOW_SECS,
-    JOB_RECOVERY_GRACE_SECS, LIVE_JOB_STREAM_RETENTION_BYTES,
+    JOB_RECOVERY_GRACE_MAX_SECS, JOB_RECOVERY_GRACE_SECS, LIVE_JOB_STREAM_RETENTION_BYTES,
 };
 use webcodex_core::runner_operation::{
     RunnerInvocationMetadata, RunnerJobOperation, RunnerOperation,
@@ -18,18 +18,20 @@ use crate::runner_protocol::{
     PersistentShellResult, RunnerJobUpdateRequest, RunnerPollRequest,
     RunnerProjectSummary, RunnerRequest, RunnerCapabilities,
     RunnerRegisterRequest, ShellCommandExecutionState, ShellJobContext, ShellJobInventory,
-    ShellJobLogSnapshot, ShellJobOpRequest, ShellJobSnapshot, ShellJobStreamSnapshot,
-    ShellJobValidationMetadata, ShellJobValidationProgress, ShellJobValidationStep,
+    ShellJobLogSnapshot, ShellJobSnapshot, ShellJobStreamSnapshot,
+    ShellJobTestCountEvidence, ShellJobValidationMetadata, ShellJobValidationProgress,
+    ShellJobValidationStep,
     ShellProcessArgv, ShellScriptLanguage, ShellScriptPayload, JOB_INVENTORY_MAX_TERMINAL_JOBS,
-    JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS,
+    JOB_SNAPSHOT_STREAM_MAX_BYTES, JOB_TERMINAL_RETENTION_SECS, PROCESS_TIMEOUT_MAX_SECS,
 };
+use webcodex_core::validation_evidence::CargoTestCountEvidenceStatus;
 
 const CLIENT_ID: &str = "oe";
 const INSTANCE_A: &str = "instance-reconcile-a";
 const INSTANCE_B: &str = "instance-reconcile-b";
 const PROJECT_ID: &str = "demo";
 const RUNTIME_PROJECT_ID: &str = "agent:oe:demo";
-const SESSION_ID: &str = "wc_sess_job_reconciliation";
+const SESSION_ID: &str = "wc_sess_QGd6iAa67eC56FwA";
 
 fn reconciliation_capabilities() -> RunnerCapabilities {
     RunnerCapabilities {
@@ -43,6 +45,7 @@ fn reconciliation_capabilities() -> RunnerCapabilities {
         structured_cargo_test_count_assertion: true,
         structured_cargo_test_execution_policy: true,
         structured_cargo_test_lib: true,
+        structured_cargo_check_packages: true,
         job_state_reconciliation: true,
         coding_agent_runs: false,
         ..Default::default()
@@ -80,6 +83,7 @@ fn empty_inventory() -> ShellJobInventory {
 
 fn register_request(instance: &str, inventory: ShellJobInventory) -> RunnerRegisterRequest {
     crate::test_support::current_runner_registration(RunnerRegisterRequest {
+        computer_session_availability: None,
         client_id: CLIENT_ID.to_string(),
         runner_instance_id: instance.to_string(),
         runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -105,41 +109,49 @@ async fn register(registry: &RunnerRegistry, instance: &str, inventory: ShellJob
         .unwrap();
 }
 
-fn start_request(command: &str) -> ShellJobOpRequest {
-    ShellJobOpRequest {
-        op: "start".to_string(),
-        client_id: Some(CLIENT_ID.to_string()),
+fn execution_start_request(execution: JobStartExecution) -> JobStartRequest {
+    JobStartRequest {
         cwd: Some("/srv/demo".to_string()),
-        command: Some(command.to_string()),
-        timeout_secs: Some(120),
-        job_id: None,
-        since_stdout_line: None,
-        since_stderr_line: None,
-        tail_lines: None,
-        limit: None,
-        codex: None,
+        ..JobStartRequest::new(CLIENT_ID, execution)
     }
 }
 
-fn cargo_validation_start_metadata(
+fn start_request(command: &str) -> JobStartRequest {
+    execution_start_request(JobStartExecution::Shell {
+        command: command.to_string(), target: JobShellTarget::default(),
+    })
+}
+
+fn validation_start_request(metadata: ShellJobValidationMetadata, purpose: &str) -> JobStartRequest {
+    JobStartRequest {
+        context: JobStartContext {
+            project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+            session_id: Some(SESSION_ID.to_string()),
+            project_cwd: Some("/srv/demo".to_string()),
+            purpose: Some(purpose.to_string()),
+            shell: Some("direct_argv".to_string()),
+            visibility: ShellJobVisibility::Public,
+        },
+        ..execution_start_request(JobStartExecution::Validation {
+            plan: JobValidationPlan::Metadata(metadata), ssh_resource: None,
+        })
+    }
+}
+
+fn cargo_validation_metadata(
     require_tests: Option<bool>,
     no_run: Option<bool>,
     minimum_tests: Option<u64>,
-) -> ShellJobStartMetadata {
+) -> ShellJobValidationMetadata {
     let step = ShellJobValidationStep {
         name: "test".to_string(),
         program: "cargo".to_string(),
         args: vec!["test".to_string(), "focused".to_string()],
         env: Vec::new(),
     };
-    ShellJobStartMetadata {
-        project_id: Some(RUNTIME_PROJECT_ID.to_string()),
-        session_id: Some(SESSION_ID.to_string()),
-        project_cwd: Some("/srv/demo".to_string()),
-        purpose: Some("test".to_string()),
-        shell: Some("direct_argv".to_string()),
-        validation_steps: vec![step.clone()],
-        validation: Some(ShellJobValidationMetadata {
+    ShellJobValidationMetadata {
+            project_validation: None,
+            source_fence: None,
             tool: "cargo_test".to_string(),
             kind: "test".to_string(),
             steps: vec![step],
@@ -150,23 +162,91 @@ fn cargo_validation_start_metadata(
             minimum_tests,
             require_tests,
             no_run,
-        }),
-        visibility: ShellJobVisibility::Public,
-        ..Default::default()
-    }
+        }
 }
 
-fn cargo_lib_validation_start_metadata() -> ShellJobStartMetadata {
-    let mut metadata = cargo_validation_start_metadata(None, None, None);
-    for step in &mut metadata.validation_steps {
+
+
+fn go_project_validation_metadata() -> ShellJobValidationMetadata {
+    use webcodex_core::project_validation::{
+        ProjectValidationAction, ProjectValidationAdapter, ProjectValidationProvenance,
+        ProjectValidationRequest,
+    };
+
+    let step = ShellJobValidationStep {
+        name: "check".to_string(),
+        program: "go".to_string(),
+        args: vec!["vet".to_string(), "./...".to_string()],
+        env: Vec::new(),
+    };
+    ShellJobValidationMetadata {
+            project_validation: Some(ProjectValidationProvenance {
+                request: ProjectValidationRequest {
+                    project_id: "demo".into(),
+                    cwd: None,
+                    action: ProjectValidationAction::Check,
+                    adapter: ProjectValidationAdapter::Go,
+                    scope: None,
+                    dependency_policy: None,
+                    dependency_resolution_policy: None,
+                    test: None,
+                },
+                backend: "go".into(),
+                recipe_root: ".".into(),
+                root_digest: "a".repeat(64),
+                manifest_digest: "b".repeat(64),
+                invocation_digest: "c".repeat(64),
+            }),
+            source_fence: None,
+            tool: "project_validate".to_string(),
+            kind: "check".to_string(),
+            steps: vec![step],
+            effective_timeout_secs: 600,
+            sync_wait_secs: 1,
+            adapter: "go_vet".to_string(),
+            validation_target_id: Some("target:2123456789abcdef01234567".to_string()),
+            minimum_tests: None,
+            require_tests: None,
+            no_run: None,
+        }
+}
+
+fn cargo_lib_validation_metadata() -> ShellJobValidationMetadata {
+    let mut metadata = cargo_validation_metadata(None, None, None);
+    for step in &mut metadata.steps {
         step.args.push("--lib".to_string());
     }
-    if let Some(validation) = metadata.validation.as_mut() {
-        for step in &mut validation.steps {
-            step.args.push("--lib".to_string());
-        }
-    }
     metadata
+}
+
+fn multi_package_cargo_check_metadata() -> ShellJobValidationMetadata {
+    let step = ShellJobValidationStep {
+        name: "check".to_string(),
+        program: "cargo".to_string(),
+        args: vec![
+            "check".to_string(),
+            "--all-targets".to_string(),
+            "-p".to_string(),
+            "package-a".to_string(),
+            "-p".to_string(),
+            "package-b".to_string(),
+        ],
+        env: Vec::new(),
+    };
+    ShellJobValidationMetadata {
+            project_validation: None,
+            source_fence: None,
+            tool: "cargo_check".to_string(),
+            kind: "check".to_string(),
+            steps: vec![step],
+            effective_timeout_secs: 600,
+            sync_wait_secs: 1,
+            adapter: "cargo_check".to_string(),
+            validation_target_id: Some("target:1123456789abcdef01234567".to_string()),
+            minimum_tests: None,
+            require_tests: None,
+            no_run: None,
+        }
 }
 
 async fn start_and_take_over(
@@ -177,18 +257,17 @@ async fn start_and_take_over(
     crate::runner_protocol::RunnerRequest,
 ) {
     let job = registry
-        .start_job_with_metadata(
-            start_request("printf 'one\\ntwo\\n'; sleep 30"),
-            "tester".to_string(),
-            ShellJobStartMetadata {
-                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
-                session_id: Some(SESSION_ID.to_string()),
-                project_cwd: Some("/srv/demo".to_string()),
-                purpose: Some("test".to_string()),
-                shell: Some("bash".to_string()),
-                ..Default::default()
-            },
-        )
+        .start_job(JobStartRequest {
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("test".to_string()),
+    shell: Some("bash".to_string()),
+    ..Default::default()
+},
+    ..start_request("printf 'one\\ntwo\\n'; sleep 30")
+}, "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry
@@ -248,6 +327,9 @@ fn snapshot_from_request(
         stdout,
         stderr: ShellJobStreamSnapshot::default(),
         validation_progress: None,
+        test_count_evidence: None,
+        format_mutation: None,
+        build_artifacts: None,
         activity: None,
     }
 }
@@ -269,14 +351,15 @@ fn update(
         status: status.to_string(),
         stdout_chunk: stdout_chunk.map(str::to_string),
         stderr_chunk: None,
-        stdout_tail: None,
-        stderr_tail: None,
         log_snapshot: None,
         exit_code: finished.then_some(0),
         duration_ms: finished.then_some(2_000),
         error: None,
         command_execution_state: None,
         validation_progress: None,
+        test_count_evidence: None,
+        format_mutation: None,
+        build_artifacts: None,
         activity: None,
         finished,
     }
@@ -354,7 +437,7 @@ async fn terminal_protocol_violation_during_recovery_keeps_execution_terminal_au
 }
 
 #[tokio::test]
-async fn validation_progress_accepts_coalesced_sequence_gaps_without_skipping_steps() {
+async fn validation_progress_accepts_sequence_only_heartbeats_and_coalesced_gaps() {
     let registry = RunnerRegistry::default();
     register(&registry, INSTANCE_A, empty_inventory()).await;
     let steps = vec![
@@ -378,19 +461,17 @@ async fn validation_progress_accepts_coalesced_sequence_gaps_without_skipping_st
         },
     ];
     let job = registry
-        .start_job_with_metadata(
-            start_request("validation"),
-            "tester".to_string(),
-            ShellJobStartMetadata {
-                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
-                session_id: Some(SESSION_ID.to_string()),
-                project_cwd: Some("/srv/demo".to_string()),
-                purpose: Some("validation".to_string()),
-                shell: Some("bash".to_string()),
-                validation_steps: steps,
-                ..Default::default()
-            },
-        )
+        .start_job(JobStartRequest {
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("validation".to_string()),
+    shell: Some("bash".to_string()),
+    ..Default::default()
+},
+    ..execution_start_request(JobStartExecution::Validation { plan: JobValidationPlan::Steps(steps), ssh_resource: None })
+}, "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry
@@ -427,8 +508,6 @@ async fn validation_progress_accepts_coalesced_sequence_gaps_without_skipping_st
             status: status.to_string(),
             stdout_chunk: None,
             stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
             log_snapshot: None,
             exit_code: finished.then_some(0),
             duration_ms: finished.then_some(2_000),
@@ -439,13 +518,33 @@ async fn validation_progress_accepts_coalesced_sequence_gaps_without_skipping_st
                 current_step: current_step.map(str::to_string),
                 failed_step: None,
             }),
+            test_count_evidence: None,
+            format_mutation: None,
+            build_artifacts: None,
             activity,
             finished,
         }
     };
 
+    registry
+        .update_job(validation_update(2, "running", 0, Some("format"), false))
+        .await
+        .unwrap();
+    let mut heartbeat = validation_update(3, "running", 0, Some("format"), false);
+    heartbeat.activity = None;
+    let heartbeat_view = registry.update_job(heartbeat).await.unwrap();
+    assert_eq!(heartbeat_view.status, "running");
+    assert_eq!(heartbeat_view.last_update_seq, Some(3));
+    assert_eq!(
+        heartbeat_view.validation_progress,
+        Some(ShellJobValidationProgress {
+            completed: 0,
+            current_step: Some("format".to_string()),
+            failed_step: None,
+        })
+    );
+
     for update in [
-        validation_update(2, "running", 0, Some("format"), false),
         validation_update(37, "running", 1, Some("check"), false),
         validation_update(81, "running", 2, Some("test"), false),
     ] {
@@ -503,11 +602,7 @@ async fn old_count_capable_runner_accepts_cargo_validation_without_explicit_exec
     registry.register(registration).await.unwrap();
 
     registry
-        .start_job_with_metadata(
-            start_request("validation"),
-            "tester".to_string(),
-            cargo_validation_start_metadata(None, None, None),
-        )
+        .start_job(validation_start_request(cargo_validation_metadata(None, None, None), "test"), "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry
@@ -519,6 +614,69 @@ async fn old_count_capable_runner_accepts_cargo_validation_without_explicit_exec
         .unwrap()
         .expect("compatible Cargo validation request");
     assert_eq!(request.kind, "start_validation_job");
+}
+
+
+
+#[tokio::test]
+async fn go_project_validation_is_fenced_again_at_job_admission() {
+    for supported in [false, true] {
+        let registry = RunnerRegistry::default();
+        let mut registration = register_request(INSTANCE_A, empty_inventory());
+        registration.capabilities.project_validation_v1 = true;
+        registration.capabilities.project_go_single_module_v1 = supported;
+        registry.register(registration).await.unwrap();
+
+        let metadata = go_project_validation_metadata();
+        assert!(metadata.is_valid());
+        let result = registry
+            .start_job(validation_start_request(metadata, "validation"), "tester".to_string(), None, None)
+            .await;
+
+        if supported {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.to_string().starts_with("capability_unavailable:"), "{error}");
+            assert!(error.to_string().contains(&format!("Runner `{CLIENT_ID}`")), "{error}");
+            assert!(error.to_string().contains("project_go_single_module_v1"), "{error}");
+            assert!(error.to_string().contains("upgrade that Runner"), "{error}");
+            assert!(registry.list_jobs(Some(10)).await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn project_test_options_are_fenced_again_at_job_admission() {
+    use webcodex_core::project_validation::*;
+    for supported in [false, true] {
+        let registry = RunnerRegistry::default();
+        let mut registration = register_request(INSTANCE_A, empty_inventory());
+        registration.capabilities.project_validation_v1 = true;
+        registration.capabilities.project_validation_test_options_v1 = supported;
+        registry.register(registration).await.unwrap();
+        let mut metadata = cargo_validation_metadata(Some(true), None, Some(3));
+        let validation = &mut metadata;
+        validation.tool = "project_validate".into();
+        validation.project_validation = Some(ProjectValidationProvenance {
+            request:ProjectValidationRequest {project_id:"demo".into(),cwd:None,action:ProjectValidationAction::Test,
+                adapter:ProjectValidationAdapter::Rust,scope:None,dependency_policy:None,
+                dependency_resolution_policy: None,
+                test:Some(ProjectValidationTestOptions {filter:Some("focused".into()),min_tests:Some(3),require_tests:None})},
+            backend:"rust".into(),recipe_root:".".into(),root_digest:"a".repeat(64),manifest_digest:"b".repeat(64),invocation_digest:"c".repeat(64),
+        });
+        assert!(validation.is_valid());
+        let result = registry.start_job(validation_start_request(metadata, "test"), "tester".into(), None, None).await;
+        if supported { assert!(result.is_ok(), "{result:?}"); }
+        else {
+            let error = result.unwrap_err();
+            assert!(error.to_string().starts_with("capability_unavailable:"), "{error}");
+            assert!(error.to_string().contains(&format!("Runner `{CLIENT_ID}`")), "{error}");
+            assert!(error.to_string().contains("project_validation_test_options_v1"), "{error}");
+            assert!(error.to_string().contains("upgrade that Runner"), "{error}");
+            assert!(registry.list_jobs(Some(10)).await.is_empty());
+        }
+    }
 }
 
 #[tokio::test]
@@ -539,15 +697,11 @@ async fn old_count_capable_runner_fails_closed_on_explicit_cargo_execution_polic
         registry.register(registration).await.unwrap();
 
         let error = registry
-            .start_job_with_metadata(
-                start_request("validation"),
-                "tester".to_string(),
-                cargo_validation_start_metadata(require_tests, no_run, minimum_tests),
-            )
+            .start_job(validation_start_request(cargo_validation_metadata(require_tests, no_run, minimum_tests), "test"), "tester".to_string(), None, None)
             .await
             .unwrap_err();
         assert!(
-            error.contains("structured_cargo_test_execution_policy_unavailable"),
+            error.to_string().contains("structured_cargo_test_execution_policy_unavailable"),
             "case={label} error={error}"
         );
         assert!(registry.list_jobs(Some(100)).await.is_empty(), "case={label}");
@@ -563,15 +717,30 @@ async fn old_structured_runner_fails_closed_on_cargo_test_lib_selector() {
     registry.register(registration).await.unwrap();
 
     let error = registry
-        .start_job_with_metadata(
-            start_request("validation"),
-            "tester".to_string(),
-            cargo_lib_validation_start_metadata(),
-        )
+        .start_job(validation_start_request(cargo_lib_validation_metadata(), "test"), "tester".to_string(), None, None)
         .await
         .unwrap_err();
     assert!(
-        error.contains("structured_cargo_test_lib_unavailable"),
+        error.to_string().contains("structured_cargo_test_lib_unavailable"),
+        "error={error}"
+    );
+    assert!(registry.list_jobs(Some(100)).await.is_empty());
+}
+
+#[tokio::test]
+async fn old_structured_runner_fails_closed_on_multi_package_cargo_check() {
+    let registry = RunnerRegistry::default();
+    let mut registration = register_request(INSTANCE_A, empty_inventory());
+    registration.capabilities.structured_cargo_check_packages = false;
+    assert!(registration.capabilities.structured_validation_argv);
+    registry.register(registration).await.unwrap();
+
+    let error = registry
+        .start_job(validation_start_request(multi_package_cargo_check_metadata(), "validation"), "tester".to_string(), None, None)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("structured_cargo_check_packages_unavailable"),
         "error={error}"
     );
     assert!(registry.list_jobs(Some(100)).await.is_empty());
@@ -582,11 +751,7 @@ async fn cargo_execution_policy_survives_inventory_roundtrip_and_server_restart(
     let registry_a = RunnerRegistry::default();
     register(&registry_a, INSTANCE_A, empty_inventory()).await;
     let job = registry_a
-        .start_job_with_metadata(
-            start_request("validation"),
-            "tester".to_string(),
-            cargo_validation_start_metadata(Some(false), None, None),
-        )
+        .start_job(validation_start_request(cargo_validation_metadata(Some(false), None, None), "test"), "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry_a
@@ -640,17 +805,19 @@ async fn cargo_test_count_assertion_survives_inventory_roundtrip_and_server_rest
     };
     let target = "target:0123456789abcdef01234567";
     let job = registry_a
-        .start_job_with_metadata(
-            start_request("validation"),
-            "tester".to_string(),
-            ShellJobStartMetadata {
-                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
-                session_id: Some(SESSION_ID.to_string()),
-                project_cwd: Some("/srv/demo".to_string()),
-                purpose: Some("test".to_string()),
-                shell: Some("direct_argv".to_string()),
-                validation_steps: vec![step.clone()],
-                validation: Some(ShellJobValidationMetadata {
+        .start_job(JobStartRequest {
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("test".to_string()),
+    shell: Some("direct_argv".to_string()),
+    visibility: ShellJobVisibility::Public,
+    ..Default::default()
+},
+    ..execution_start_request(JobStartExecution::Validation { plan: JobValidationPlan::Metadata(ShellJobValidationMetadata {
+                    project_validation: None,
+                    source_fence: None,
                     tool: "cargo_test".to_string(),
                     kind: "test".to_string(),
                     steps: vec![step],
@@ -661,11 +828,8 @@ async fn cargo_test_count_assertion_survives_inventory_roundtrip_and_server_rest
                     minimum_tests: Some(6),
                     require_tests: None,
                     no_run: None,
-                }),
-                visibility: ShellJobVisibility::Public,
-                ..Default::default()
-            },
-        )
+                }), ssh_resource: None })
+}, "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry_a
@@ -689,21 +853,23 @@ async fn cargo_test_count_assertion_survives_inventory_roundtrip_and_server_rest
     let mut snapshot = snapshot_from_request(
         &job,
         &request,
-        "running",
+        "completed",
         2,
-        stream("running 4 tests\n", 1, false),
+        stream("retained tail after truncation\n", 42, true),
     );
     snapshot.validation_progress = Some(ShellJobValidationProgress {
-        completed: 0,
-        current_step: Some("test".to_string()),
+        completed: 1,
+        current_step: None,
         failed_step: None,
     });
-    snapshot.activity = Some(crate::runner_protocol::ShellJobActivity {
-        state: crate::runner_protocol::ShellJobActivityState::Working,
-        phase: crate::runner_protocol::ShellJobActivityPhase::ValidationTest,
-        source: crate::runner_protocol::ShellJobActivitySource::ValidationPlan,
+    snapshot.test_count_evidence = Some(ShellJobTestCountEvidence {
+            tests_passed: None,
+            tests_failed: None,
+        tests_detected: true,
+        tests_run_count: Some(6),
+        status: CargoTestCountEvidenceStatus::CompleteSummary,
     });
-    let expected_activity = snapshot.activity;
+    let expected_evidence = snapshot.test_count_evidence.clone();
     let inventory: ShellJobInventory = serde_json::from_value(
         serde_json::to_value(ShellJobInventory {
             active_complete: true,
@@ -721,8 +887,10 @@ async fn cargo_test_count_assertion_survives_inventory_roundtrip_and_server_rest
         restored_validation.validation_target_id.as_deref(),
         Some(target)
     );
-    assert_eq!(restored.status, "running");
-    assert_eq!(restored.activity, expected_activity);
+    assert_eq!(restored.status, "completed");
+    assert!(restored.stdout_log_truncated);
+    assert_eq!(restored.stdout_retained_from_line, Some(42));
+    assert_eq!(restored.test_count_evidence, expected_evidence);
     assert!(restored.recovered_after_server_restart);
 }
 
@@ -741,6 +909,8 @@ async fn reconciliation_rejects_cross_product_first_class_go_test_metadata() {
     snapshot.context.purpose = Some("validation".to_string());
     snapshot.context.validation_steps = vec!["test".to_string()];
     snapshot.context.validation = Some(ShellJobValidationMetadata {
+        project_validation: None,
+        source_fence: None,
         tool: "go_test".to_string(),
         kind: "test".to_string(),
         steps: vec![cargo_step],
@@ -816,32 +986,95 @@ async fn job_reconciliation_server_restart_restores_running_job_and_completion()
 }
 
 #[tokio::test]
+async fn long_process_terminal_wait_horizon_covers_execution_recovery_and_retention() {
+    let registry = RunnerRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let job = registry
+        .start_job(JobStartRequest {
+    timeout_secs: PROCESS_TIMEOUT_MAX_SECS,
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("operation".to_string()),
+    shell: Some("direct_argv".to_string()),
+    visibility: ShellJobVisibility::Public,
+    ..Default::default()
+},
+    ..execution_start_request(JobStartExecution::Process { process: ShellProcessArgv {
+                    executable: "/bin/echo".to_string(),
+                    args: vec!["long".to_string()],
+                }, stdin: None, correlation: JobValidationCorrelation {
+    validation_identity: None,
+    validation_tool: None,
+    assertion_name: None,
+} })
+}, "tester".to_string(), None, None)
+        .await
+        .unwrap();
+
+    let before = now_ts();
+    let snapshot = registry
+        .job_terminal_registration_snapshot_for_auth(None, &job.job_id)
+        .await
+        .unwrap();
+    let after = now_ts();
+    let expected_horizon = PROCESS_TIMEOUT_MAX_SECS as i64
+        + JOB_RECOVERY_GRACE_MAX_SECS
+        + JOB_TERMINAL_RETENTION_SECS;
+    assert!(snapshot.wait_expires_at >= before + expected_horizon);
+    assert!(snapshot.wait_expires_at <= after + expected_horizon);
+    assert_eq!(expected_horizon, 694_800);
+}
+
+#[tokio::test]
+async fn raw_shell_terminal_wait_horizon_covers_accepted_day_long_budget() {
+    let registry = RunnerRegistry::default();
+    register(&registry, INSTANCE_A, empty_inventory()).await;
+    let mut request = JobStartRequest::shell(CLIENT_ID, "echo long");
+    request.timeout_secs = 86_400;
+    request.cwd = Some("/srv/demo".to_string());
+    request.context.project_id = Some(RUNTIME_PROJECT_ID.to_string());
+    request.context.project_cwd = Some(".".to_string());
+    request.context.visibility = ShellJobVisibility::Public;
+    let job = registry.start_job(request, "tester".to_string(), None, None).await.unwrap();
+    let before = now_ts();
+    let snapshot = registry
+        .job_terminal_registration_snapshot_for_auth(None, &job.job_id)
+        .await.unwrap();
+    let after = now_ts();
+    let expected_horizon = 86_400 + JOB_RECOVERY_GRACE_MAX_SECS + JOB_TERMINAL_RETENTION_SECS;
+    assert_eq!(expected_horizon, 176_400);
+    assert!(snapshot.wait_expires_at >= before + expected_horizon);
+    assert!(snapshot.wait_expires_at <= after + expected_horizon);
+}
+
+#[tokio::test]
 async fn structured_process_reconciliation_restores_active_and_terminal_evidence_without_redispatch(
 ) {
     let registry_a = RunnerRegistry::default();
     register(&registry_a, INSTANCE_A, empty_inventory()).await;
     let job = registry_a
-        .start_job_with_metadata(
-            start_request(""),
-            "tester".to_string(),
-            ShellJobStartMetadata {
-                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
-                session_id: Some(SESSION_ID.to_string()),
-                project_cwd: Some("/srv/demo".to_string()),
-                purpose: Some("test".to_string()),
-                shell: Some("direct_argv".to_string()),
-                visibility: ShellJobVisibility::HiddenUntilHandoff,
-                structured_execution: Some(StructuredJobExecution::Process(ShellProcessArgv {
+        .start_job(JobStartRequest {
+    timeout_secs: 21_600,
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("test".to_string()),
+    shell: Some("direct_argv".to_string()),
+    visibility: ShellJobVisibility::HiddenUntilHandoff,
+    ..Default::default()
+},
+    ..execution_start_request(JobStartExecution::Process { process: ShellProcessArgv {
                     executable: "/bin/echo".to_string(),
                     args: vec!["literal;$(touch never-executed)".to_string()],
-                })),
-                validation_identity: Some("assertion:0123456789abcdef01234567".to_string()),
-                validation_tool: Some("cargo_test".to_string()),
-                assertion_name: Some("restart process assertion".to_string()),
-                stdin: Some("typed stdin".to_string()),
-                ..Default::default()
-            },
-        )
+                }, stdin: Some("typed stdin".to_string()), correlation: JobValidationCorrelation {
+    validation_identity: Some("assertion:0123456789abcdef01234567".to_string()),
+    validation_tool: Some("cargo_test".to_string()),
+    assertion_name: Some("restart process assertion".to_string()),
+} })
+}, "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry_a
@@ -853,6 +1086,7 @@ async fn structured_process_reconciliation_restores_active_and_terminal_evidence
         .unwrap()
         .expect("typed process Job request");
     assert_eq!(request.kind, "start_process_job");
+    assert_eq!(request.timeout_secs, 21_600);
     assert_eq!(request.command, "");
     assert!(request.process.is_some());
     assert!(request.script.is_none());
@@ -1026,32 +1260,38 @@ async fn structured_process_reconciliation_restores_active_and_terminal_evidence
 async fn javascript_structured_job_start_requires_additive_runner_capability() {
     let registry = RunnerRegistry::default();
     register(&registry, INSTANCE_A, empty_inventory()).await;
-    let metadata = || ShellJobStartMetadata {
-        project_id: Some(RUNTIME_PROJECT_ID.to_string()),
-        session_id: Some(SESSION_ID.to_string()),
-        project_cwd: Some("/srv/demo".to_string()),
-        purpose: Some("operation".to_string()),
-        shell: Some("javascript".to_string()),
-        visibility: ShellJobVisibility::HiddenUntilHandoff,
-        structured_execution: Some(StructuredJobExecution::Script(ShellScriptPayload {
+    let request = || JobStartRequest {
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("operation".to_string()),
+    shell: Some("javascript".to_string()),
+    visibility: ShellJobVisibility::HiddenUntilHandoff,
+    ..Default::default()
+},
+    ..execution_start_request(JobStartExecution::Script { script: ShellScriptPayload {
             language: ShellScriptLanguage::Javascript,
             script: "await Promise.resolve();\n".to_string(),
             args: Vec::new(),
-        })),
-        ..Default::default()
-    };
+        }, stdin: None, correlation: JobValidationCorrelation {
+    validation_identity: None,
+    validation_tool: None,
+    assertion_name: None,
+} })
+};
 
     let error = registry
-        .start_job_with_metadata(start_request(""), "tester".to_string(), metadata())
+        .start_job(request(), "tester".to_string(), None, None)
         .await
         .unwrap_err();
-    assert!(error.contains("structured_script_javascript"), "{error}");
+    assert!(error.to_string().contains("structured_script_javascript"), "{error}");
 
     let mut upgraded = register_request(INSTANCE_A, empty_inventory());
     upgraded.capabilities.structured_script_javascript = true;
     registry.register(upgraded).await.unwrap();
     let job = registry
-        .start_job_with_metadata(start_request(""), "tester".to_string(), metadata())
+        .start_job(request(), "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry
@@ -1076,33 +1316,39 @@ async fn typescript_structured_job_start_requires_additive_runner_capability() {
     old_style.capabilities.structured_script_javascript = true;
     old_style.capabilities.structured_script_typescript = false;
     registry.register(old_style).await.unwrap();
-    let metadata = || ShellJobStartMetadata {
-        project_id: Some(RUNTIME_PROJECT_ID.to_string()),
-        session_id: Some(SESSION_ID.to_string()),
-        project_cwd: Some("/srv/demo".to_string()),
-        purpose: Some("operation".to_string()),
-        shell: Some("typescript".to_string()),
-        visibility: ShellJobVisibility::HiddenUntilHandoff,
-        structured_execution: Some(StructuredJobExecution::Script(ShellScriptPayload {
+    let request = || JobStartRequest {
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("operation".to_string()),
+    shell: Some("typescript".to_string()),
+    visibility: ShellJobVisibility::HiddenUntilHandoff,
+    ..Default::default()
+},
+    ..execution_start_request(JobStartExecution::Script { script: ShellScriptPayload {
             language: ShellScriptLanguage::Typescript,
             script: "const value: string = 'ok';\nvoid value;\n".to_string(),
             args: Vec::new(),
-        })),
-        ..Default::default()
-    };
+        }, stdin: None, correlation: JobValidationCorrelation {
+    validation_identity: None,
+    validation_tool: None,
+    assertion_name: None,
+} })
+};
 
     let error = registry
-        .start_job_with_metadata(start_request(""), "tester".to_string(), metadata())
+        .start_job(request(), "tester".to_string(), None, None)
         .await
         .unwrap_err();
-    assert!(error.contains("structured_script_typescript"), "{error}");
+    assert!(error.to_string().contains("structured_script_typescript"), "{error}");
 
     let mut upgraded = register_request(INSTANCE_A, empty_inventory());
     upgraded.capabilities.structured_script_javascript = true;
     upgraded.capabilities.structured_script_typescript = true;
     registry.register(upgraded).await.unwrap();
     let job = registry
-        .start_job_with_metadata(start_request(""), "tester".to_string(), metadata())
+        .start_job(request(), "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry
@@ -1121,6 +1367,47 @@ async fn typescript_structured_job_start_requires_additive_runner_capability() {
 }
 
 #[tokio::test]
+async fn python_script_job_requires_additive_runner_capability() {
+    let registry = RunnerRegistry::default();
+    let mut old_runner = register_request(INSTANCE_A, empty_inventory());
+    old_runner.capabilities.structured_script_payload = true;
+    old_runner.capabilities.structured_execution_jobs = true;
+    old_runner.capabilities.structured_script_python = false;
+    registry.register(old_runner).await.unwrap();
+    let request = || JobStartRequest {
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("operation".to_string()),
+    shell: Some("python".to_string()),
+    visibility: ShellJobVisibility::HiddenUntilHandoff,
+    ..Default::default()
+},
+    ..execution_start_request(JobStartExecution::Script { script: ShellScriptPayload {
+            language: ShellScriptLanguage::Python,
+            script: "print('雪')\n".to_string(),
+            args: vec!["two words".to_string()],
+        }, stdin: None, correlation: JobValidationCorrelation {
+    validation_identity: None,
+    validation_tool: None,
+    assertion_name: None,
+} })
+};
+    let error = registry.start_job(request(), "tester".to_string(), None, None).await.unwrap_err();
+    assert!(error.to_string().contains("structured_script_python"), "{error}");
+    assert!(registry.poll(RunnerPollRequest {client_id: CLIENT_ID.to_string(), runner_instance_id: INSTANCE_A.to_string()}).await.unwrap().is_none());
+
+    let mut upgraded = register_request(INSTANCE_A, empty_inventory());
+    upgraded.capabilities.structured_script_python = true;
+    registry.register(upgraded).await.unwrap();
+    let job = registry.start_job(request(), "tester".to_string(), None, None).await.unwrap();
+    let request = registry.poll(RunnerPollRequest {client_id: CLIENT_ID.to_string(), runner_instance_id: INSTANCE_A.to_string()}).await.unwrap().unwrap();
+    assert_eq!(request.job_id.as_deref(), Some(job.job_id.as_str()));
+    assert_eq!(request.script.unwrap().language, ShellScriptLanguage::Python);
+}
+
+#[tokio::test]
 async fn terminal_structured_script_snapshot_is_recovered_with_safe_metadata_without_redispatch() {
     let registry_a = RunnerRegistry::default();
     register(&registry_a, INSTANCE_A, empty_inventory()).await;
@@ -1128,28 +1415,26 @@ async fn terminal_structured_script_snapshot_is_recovered_with_safe_metadata_wit
     let script_arg = "private structured script arg".to_string();
     let script_stdin = "private structured script stdin".to_string();
     let job = registry_a
-        .start_job_with_metadata(
-            start_request(""),
-            "tester".to_string(),
-            ShellJobStartMetadata {
-                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
-                session_id: Some(SESSION_ID.to_string()),
-                project_cwd: Some("/srv/demo".to_string()),
-                purpose: Some("test".to_string()),
-                shell: Some("bash".to_string()),
-                visibility: ShellJobVisibility::HiddenUntilHandoff,
-                structured_execution: Some(StructuredJobExecution::Script(ShellScriptPayload {
+        .start_job(JobStartRequest {
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("test".to_string()),
+    shell: Some("bash".to_string()),
+    visibility: ShellJobVisibility::HiddenUntilHandoff,
+    ..Default::default()
+},
+    ..execution_start_request(JobStartExecution::Script { script: ShellScriptPayload {
                     language: ShellScriptLanguage::Bash,
                     script: script_body.clone(),
                     args: vec![script_arg.clone()],
-                })),
-                validation_identity: Some("assertion:fedcba9876543210fedcba98".to_string()),
-                validation_tool: None,
-                assertion_name: Some("restart script assertion".to_string()),
-                stdin: Some(script_stdin.clone()),
-                ..Default::default()
-            },
-        )
+                }, stdin: Some(script_stdin.clone()), correlation: JobValidationCorrelation {
+    validation_identity: Some("assertion:fedcba9876543210fedcba98".to_string()),
+    validation_tool: None,
+    assertion_name: Some("restart script assertion".to_string()),
+} })
+}, "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry_a
@@ -1256,24 +1541,25 @@ async fn projected_hidden_structured_terminal_is_suppressed_only_by_same_server_
     let registry = RunnerRegistry::default();
     register(&registry, INSTANCE_A, empty_inventory()).await;
     let job = registry
-        .start_job_with_metadata(
-            start_request(""),
-            "tester".to_string(),
-            ShellJobStartMetadata {
-                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
-                session_id: Some(SESSION_ID.to_string()),
-                project_cwd: Some("/srv/demo".to_string()),
-                purpose: Some("test".to_string()),
-                shell: Some("direct_argv".to_string()),
-                visibility: ShellJobVisibility::HiddenUntilHandoff,
-                structured_execution: Some(StructuredJobExecution::Process(ShellProcessArgv {
+        .start_job(JobStartRequest {
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("test".to_string()),
+    shell: Some("direct_argv".to_string()),
+    visibility: ShellJobVisibility::HiddenUntilHandoff,
+    ..Default::default()
+},
+    ..execution_start_request(JobStartExecution::Process { process: ShellProcessArgv {
                     executable: "/bin/echo".to_string(),
                     args: vec!["safe retained argument".to_string()],
-                })),
-                stdin: Some("private projected stdin".to_string()),
-                ..Default::default()
-            },
-        )
+                }, stdin: Some("private projected stdin".to_string()), correlation: JobValidationCorrelation {
+    validation_identity: None,
+    validation_tool: None,
+    assertion_name: None,
+} })
+}, "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry
@@ -1447,19 +1733,18 @@ async fn projected_hidden_raw_shell_terminal_does_not_resurrect_on_same_instance
     let registry = RunnerRegistry::default();
     register(&registry, INSTANCE_A, empty_inventory()).await;
     let job = registry
-        .start_job_with_metadata(
-            start_request("printf raw-shell"),
-            "tester".to_string(),
-            ShellJobStartMetadata {
-                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
-                session_id: Some(SESSION_ID.to_string()),
-                project_cwd: Some("/srv/demo".to_string()),
-                purpose: Some("test".to_string()),
-                shell: Some("bash".to_string()),
-                visibility: ShellJobVisibility::HiddenUntilHandoff,
-                ..Default::default()
-            },
-        )
+        .start_job(JobStartRequest {
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("test".to_string()),
+    shell: Some("bash".to_string()),
+    visibility: ShellJobVisibility::HiddenUntilHandoff,
+    ..Default::default()
+},
+    ..start_request("printf raw-shell")
+}, "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry
@@ -1546,19 +1831,18 @@ async fn projected_hidden_terminal_removes_after_runner_instance_replacement() {
     let registry = RunnerRegistry::default();
     register(&registry, INSTANCE_A, empty_inventory()).await;
     let job = registry
-        .start_job_with_metadata(
-            start_request("printf projected-before-replacement"),
-            "tester".to_string(),
-            ShellJobStartMetadata {
-                project_id: Some(RUNTIME_PROJECT_ID.to_string()),
-                session_id: Some(SESSION_ID.to_string()),
-                project_cwd: Some("/srv/demo".to_string()),
-                purpose: Some("test".to_string()),
-                shell: Some("bash".to_string()),
-                visibility: ShellJobVisibility::HiddenUntilHandoff,
-                ..Default::default()
-            },
-        )
+        .start_job(JobStartRequest {
+    context: JobStartContext {
+    project_id: Some(RUNTIME_PROJECT_ID.to_string()),
+    session_id: Some(SESSION_ID.to_string()),
+    project_cwd: Some("/srv/demo".to_string()),
+    purpose: Some("test".to_string()),
+    shell: Some("bash".to_string()),
+    visibility: ShellJobVisibility::HiddenUntilHandoff,
+    ..Default::default()
+},
+    ..start_request("printf projected-before-replacement")
+}, "tester".to_string(), None, None)
         .await
         .unwrap();
     let request = registry
@@ -1827,16 +2111,10 @@ async fn terminal_observed_future_inventory_ended_at_cannot_bypass_prune() {
                 operation: request.decode_operation().unwrap(),
                 waiter: None,
                 job_id: Some(job.job_id.clone()),
-                expected_runner_owner: None,
-                expected_project_id: None,
-                expected_project_cwd: None,
-                expected_mcp_gateway_runner_instance_id: None,
-                expected_ssh_resource_runner_instance_id: None,
-                expected_runner_config_runner_instance_id: None,
-                skill_fence: None,
+                dispatch_fence: crate::dispatch_fence::PendingDispatchFence::Unfenced,
+                enqueued_at: std::time::Instant::now(),
+                dispatched_transport: Some(crate::RunnerTransport::Polling),
                 dispatched: true,
-                expected_mcp_gateway_provider_id: None,
-                expected_mcp_gateway_provider_instance_id: None,
             },
         );
         inner
@@ -1849,16 +2127,10 @@ async fn terminal_observed_future_inventory_ended_at_cannot_bypass_prune() {
                 operation: control_request.decode_operation().unwrap(),
                 waiter: None,
                 job_id: Some(job.job_id.clone()),
-                expected_runner_owner: None,
-                expected_project_id: None,
-                expected_project_cwd: None,
-                expected_mcp_gateway_runner_instance_id: None,
-                expected_ssh_resource_runner_instance_id: None,
-                expected_runner_config_runner_instance_id: None,
-                skill_fence: None,
+                dispatch_fence: crate::dispatch_fence::PendingDispatchFence::Unfenced,
+                enqueued_at: std::time::Instant::now(),
+                dispatched_transport: None,
                 dispatched: false,
-                expected_mcp_gateway_provider_id: None,
-                expected_mcp_gateway_provider_instance_id: None,
             },
         );
         let queue = inner
@@ -2363,7 +2635,7 @@ async fn job_reconciliation_instance_replacement_does_not_redispatch_server_queu
     let registry = RunnerRegistry::default();
     register(&registry, INSTANCE_A, empty_inventory()).await;
     let queued = registry
-        .start_job(start_request("echo must-not-run"), "tester".to_string())
+        .start_job(start_request("echo must-not-run"), "tester".to_string(), None, None)
         .await
         .unwrap();
     assert_eq!(queued.status, "queued");
@@ -2552,7 +2824,61 @@ fn standalone_snapshot(job_id: &str, status: &str) -> ShellJobSnapshot {
         stdout: ShellJobStreamSnapshot::default(),
         stderr: ShellJobStreamSnapshot::default(),
         validation_progress: None,
+        test_count_evidence: None,
+        format_mutation: None,
+        build_artifacts: None,
         activity: None,
+    }
+}
+
+#[test]
+fn job_inventory_accepts_bash_login_shell_context() {
+    let mut snapshot = standalone_snapshot("bash-login-running", "running");
+    snapshot.context.shell = Some("bash_login".to_string());
+    let inventory = ShellJobInventory {
+        active_complete: true,
+        jobs: vec![snapshot],
+    };
+
+    validate_job_inventory(CLIENT_ID, &[project_summary()], &inventory).unwrap();
+}
+
+#[tokio::test]
+async fn job_inventory_recovers_python_script_without_changing_semantic_identity() {
+    let mut snapshot = standalone_snapshot("python-reconnect", "running");
+    snapshot.context.shell = Some("python".to_string());
+    snapshot.context.structured_execution = Some(
+        crate::runner_protocol::ShellJobStructuredExecutionMetadata {
+            execution_source: "run_script".to_string(),
+            language: Some(ShellScriptLanguage::Python),
+            script_bytes: Some(24),
+            arg_count: 0,
+            stdin_present: false,
+            validation_identity: None,
+            validation_tool: None,
+            assertion_name: None,
+        },
+    );
+    let inventory = ShellJobInventory {
+        active_complete: true,
+        jobs: vec![snapshot.clone()],
+    };
+    validate_job_inventory(CLIENT_ID, &[project_summary()], &inventory).unwrap();
+    // A fresh Server must accept the retained Python Job at registration,
+    // rather than kill an otherwise healthy Runner on reconnect.
+    register(&RunnerRegistry::default(), INSTANCE_A, inventory).await;
+    for shell in ["python3", "python.exe", "unknown"] {
+        snapshot.context.shell = Some(shell.to_string());
+        let error = validate_job_inventory(
+            CLIENT_ID,
+            &[project_summary()],
+            &ShellJobInventory {
+                active_complete: true,
+                jobs: vec![snapshot.clone()],
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("shell is invalid"), "{error}");
     }
 }
 
@@ -2692,6 +3018,8 @@ async fn reconciliation_summary_counts_inventory_effects_without_payload_data() 
             INSTANCE_A,
             None,
             registry.observation_epoch.clone(),
+            None,
+            None,
             &first_inventory,
             now_ts(),
         );
@@ -2719,6 +3047,8 @@ async fn reconciliation_summary_counts_inventory_effects_without_payload_data() 
         INSTANCE_A,
         None,
         registry.observation_epoch.clone(),
+        None,
+        None,
         &second_inventory,
         now_ts(),
     );
@@ -2931,10 +3261,7 @@ async fn job_reconciliation_malformed_inventory_does_not_mutate_registry() {
 
     register(&registry, INSTANCE_A, empty_inventory()).await;
     let queued = registry
-        .start_job(
-            start_request("echo request-id-collision"),
-            "tester".to_string(),
-        )
+        .start_job(start_request("echo request-id-collision"), "tester".to_string(), None, None)
         .await
         .unwrap();
     let queued_request_id = {
@@ -3011,7 +3338,7 @@ async fn job_reconciliation_absent_capability_keeps_immediate_lost_semantics() {
     request.job_inventory = None;
     registry.register(request).await.unwrap();
     let job = registry
-        .start_job(start_request("sleep 30"), "tester".to_string())
+        .start_job(start_request("sleep 30"), "tester".to_string(), None, None)
         .await
         .unwrap();
     registry
@@ -3278,7 +3605,7 @@ async fn recovery_sweep_pass_cap_bounds_a_single_pass() {
     let mut job_ids = Vec::new();
     for _ in 0..count {
         let job = registry
-            .start_job(start_request("sleep 30"), "tester".to_string())
+            .start_job(start_request("sleep 30"), "tester".to_string(), None, None)
             .await
             .unwrap();
         let request = registry
@@ -3543,3 +3870,260 @@ async fn sweep_only_transitions_expired_jobs_and_leaves_recent_recovering() {
 
 #[path = "job_receipts.rs"]
 mod job_receipts;
+
+#[tokio::test]
+async fn project_validation_python_pytest_capability_rechecked_at_job_admission() {
+    use webcodex_core::project_validation::*;
+    for supported in [false, true] {
+        let registry = RunnerRegistry::default();
+        let mut registration = register_request(INSTANCE_A, empty_inventory());
+        registration.capabilities.project_validation_v1 = true;
+        registration
+            .capabilities
+            .project_validation_python_pytest_v1 = supported;
+        registry.register(registration).await.unwrap();
+        let mut metadata = cargo_validation_metadata(Some(true), None, Some(1));
+        let validation = &mut metadata;
+        validation.tool = "project_validate".into();
+        validation.adapter = "python:pytest:test".into();
+        validation.steps = vec![ShellJobValidationStep {
+            name: "test".into(),
+            program: "python".into(),
+            args: ["-m", "pytest", "--color=no", "-rA"]
+                .map(str::to_string)
+                .to_vec(),
+            env: vec![],
+        }];
+        validation.project_validation = Some(ProjectValidationProvenance {
+            request: ProjectValidationRequest {
+                project_id: "demo".into(),
+                cwd: None,
+                action: ProjectValidationAction::Test,
+                adapter: ProjectValidationAdapter::Auto,
+                scope: None,
+                dependency_policy: None,
+                dependency_resolution_policy: None,
+                test: None,
+            },
+            backend: "python".into(),
+            recipe_root: ".".into(),
+            root_digest: "a".repeat(64),
+            manifest_digest: "b".repeat(64),
+            invocation_digest: "c".repeat(64),
+        });
+        assert!(validation.is_valid());
+
+        let result = registry
+            .start_job(validation_start_request(metadata, "test"), "tester".into(), None, None)
+            .await;
+        if supported {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.to_string().starts_with("capability_unavailable:"), "{error}");
+            assert!(error.to_string().contains(&format!("Runner `{CLIENT_ID}`")), "{error}");
+            assert!(error.to_string().contains("project_validation_python_pytest_v1"), "{error}");
+            assert!(error.to_string().contains("upgrade that Runner"), "{error}");
+            assert!(registry.list_jobs(Some(10)).await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn project_validation_ruff_admission_requires_ruff_capability_even_with_pytest() {
+    use webcodex_core::project_validation::*;
+    for action in [ProjectValidationAction::Check, ProjectValidationAction::FormatCheck] {
+        for supported in [false, true] {
+            let registry = RunnerRegistry::default();
+            let mut registration = register_request(INSTANCE_A, empty_inventory());
+            registration.capabilities.project_validation_v1 = true;
+            registration.capabilities.project_validation_python_pytest_v1 = !supported;
+            registration.capabilities.project_validation_python_ruff_v1 = supported;
+            registry.register(registration).await.unwrap();
+            let mut metadata = cargo_validation_metadata(None, None, None);
+            let validation = &mut metadata;
+            validation.tool = "project_validate".into();
+            validation.adapter = format!("python:ruff:{}", action.kind());
+            validation.kind = action.kind().into();
+            validation.steps = vec![ShellJobValidationStep::python_ruff(action.kind()).unwrap()];
+            validation.project_validation = Some(ProjectValidationProvenance {
+                request: ProjectValidationRequest { project_id: "demo".into(), cwd: None, action, adapter: ProjectValidationAdapter::Auto, scope: None, dependency_policy: None, dependency_resolution_policy: None, test: None },
+                backend: "python".into(), recipe_root: ".".into(), root_digest: "a".repeat(64), manifest_digest: "b".repeat(64), invocation_digest: "c".repeat(64),
+            });
+            assert!(validation.is_valid());
+
+            let result = registry.start_job(validation_start_request(metadata, "test"), "tester".into(), None, None).await;
+            if supported { assert!(result.is_ok(), "{result:?}"); }
+            else {
+                assert!(result.unwrap_err().to_string().contains("project_validation_python_ruff_v1"));
+                assert!(registry.list_jobs(Some(10)).await.is_empty());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn project_validation_workspace_exclusion_capability_rechecked_at_admission() {
+    use webcodex_core::project_validation::*;
+    for supported in [false, true] {
+        let registry = RunnerRegistry::default();
+        let mut registration = register_request(INSTANCE_A, empty_inventory());
+        registration.capabilities.project_validation_v1 = true;
+        registration.capabilities.project_all_packages_v1 = true;
+        registration.capabilities.project_workspace_exclusions_v1 = supported;
+        registry.register(registration).await.unwrap();
+
+        let mut metadata = cargo_validation_metadata(None, None, None);
+        metadata.tool = "project_validate".into();
+        metadata.kind = "check".into();
+        metadata.adapter = "cargo_check".into();
+        metadata.steps = vec![ShellJobValidationStep {
+            name: "check".into(),
+            program: "cargo".into(),
+            args: ["check", "--all-targets", "--workspace", "--exclude", "alpha"]
+                .map(str::to_string)
+                .to_vec(),
+            env: vec![],
+        }];
+        metadata.project_validation = Some(ProjectValidationProvenance {
+            request: ProjectValidationRequest {
+                project_id: "demo".into(),
+                cwd: None,
+                action: ProjectValidationAction::Check,
+                adapter: ProjectValidationAdapter::Rust,
+                scope: Some(ProjectValidationScope {
+                    packages: vec![],
+                    all_packages: true,
+                    exclude_packages: vec!["alpha".into()],
+                }),
+                dependency_policy: None,
+                dependency_resolution_policy: None,
+                test: None,
+            },
+            backend: "rust".into(),
+            recipe_root: ".".into(),
+            root_digest: "a".repeat(64),
+            manifest_digest: "b".repeat(64),
+            invocation_digest: "c".repeat(64),
+        });
+        assert!(metadata.is_valid());
+
+        let result = registry
+            .start_job(
+                validation_start_request(metadata, "test"),
+                "tester".into(),
+                None,
+                None,
+            )
+            .await;
+        if supported {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.to_string().starts_with("capability_unavailable:"), "{error}");
+            assert!(error.to_string().contains("project_workspace_exclusions_v1"), "{error}");
+            assert!(registry.list_jobs(Some(10)).await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn project_validation_node_native_capability_rechecked_at_job_admission() {
+    use webcodex_core::project_validation::*;
+    for supported in [false, true] {
+        let registry = RunnerRegistry::default();
+        let mut registration = register_request(INSTANCE_A, empty_inventory());
+        registration.capabilities.project_validation_v1 = true;
+        registration.capabilities.project_validation_node_tap_v1 = supported;
+        registry.register(registration).await.unwrap();
+
+        let mut metadata = cargo_validation_metadata(Some(true), None, Some(1));
+        let validation = &mut metadata;
+        validation.tool = "project_validate".into();
+        validation.adapter = "node:tap:test".into();
+        validation.steps = vec![ShellJobValidationStep {
+            name: "test".into(),
+            program: "node".into(),
+            args: ["--test", "--test-reporter=tap"].map(str::to_string).to_vec(),
+            env: vec![],
+        }];
+        validation.project_validation = Some(ProjectValidationProvenance {
+            request: ProjectValidationRequest {
+                project_id: "demo".into(),
+                cwd: None,
+                action: ProjectValidationAction::Test,
+                adapter: ProjectValidationAdapter::Auto,
+                scope: None,
+                dependency_policy: None,
+                dependency_resolution_policy: None,
+                test: None,
+            },
+            backend: "node".into(),
+            recipe_root: ".".into(),
+            root_digest: "a".repeat(64),
+            manifest_digest: "b".repeat(64),
+            invocation_digest: "c".repeat(64),
+        });
+        assert!(validation.is_valid());
+
+        let result = registry
+            .start_job(validation_start_request(metadata, "test"), "tester".into(), None, None)
+            .await;
+        if supported {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.to_string().starts_with("capability_unavailable:"), "{error}");
+            assert!(error.to_string().contains("project_validation_node_tap_v1"), "{error}");
+            assert!(registry.list_jobs(Some(10)).await.is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn project_validation_node_json_capability_rechecked_at_job_admission() {
+    use webcodex_core::project_validation::*;
+    for (supported,framework) in [(false,"vitest"),(true,"vitest"),(false,"jest"),(true,"jest")] {
+        let registry = RunnerRegistry::default();
+        let mut registration = register_request(INSTANCE_A, empty_inventory());
+        registration.capabilities.project_validation_v1 = true;
+        registration.capabilities.project_validation_node_json_v1 = supported;
+        registry.register(registration).await.unwrap();
+
+        let mut metadata = cargo_validation_metadata(Some(true), None, Some(1));
+        let validation = &mut metadata;
+        validation.tool = "project_validate".into();
+        validation.adapter = format!("node:{framework}:test");
+        validation.steps = vec![ShellJobValidationStep::node_json_test(framework).unwrap()];
+        validation.project_validation = Some(ProjectValidationProvenance {
+            request: ProjectValidationRequest {
+                project_id: "demo".into(),
+                cwd: None,
+                action: ProjectValidationAction::Test,
+                adapter: ProjectValidationAdapter::Auto,
+                scope: None,
+                dependency_policy: None,
+                dependency_resolution_policy: None,
+                test: None,
+            },
+            backend: "node".into(),
+            recipe_root: ".".into(),
+            root_digest: "a".repeat(64),
+            manifest_digest: "b".repeat(64),
+            invocation_digest: "c".repeat(64),
+        });
+        assert!(validation.is_valid());
+
+        let result = registry
+            .start_job(validation_start_request(metadata, "test"), "tester".into(), None, None)
+            .await;
+        if supported {
+            assert!(result.is_ok(), "{result:?}");
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.to_string().starts_with("capability_unavailable:"), "{error}");
+            assert!(error.to_string().contains("project_validation_node_json_v1"), "{error}");
+            assert!(registry.list_jobs(Some(10)).await.is_empty());
+        }
+    }
+}

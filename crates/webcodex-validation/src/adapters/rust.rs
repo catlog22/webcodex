@@ -1,6 +1,11 @@
-use super::{ValidationAdapter, ValidationCommandOptions, ValidationFailureEvidence};
-use webcodex_core::runner_protocol::{normalize_cargo_value, normalize_rust_test_filter};
-use webcodex_core::shell_quote::shell_escape_simple;
+use super::{
+    read_only_validation_plan, validate_package_scope_exclusivity, ReadOnlyValidationPlan,
+    ValidationAdapter, ValidationCommandOptions, ValidationEvidenceProfile,
+    ValidationFailureEvidence, ValidationPlanArg,
+};
+use webcodex_core::runner_protocol::{
+    normalize_cargo_packages, normalize_cargo_value, normalize_rust_test_filter,
+};
 use webcodex_core::validation_evidence::{
     parse_cargo_check_diagnostics, parse_cargo_test_diagnostics, ValidationDiagnostics,
 };
@@ -9,6 +14,7 @@ use webcodex_core::validation_evidence::{
 enum RustAdapterKind {
     Format,
     Check,
+    Clippy,
     Test,
 }
 
@@ -29,9 +35,14 @@ static CARGO_TEST_ADAPTER: RustValidationAdapter = RustValidationAdapter {
     kind: RustAdapterKind::Test,
     tool_identity: "cargo_test",
 };
-static RUST_ADAPTERS: [&dyn ValidationAdapter; 3] = [
+static CARGO_CLIPPY_ADAPTER: RustValidationAdapter = RustValidationAdapter {
+    kind: RustAdapterKind::Clippy,
+    tool_identity: "cargo_clippy",
+};
+static RUST_ADAPTERS: [&dyn ValidationAdapter; 4] = [
     &CARGO_FMT_ADAPTER,
     &CARGO_CHECK_ADAPTER,
+    &CARGO_CLIPPY_ADAPTER,
     &CARGO_TEST_ADAPTER,
 ];
 
@@ -39,28 +50,18 @@ pub(super) fn validation_adapters() -> &'static [&'static dyn ValidationAdapter]
     &RUST_ADAPTERS
 }
 
-impl ValidationAdapter for RustValidationAdapter {
+impl ValidationEvidenceProfile for RustValidationAdapter {
     fn validation_kind(&self) -> &'static str {
         match self.kind {
             RustAdapterKind::Format => "format",
             RustAdapterKind::Check => "check",
+            RustAdapterKind::Clippy => "lint",
             RustAdapterKind::Test => "test",
         }
     }
 
     fn tool_identity(&self) -> &'static str {
         self.tool_identity
-    }
-
-    fn build_command(&self, options: ValidationCommandOptions) -> Result<String, String> {
-        if options.go_packages.is_some() {
-            return Err("Cargo validation does not accept go_test packages".to_string());
-        }
-        match self.kind {
-            RustAdapterKind::Format => Ok(cargo_fmt_command(options.check)),
-            RustAdapterKind::Check => cargo_check_command(options),
-            RustAdapterKind::Test => cargo_test_command(options),
-        }
     }
 
     fn parse(
@@ -70,7 +71,7 @@ impl ValidationAdapter for RustValidationAdapter {
         truncated: bool,
     ) -> ValidationDiagnostics {
         match self.kind {
-            RustAdapterKind::Format | RustAdapterKind::Check => {
+            RustAdapterKind::Format | RustAdapterKind::Check | RustAdapterKind::Clippy => {
                 parse_cargo_check_diagnostics(stdout_excerpt, stderr_excerpt, truncated)
             }
             RustAdapterKind::Test => {
@@ -146,76 +147,192 @@ impl ValidationAdapter for RustValidationAdapter {
     }
 }
 
-fn cargo_fmt_command(check: bool) -> String {
-    if check {
-        "cargo fmt -- --check".to_string()
-    } else {
-        "cargo fmt".to_string()
+impl ValidationAdapter for RustValidationAdapter {
+    fn build_readonly_plan(
+        &self,
+        options: ValidationCommandOptions,
+    ) -> Result<ReadOnlyValidationPlan, String> {
+        if options.go_packages.is_some() {
+            return Err("Cargo validation does not accept go_test packages".to_string());
+        }
+        match self.kind {
+            RustAdapterKind::Format => {
+                if !options.check {
+                    return Err("cargo_fmt mutation is not read-only validation".to_string());
+                }
+                read_only_validation_plan(
+                    "format",
+                    "cargo",
+                    vec![
+                        ValidationPlanArg::Literal("fmt"),
+                        ValidationPlanArg::Literal("--"),
+                        ValidationPlanArg::Literal("--check"),
+                    ],
+                )
+            }
+            RustAdapterKind::Clippy => {
+                let mut options = options;
+                options.all_targets = Some(true);
+                let plan = cargo_check_plan(options)?;
+                let mut step = plan.structured_step;
+                step.name = "lint".into();
+                step.args[0] = "clippy".into();
+                step.args
+                    .extend(["--", "-D", "clippy::correctness"].map(str::to_string));
+                read_only_validation_plan(
+                    "lint",
+                    "cargo",
+                    step.args
+                        .into_iter()
+                        .map(ValidationPlanArg::Value)
+                        .collect(),
+                )
+            }
+            RustAdapterKind::Check => cargo_check_plan(options),
+            RustAdapterKind::Test => cargo_test_plan(options),
+        }
+    }
+
+    fn build_command(&self, options: ValidationCommandOptions) -> Result<String, String> {
+        if self.kind == RustAdapterKind::Format && !options.check {
+            if options.go_packages.is_some() {
+                return Err("Cargo validation does not accept go_test packages".to_string());
+            }
+            return Ok("cargo fmt".to_string());
+        }
+        self.build_readonly_plan(options)
+            .map(|plan| plan.compatibility_command)
     }
 }
 
-fn cargo_check_command(options: ValidationCommandOptions) -> Result<String, String> {
+fn cargo_check_plan(options: ValidationCommandOptions) -> Result<ReadOnlyValidationPlan, String> {
+    validate_package_scope_exclusivity(
+        options.package.is_some() || options.cargo_packages.is_some(),
+        options.all_packages,
+    )?;
     let features = validate_arg("features", options.features)?;
-    let package = validate_arg("package", options.package)?;
-    let mut args = vec!["cargo".to_string(), "check".to_string()];
+    let packages = normalize_cargo_packages(
+        options.package.as_deref(),
+        options.cargo_packages.as_deref(),
+    )
+    .map_err(|reason| format!("packages {reason}"))?;
+    let exclusions =
+        normalize_project_exclusions(options.all_packages, &options.cargo_exclude_packages)?;
+    let mut args = vec![ValidationPlanArg::Literal("check")];
+    if options.dependency_mode
+        == Some(webcodex_core::project_validation::ProjectDependencyMode::Locked)
+    {
+        args.push(ValidationPlanArg::Literal("--locked"));
+    }
+    if options.dependency_resolution_policy.is_some() {
+        args.push(ValidationPlanArg::Literal("--offline"));
+    }
     if options.all_targets.unwrap_or(true) {
-        args.push("--all-targets".to_string());
+        args.push(ValidationPlanArg::Literal("--all-targets"));
     }
     if options.all_features.unwrap_or(false) {
-        args.push("--all-features".to_string());
+        args.push(ValidationPlanArg::Literal("--all-features"));
     }
     if options.no_default_features.unwrap_or(false) {
-        args.push("--no-default-features".to_string());
+        args.push(ValidationPlanArg::Literal("--no-default-features"));
     }
     if let Some(features) = features {
-        args.push("--features".to_string());
-        args.push(shell_escape_simple(&features));
+        args.push(ValidationPlanArg::Literal("--features"));
+        args.push(ValidationPlanArg::Value(features));
     }
-    if let Some(package) = package {
-        args.push("-p".to_string());
-        args.push(shell_escape_simple(&package));
+    if options.all_packages {
+        args.push(ValidationPlanArg::Literal("--workspace"));
+        for package in exclusions {
+            args.push(ValidationPlanArg::Literal("--exclude"));
+            args.push(ValidationPlanArg::Value(package));
+        }
+    } else {
+        for package in packages.into_iter().flatten() {
+            args.push(ValidationPlanArg::Literal("-p"));
+            args.push(ValidationPlanArg::Value(package));
+        }
     }
-    Ok(args.join(" "))
+    read_only_validation_plan("check", "cargo", args)
 }
 
-fn cargo_test_command(options: ValidationCommandOptions) -> Result<String, String> {
+fn cargo_test_plan(options: ValidationCommandOptions) -> Result<ReadOnlyValidationPlan, String> {
+    validate_package_scope_exclusivity(
+        options.package.is_some() || options.cargo_packages.is_some(),
+        options.all_packages,
+    )?;
     let filter = validate_filter(options.filter)?;
     let features = validate_arg("features", options.features)?;
-    let package = validate_arg("package", options.package)?;
-    let mut args = vec!["cargo".to_string(), "test".to_string()];
+    let packages = normalize_cargo_packages(
+        options.package.as_deref(),
+        options.cargo_packages.as_deref(),
+    )
+    .map_err(|reason| format!("packages {reason}"))?;
+    let exclusions =
+        normalize_project_exclusions(options.all_packages, &options.cargo_exclude_packages)?;
+    let mut args = vec![ValidationPlanArg::Literal("test")];
     if let Some(filter) = filter {
-        args.push(shell_escape_simple(&filter));
+        args.push(ValidationPlanArg::Value(filter));
+    }
+    if options.dependency_mode
+        == Some(webcodex_core::project_validation::ProjectDependencyMode::Locked)
+    {
+        args.push(ValidationPlanArg::Literal("--locked"));
+    }
+    if options.dependency_resolution_policy.is_some() {
+        args.push(ValidationPlanArg::Literal("--offline"));
     }
     if options.lib.unwrap_or(false) {
-        args.push("--lib".to_string());
+        args.push(ValidationPlanArg::Literal("--lib"));
     }
     if options.all_targets.unwrap_or(false) {
-        args.push("--all-targets".to_string());
+        args.push(ValidationPlanArg::Literal("--all-targets"));
     }
     if options.all_features.unwrap_or(false) {
-        args.push("--all-features".to_string());
+        args.push(ValidationPlanArg::Literal("--all-features"));
     }
     if options.no_default_features.unwrap_or(false) {
-        args.push("--no-default-features".to_string());
+        args.push(ValidationPlanArg::Literal("--no-default-features"));
     }
     if let Some(features) = features {
-        args.push("--features".to_string());
-        args.push(shell_escape_simple(&features));
+        args.push(ValidationPlanArg::Literal("--features"));
+        args.push(ValidationPlanArg::Value(features));
     }
-    if let Some(package) = package {
-        args.push("-p".to_string());
-        args.push(shell_escape_simple(&package));
+    if options.all_packages {
+        args.push(ValidationPlanArg::Literal("--workspace"));
+        for package in exclusions {
+            args.push(ValidationPlanArg::Literal("--exclude"));
+            args.push(ValidationPlanArg::Value(package));
+        }
+    } else {
+        for package in packages.into_iter().flatten() {
+            args.push(ValidationPlanArg::Literal("-p"));
+            args.push(ValidationPlanArg::Value(package));
+        }
     }
     if options.no_run.unwrap_or(false) {
-        args.push("--no-run".to_string());
+        args.push(ValidationPlanArg::Literal("--no-run"));
     }
-    Ok(args.join(" "))
+    read_only_validation_plan("test", "cargo", args)
 }
 
-/// Normalize one value-taking Cargo option using the same shared contract the
-/// structured Job argv builder uses, so a request produces identical
-/// arguments whether it runs synchronously or as a long Job. The error label
-/// is mapped to the tool-facing message.
+fn normalize_project_exclusions(
+    all_packages: bool,
+    exclusions: &[String],
+) -> Result<Vec<String>, String> {
+    if exclusions.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !all_packages {
+        return Err("workspace exclusions require all_packages=true".into());
+    }
+    webcodex_core::runner_protocol::normalize_cargo_excluded_packages(exclusions)
+        .map_err(str::to_string)
+}
+
+/// Normalize one value-taking Cargo option before the adapter emits its single
+/// read-only validation plan. The command-text and structured-argv projections
+/// are then derived from that same normalized value. The error label is mapped
+/// to the tool-facing message.
 fn validate_arg(label: &str, value: Option<String>) -> Result<Option<String>, String> {
     match value {
         Some(raw) => match normalize_cargo_value(&raw) {

@@ -41,7 +41,8 @@ fn canonical_audit_policies_keep_private_payloads_out_of_durable_session_ledger(
         "events":[{"kind":"text", "text":"PRIVATE_CODING_EVENT"}],
         "messages":[{"body":"PRIVATE_MESSAGE_BODY"}],
         "entries":[{"value":"PRIVATE_MEMORY_VALUE"}],
-        "skills":[{"body":"PRIVATE_SKILL_BODY", "path":"PRIVATE_SKILL_PATH"}]
+        "skills":[{"body":"PRIVATE_SKILL_BODY", "path":"PRIVATE_SKILL_PATH"}],
+        "skill_name":"PRIVATE_SKILL_NAME"
     });
     for name in definitions
         .iter()
@@ -55,7 +56,7 @@ fn canonical_audit_policies_keep_private_payloads_out_of_durable_session_ledger(
         if name == "work_on_project" {
             tool_input["instruction"] = json!("Audit fixture task");
         }
-        if name == "git_status" {
+        if name == "get_git_status" {
             tool_output["stdout"] = json!(" M src/lib.rs\n");
         }
         let arguments = session_log_arguments_for_tool_request(name, &tool_input);
@@ -71,7 +72,7 @@ fn canonical_audit_policies_keep_private_payloads_out_of_durable_session_ledger(
         store.record_tool_call_finished(start, true, &projected, None, None);
     }
     store.flush_persistence();
-    let persisted = std::fs::read_to_string(&ledger).unwrap();
+    let persisted = webcodex_workflow_session::root_test_support::read_ledger(&ledger).unwrap();
     assert!(
         !persisted.contains("PRIVATE_"),
         "private sentinel in persisted audit ledger near {:?}",
@@ -126,7 +127,7 @@ fn canonical_audit_evidence_preserves_only_existing_bounded_execution_excerpts()
         );
         store.record_tool_call_finished(start, true, &projected, None, None);
         store.flush_persistence();
-        let persisted = std::fs::read_to_string(&ledger).unwrap();
+        let persisted = webcodex_workflow_session::root_test_support::read_ledger(&ledger).unwrap();
         assert!(!persisted.contains("PRIVATE_"), "{name}");
         assert_eq!(
             persisted.contains("allowed stdout witness"),

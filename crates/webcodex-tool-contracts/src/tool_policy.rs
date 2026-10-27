@@ -5,12 +5,13 @@ use super::metadata::{
 };
 use super::tool_definition::{
     tool_definitions, RunnerCapabilityRequirement, ToolActivityInteraction, ToolActivityKind,
-    ToolActivityPresentation, ToolActivitySemantics, ToolAuditPolicy, ToolContextContinuityPolicy,
+    ToolActivityPresentation, ToolActivitySemantics, ToolAuditPolicy, ToolCompositionPolicy,
     ToolDefinition, ToolDiffReviewEvidence, ToolEffectAnnotations, ToolExecutionContract,
-    ToolExecutionForm, ToolExplorationEvidence, ToolGptActionExposure, ToolOperatorExtensionFamily,
-    ToolReviewEvidence, ToolSessionEvidencePolicy, ToolValidationIdentityKind,
-    PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE, PERMISSION_RISK_PATCH,
-    PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION, PERMISSION_RISK_WRITE, TOOL_CATEGORY_JOB,
+    ToolExecutionForm, ToolExplorationEvidence, ToolHostOrchestrationHint,
+    ToolOperatorExtensionFamily, ToolReviewEvidence, ToolSessionEvidencePolicy,
+    ToolValidationIdentityKind, PERMISSION_RISK_ARTIFACT_WRITE, PERMISSION_RISK_DESTRUCTIVE,
+    PERMISSION_RISK_PATCH, PERMISSION_RISK_SHELL, PERMISSION_RISK_VALIDATION,
+    PERMISSION_RISK_WRITE,
 };
 
 impl ToolDefinition {
@@ -67,25 +68,30 @@ impl ToolDefinition {
     }
 
     pub fn adaptive_runtime_direct_rank(self) -> Option<u16> {
-        self.model_surface.adaptive_runtime_direct_rank
+        self.adaptive_runtime_direct.map(|policy| policy.rank)
     }
 
-    pub fn gpt_action_exposure(self) -> ToolGptActionExposure {
-        self.model_surface.gpt_action_exposure
+    pub fn adaptive_runtime_direct_reason(
+        self,
+    ) -> Option<super::tool_definition::ToolDirectReason> {
+        self.adaptive_runtime_direct.map(|policy| policy.reason)
     }
 
-    pub fn supports_gpt_actions(self) -> bool {
-        self.visibility.is_model_visible()
-            && self.gpt_action_exposure() == ToolGptActionExposure::Inherit
+    /// App presentation is a surface property, independent of permission,
+    /// execution, audit eligibility and individual Host review.
+    pub fn presents_app(self) -> bool {
+        matches!(
+            self.adaptive_runtime_direct_reason(),
+            Some(
+                super::tool_definition::ToolDirectReason::Presentation
+                    | super::tool_definition::ToolDirectReason::Continuation
+            )
+        )
     }
 
-    pub fn gpt_action_description(self) -> Option<&'static str> {
-        self.model_spec
-            .map(|spec| spec.gpt_action_description.unwrap_or(spec.description))
-    }
-
-    pub fn context_continuity_policy(self) -> ToolContextContinuityPolicy {
-        self.policy.context_continuity
+    pub fn requires_individual_host_review(self) -> bool {
+        self.adaptive_runtime_direct_reason()
+            == Some(super::tool_definition::ToolDirectReason::HostReview)
     }
 
     pub fn session_evidence_policy(self) -> ToolSessionEvidencePolicy {
@@ -101,7 +107,9 @@ impl ToolDefinition {
                 ToolExplorationEvidence::Read | ToolExplorationEvidence::ReadBatch => {
                     return ToolActivityKind::Read;
                 }
-                ToolExplorationEvidence::Search | ToolExplorationEvidence::SearchBatch => {
+                ToolExplorationEvidence::Search
+                | ToolExplorationEvidence::SearchBatch
+                | ToolExplorationEvidence::SearchCompound => {
                     return ToolActivityKind::Search;
                 }
                 ToolExplorationEvidence::Navigation(_) => return ToolActivityKind::Navigate,
@@ -121,8 +129,7 @@ impl ToolDefinition {
                 return ToolActivityKind::Edit;
             }
             if self.execution.is_some()
-                || (self.category == TOOL_CATEGORY_JOB
-                    && self.session_evidence.persistent_shell.is_some())
+                || self.session_evidence.persistent_shell.is_some()
                 || self.metadata.effect == ToolEffect::Execute
                 || self.metadata.shell_like
                 || self.metadata.risk == ToolRisk::JobRun
@@ -151,10 +158,6 @@ impl ToolDefinition {
     #[cfg(any(test, feature = "root-test-support"))]
     pub fn requires_explicit_business_session(self) -> bool {
         self.policy.requires_explicit_business_session
-    }
-
-    pub fn uses_unit_arguments(self) -> bool {
-        self.policy.unit_arguments
     }
 
     pub fn requires_artifact_upload_path_binding(self) -> bool {
@@ -231,6 +234,20 @@ pub fn runtime_tool_execution_contract(name: &str) -> Option<ToolExecutionContra
     lookup_tool_definition(name).and_then(|definition| definition.execution)
 }
 
+/// Canonical nested-orchestration scheduling policy. Unknown/non-runtime names
+/// fail closed and are never composable by implication from effect metadata.
+pub fn runtime_tool_composition_policy(name: &str) -> ToolCompositionPolicy {
+    lookup_tool_definition(name)
+        .map(|definition| definition.composition)
+        .unwrap_or(ToolCompositionPolicy::Denied)
+}
+
+pub fn runtime_tool_host_orchestration_hint(name: &str) -> ToolHostOrchestrationHint {
+    lookup_tool_definition(name)
+        .map(|definition| definition.host_orchestration)
+        .unwrap_or(ToolHostOrchestrationHint::UNSPECIFIED)
+}
+
 pub fn runtime_tool_session_evidence_policy(name: &str) -> ToolSessionEvidencePolicy {
     lookup_tool_definition(name)
         .map(|definition| definition.session_evidence_policy())
@@ -291,25 +308,6 @@ pub fn runtime_tool_metadata(name: &str) -> ToolMetadata {
         Ok(definition) => definition.metadata(),
         Err(metadata) => metadata,
     }
-}
-
-fn tool_context_continuity_policy(name: &str) -> ToolContextContinuityPolicy {
-    lookup_tool_definition(name)
-        .map(|definition| definition.context_continuity_policy())
-        .unwrap_or(ToolContextContinuityPolicy::CONSERVATIVE)
-}
-
-#[cfg(any(test, feature = "root-test-support"))]
-pub fn runtime_tool_context_continuity_policy(name: &str) -> ToolContextContinuityPolicy {
-    tool_context_continuity_policy(name)
-}
-
-pub fn runtime_tool_accepts_context_ack(name: &str) -> bool {
-    tool_context_continuity_policy(name).accepts_context_ack
-}
-
-pub fn runtime_tool_advances_context_checkpoint(name: &str) -> bool {
-    tool_context_continuity_policy(name).advances_context_checkpoint()
 }
 
 pub fn runtime_tool_effect_annotations(name: &str) -> ToolEffectAnnotations {
@@ -414,6 +412,26 @@ pub fn is_model_visible_tool_name(name: &str) -> bool {
     lookup_tool_definition(name).is_some_and(|definition| definition.visibility.is_model_visible())
 }
 
+/// Whether an ordinary model-facing result may carry the passive Job-attention
+/// sidecar. Explicit Job lifecycle/control surfaces and the Window diagnostic
+/// remain self-describing and must not recursively consume the sidecar.
+pub fn runtime_tool_supports_passive_job_attention(name: &str) -> bool {
+    is_model_visible_tool_name(name)
+        && !matches!(
+            name,
+            "read_current_window_activity"
+                | "plugin_tool"
+                | "run_job"
+                | "run_detached_process"
+                | "observe_jobs"
+                | "list_jobs"
+                | "stop_job"
+                | "wait_for_job_readiness"
+                | "wait_for_job_terminal"
+                | "present_job_terminal_continuation"
+        )
+}
+
 #[cfg(any(test, feature = "root-test-support"))]
 pub fn is_model_hidden_tool_name(name: &str) -> bool {
     lookup_tool_definition(name).is_some_and(|definition| definition.visibility.is_model_hidden())
@@ -453,23 +471,6 @@ pub fn adaptive_runtime_direct_tool_definitions() -> Vec<&'static ToolDefinition
         )
     });
     definitions
-}
-
-/// GPT Actions ordinary direct exposure is a pure projection of Adaptive
-/// Runtime Direct. Protocol exceptions stay on the canonical ToolDefinition;
-/// there is deliberately no second rank or operation registry.
-pub fn gpt_action_direct_tool_definitions() -> Vec<&'static ToolDefinition> {
-    adaptive_runtime_direct_tool_definitions()
-        .into_iter()
-        .filter(|definition| definition.supports_gpt_actions())
-        .collect()
-}
-
-/// Admission predicate shared by GPT Action direct/gateway adapters. It says
-/// only that the canonical model-visible tool is protocol-compatible with GPT
-/// Actions; authority and execution remain kernel-owned.
-pub fn gpt_action_tool_supported(tool_name: &str) -> bool {
-    lookup_tool_definition(tool_name).is_some_and(|definition| definition.supports_gpt_actions())
 }
 
 pub fn model_visible_tool_names_csv() -> String {

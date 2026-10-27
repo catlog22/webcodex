@@ -18,19 +18,18 @@
 //! Polling remains a fully supported fallback transport.
 
 use crate::runner_http::{RunnerRegistry, RunnerTransport};
-use crate::runner_protocol::{RunnerEnvelope, RunnerRegisterRequest};
+use crate::runner_protocol::{RunnerEnvelope, RunnerRegisterRequest, RUNNER_ENVELOPE_MAX_BYTES};
 use futures_util::{SinkExt, StreamExt};
 use salvo::prelude::*;
 use salvo::websocket::{Message, WebSocket, WebSocketUpgrade};
 use serde_json::json;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Notify};
 
-/// Maximum WebSocket text message size. Runner requests/results carry shell
-/// output which can be sizeable; 8 MiB matches the registry output cap head
-/// room while still bounding memory.
-const WS_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
+/// Maximum WebSocket text message size. Keep it aligned with the shared
+/// transport-neutral Runner envelope budget.
+const WS_MAX_MESSAGE_SIZE: usize = RUNNER_ENVELOPE_MAX_BYTES;
 /// Deadline for the Runner to send its first `Register` envelope after the
 /// handshake. Prevents half-open connections from holding registry state.
 const REGISTER_TIMEOUT: Duration = Duration::from_secs(15);
@@ -180,12 +179,32 @@ async fn handle_runner_ws(
         let mut sink = sink;
         let mut out_rx = out_rx;
         while let Some(env) = out_rx.recv().await {
+            let envelope_kind = env.kind();
+            let send_started = Instant::now();
             let Ok(json) = env.to_json() else {
+                crate::runner_http::observe_server_stream_writer_send(
+                    RunnerTransport::WebSocket,
+                    envelope_kind,
+                    None,
+                    crate::runner_http::RunnerStreamMetricOutcome::TransportError,
+                );
                 return crate::runner_session::WriterExit::TransportFailed;
             };
             if sink.send(Message::text(json)).await.is_err() {
+                crate::runner_http::observe_server_stream_writer_send(
+                    RunnerTransport::WebSocket,
+                    envelope_kind,
+                    None,
+                    crate::runner_http::RunnerStreamMetricOutcome::TransportError,
+                );
                 return crate::runner_session::WriterExit::TransportFailed;
             }
+            crate::runner_http::observe_server_stream_writer_send(
+                RunnerTransport::WebSocket,
+                envelope_kind,
+                Some(send_started.elapsed()),
+                crate::runner_http::RunnerStreamMetricOutcome::Success,
+            );
         }
         if sink.close().await.is_err() {
             crate::runner_session::WriterExit::TransportFailed
@@ -206,7 +225,7 @@ async fn handle_runner_ws(
             connection_id: &connection_id,
             notify,
             cancel,
-            transport_label: "websocket",
+            transport: RunnerTransport::WebSocket,
         },
         out_tx,
         reader,
@@ -300,7 +319,7 @@ mod tests {
     use crate::runner_protocol::{
         ClaudeCodeProviderStatus, ProviderCallSummary, RunnerCapabilities, RunnerPolicySummary,
         RunnerProtocolGenerationNumber, RunnerRegisterRequest, RunnerResultRequest,
-        ShellJobOpRequest, ShellRunRequest, ToolProvidersStatus,
+        ShellRunRequest, ToolProvidersStatus,
     };
     use salvo::conn::{Acceptor, Listener};
     use std::net::SocketAddr;
@@ -308,6 +327,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     use tokio_tungstenite::tungstenite::http::HeaderValue;
     use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
+    use webcodex_runner_registry::JobStartRequest;
 
     async fn wait_for_ws_client_connected(
         registry: &RunnerRegistry,
@@ -353,84 +373,19 @@ mod tests {
     fn register_envelope_with_instance(client_id: &str, instance_id: &str) -> RunnerEnvelope {
         RunnerEnvelope::Register {
             payload: RunnerRegisterRequest {
-                process_started_at: None,
-                build: None,
-                job_concurrency_limit: None,
-                job_inventory: None,
-                coding_agent_providers: None,
-                coding_agent_inventory: None,
-                client_id: client_id.to_string(),
-                runner_instance_id: instance_id.to_string(),
-                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
                 display_name: Some("ws-test".to_string()),
                 owner: Some("tester".to_string()),
-                hostname: None,
-                host_context: None,
-                capabilities: crate::test_support::current_runner_capabilities(
+                policy: Some(RunnerPolicySummary::default()),
+                ..crate::test_support::runner_registration(
+                    client_id,
+                    instance_id,
                     RunnerCapabilities {
-                        shell: true,
-                        file_read: true,
-                        file_write: true,
-                        artifact_export_chunk_read: false,
-                        artifact_export_streaming_metadata: false,
-                        structured_file_delete: true,
-                        apply_text_edit_occurrence: false,
-                        apply_text_edit_line_scope: false,
-                        apply_patch: false,
-                        apply_patch_match_metadata: false,
-                        apply_patch_matching_mode: false,
-                        apply_patch_strict_matching: false,
-                        git: false,
-                        jobs: true,
-                        async_jobs: true,
-                        async_shell_jobs: true,
-                        ssh_shell: false,
-                        persistent_shell: false,
-                        ssh_persistent_shell: false,
-                        structured_validation_argv: true,
-                        structured_cargo_test_count_assertion: true,
                         structured_cargo_test_execution_policy: true,
                         structured_cargo_test_lib: true,
-                        structured_go_test_json: true,
-                        structured_go_test_tool: true,
-                        structured_go_test_packages: true,
-                        structured_process_argv: true,
-                        structured_script_payload: false,
-                        structured_script_javascript: false,
-                        structured_script_typescript: false,
-                        internal_posix_script: false,
-                        structured_execution_jobs: false,
-                        detached_process_jobs: false,
-                        lsp_read_only_navigation: false,
-                        lsp_call_hierarchy: false,
-                        project_lifecycle: false,
-                        project_path_registration: false,
-                        managed_worktree: false,
-                        skill_runtime: false,
-                        skill_management: false,
-                        computer_observe: false,
-                        computer_application_discovery: false,
-                        computer_application_launch: false,
-                        computer_display_observe: false,
-                        computer_pointer_control: false,
-                        computer_clipboard_read: false,
-                        computer_clipboard_write: false,
-                        computer_snapshot_region: false,
-                        computer_accessibility_observe: false,
-                        computer_element_state: false,
-                        computer_control: false,
-                        computer_scroll_to_element: false,
-                        computer_key_input: false,
-                        computer_window_activate: false,
-                        computer_text_input: false,
-                        job_state_reconciliation: false,
-                        coding_agent_runs: false,
-                        native_tool_plugins: false,
-                        managed_ssh_resources: false,
-                        runner_config_control: false,
+                        structured_cargo_check_packages: true,
+                        ..Default::default()
                     },
-                ),
-                policy: Some(RunnerPolicySummary::default()),
+                )
             },
         }
     }
@@ -634,6 +589,7 @@ mod tests {
         let (request_id, mut result_rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "shared-a".to_string(),
                     cwd: None,
                     command: "echo shared-a".to_string(),
@@ -661,6 +617,8 @@ mod tests {
                     exit_code: Some(0),
                     stdout: Some("spoofed".to_string()),
                     stderr: None,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: Some(1),
                     error: None,
                 }
@@ -688,6 +646,8 @@ mod tests {
                     exit_code: Some(0),
                     stdout: Some("authentic".to_string()),
                     stderr: None,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: Some(1),
                     error: None,
                 }
@@ -792,10 +752,11 @@ mod tests {
         }
 
         // Enqueue a synchronous run request via the registry (same path the
-        // GPT Actions / MCP surface uses). The pump should push it.
+        // MCP surface uses). The pump should push it.
         let (request_id, rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "ws-roundtrip".to_string(),
                     cwd: None,
                     command: "echo hi".to_string(),
@@ -828,6 +789,8 @@ mod tests {
                 exit_code: Some(0),
                 stdout: Some("hi".to_string()),
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: Some(1),
                 error: None,
             }
@@ -850,6 +813,7 @@ mod tests {
 
         ws.send(TungsteniteMessage::Text(
             RunnerEnvelope::RuntimeMetadata {
+                computer_session_availability: None,
                 tool_providers: provider_status(),
                 mcp_gateway_providers: Some(vec![crate::mcp_gateway::McpGatewayProvider {
                     provider_id: "blender".to_string(),
@@ -1156,6 +1120,7 @@ mod tests {
                 let (request_id, rx) = registry
                     .enqueue_run(
                         ShellRunRequest {
+                            login: false,
                             client_id: "ws-slow".to_string(),
                             cwd: None,
                             command: "echo hi".to_string(),
@@ -1192,6 +1157,8 @@ mod tests {
                     exit_code: Some(0),
                     stdout: Some("hi".to_string()),
                     stderr: None,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
                     duration_ms: Some(1),
                     error: None,
                 }
@@ -1230,20 +1197,13 @@ mod tests {
         // Start an async job via the registry (same path the API uses).
         let job = registry
             .start_job(
-                ShellJobOpRequest {
-                    op: "start".to_string(),
-                    client_id: Some("ws-lost".to_string()),
-                    cwd: None,
-                    command: Some("sleep 30".to_string()),
-                    timeout_secs: Some(30),
-                    job_id: None,
-                    since_stdout_line: None,
-                    since_stderr_line: None,
-                    tail_lines: None,
-                    limit: None,
-                    codex: None,
+                JobStartRequest {
+                    timeout_secs: 30,
+                    ..JobStartRequest::shell("ws-lost".to_string(), "sleep 30".to_string())
                 },
                 "tester".to_string(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1461,20 +1421,13 @@ mod tests {
         // Start a job under B.
         let job = registry
             .start_job(
-                ShellJobOpRequest {
-                    op: "start".to_string(),
-                    client_id: Some("ws-stale-disc".to_string()),
-                    cwd: None,
-                    command: Some("sleep 30".to_string()),
-                    timeout_secs: Some(30),
-                    job_id: None,
-                    since_stdout_line: None,
-                    since_stderr_line: None,
-                    tail_lines: None,
-                    limit: None,
-                    codex: None,
+                JobStartRequest {
+                    timeout_secs: 30,
+                    ..JobStartRequest::shell("ws-stale-disc".to_string(), "sleep 30".to_string())
                 },
                 "tester".to_string(),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -1640,6 +1593,7 @@ mod tests {
         let (request_id, _rx) = registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id: "ws-steal".to_string(),
                     cwd: None,
                     command: "echo hi".to_string(),

@@ -5,41 +5,102 @@ use super::common::{
     wrapped_output_schema,
 };
 
+fn mcp_workflow_tools_schema() -> Value {
+    json!({
+        "type":"object", "additionalProperties":false,
+        "properties":{
+            "goals":{"type":"boolean"},
+            "agent_continuation":{"type":"boolean"},
+            "job_continuation":{"type":"boolean"}
+        },
+        "required":["goals", "agent_continuation", "job_continuation"]
+    })
+}
+
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
-        "runtime_status" => Some(wrapped_output_schema(vec![
+        "read_current_window_activity" => Some(wrapped_output_schema(vec![
+            ("status", json!({"type":"string","enum":["available","unavailable"]})),
+            ("reason_code", schema_type("string", "Bounded reason when current Window, authenticated principal, runtime:read, or activity storage is unavailable.")),
+            ("events", json!({"type":"array","maxItems":50,"description":"Newest first, sanitized current-Window events after principal and current Project visibility filtering. No arguments, outputs, raw payloads, native paths, credentials, or principal identifiers.","items":{"type":"object","additionalProperties":false,"properties":{
+                "request_observed_at_ms":{"type":"integer"},
+                "response_handed_at_ms":{"type":"integer","description":"WebCodex response constructed and handed to HTTP framework / handler returned. No client, Host, ChatGPT, or model-continuation receipt is implied."},
+                "started_at_ms":{"type":"integer"},"ended_at_ms":{"type":"integer"},"duration_ms":{"type":"integer"},
+                "service_ms":{"type":"integer"},
+                "next_call_gap_ms":{"type":["integer","null"],"description":"Observed only from a later canonical meaningful call in this principal and Window; null means no serial gap was observed, never elapsed time."},
+                "cycle_ms":{"type":"integer"},"window_transition_kind":{"type":"string"},"response_streaming":{"type":"boolean"},
+                "method":{"type":"string"},"tool_name":{"type":"string"},"activity_presentation":{"type":"string"},"activity_kind":{"type":"string"},
+                "project":{"type":"string"},"status":{"type":"string"},"http_status":{"type":"integer"},"meaningful":{"type":"boolean"},
+                "server_trace_id":{"type":"string"},"workflow_sessions":{"type":"array","items":{"type":"object","additionalProperties":false,"properties":{"workflow_session_id":{"type":"string"},"project":{"type":"string"},"relation":{"type":"string"}},"required":["workflow_session_id","relation"]}},
+                "code_mode_composition":open_object_schema("Validated bounded nested WebCodex Code Mode composition when available.")
+            },"required":["started_at_ms","ended_at_ms","duration_ms","method","status","meaningful","workflow_sessions"]}})),
+            ("summary", current_window_activity_summary_schema()),
+            ("active_requests", json!({"type":"array","maxItems":8,"items":{"type":"object","additionalProperties":false,"properties":{"server_trace_id":{"type":"string"},"tool_name":{"type":["string","null"]},"started_at_ms":{"type":"integer"}},"required":["server_trace_id","tool_name","started_at_ms"]}})),
+            ("truncated", schema_type("boolean", "Visible events from the bounded recent scan were omitted by the presentation or serialized byte bound; this is not a lifetime-history completeness claim.")),
+        ])),
+        "get_runtime_status" => Some(wrapped_output_schema(vec![
+            ("mcp_host", json!({
+                "type": "object", "additionalProperties": false,
+                "description": "Current request's effective Host profile and its provenance, alongside the immutable deployment default. This is guidance/wait strategy, never execution authority.",
+                "properties": {
+                    "profile": {"type": "string", "enum": ["direct", "host_code_mode"], "description": "Profile effective for this request."},
+                    "deployment_profile": {"type": "string", "enum": ["direct", "host_code_mode"]},
+                    "profile_source": {"type": "string", "enum": ["deployment", "request_header"]}
+                },
+                "required": ["profile", "deployment_profile", "profile_source"]
+            })),
+            ("compatibility", open_object_schema("Sparse fleet protocol, build/source alignment and mixed-build evidence; no per-Runner rows.")),
+            ("connection", open_object_schema("Sparse process, transport and Project registry states without timestamps.")),
+
             ("service", schema_type("string", "Runtime service name.")),
-            (
-                "runtime_exposure",
-                schema_type(
-                    "string",
-                    "Configured runtime exposure: local_coding, adaptive_runtime, full_operator_runtime, or project_connector.",
-                ),
-            ),
             (
                 "mcp_compact_schemas",
                 schema_type(
                     "boolean",
-                    "Whether MCP tools/list omits outputSchema while retaining tool names, descriptions, inputSchema, and annotations. This is MCP discovery schema compaction, not runtime_status compact=true response shaping or GPT Action response compaction.",
+                    "Whether MCP tools/list omits outputSchema while retaining tool names, descriptions, inputSchema, and annotations. This is MCP discovery schema compaction, not get_runtime_status compact=true response shaping.",
                 ),
             ),
             (
                 "effective_config",
                 json!({
                     "type": "object",
-                    "description": "Safe allowlisted effective configuration of the running Server. This is distinct from runtime_status compact=true response shaping and from health or transport state.",
+                    "description": "Safe allowlisted effective configuration of the running Server. This is distinct from get_runtime_status compact=true response shaping and from health or transport state.",
                     "additionalProperties": false,
                     "properties": {
                         "auth": {
                             "type": "object",
                             "additionalProperties": false,
                             "properties": {
-                                "shared_key_enabled": {"type": "boolean", "description": "Whether direct shared-key quick-start authentication is effective for the running Server; false under the project-bound ProjectConnector exposure."},
-                                "anonymous_enabled": {"type": "boolean", "description": "Whether explicit open-anonymous access is effective for the running Server; false under the project-bound ProjectConnector exposure."},
+                                "shared_key_configured": {"type": "boolean", "description": "Deployment shared-key configuration before the remote-boundary policy is applied."},
+                                "shared_key_remote_enabled": {"type": "boolean", "description": "Explicit deployment opt-in for shared-key use at a remote boundary."},
+                                "shared_key_enabled": {"type": "boolean", "description": "Whether direct shared-key quick-start authentication is effective for the running Server."},
+                                "anonymous_enabled": {"type": "boolean", "description": "Whether explicit open-anonymous access is effective for the running Server."},
                                 "oauth2_enabled": {"type": "boolean", "description": "Whether OAuth2 support was enabled in the running Server configuration."},
                                 "oauth2_shared_key_bridge_enabled": {"type": "boolean", "description": "Whether the OAuth2 shared-key bridge is enabled in the running OAuth2 configuration; false whenever OAuth2 itself is disabled. This public OAuth flow is distinct from direct Bearer shared-key authentication."}
                             },
-                            "required": ["shared_key_enabled", "anonymous_enabled", "oauth2_enabled", "oauth2_shared_key_bridge_enabled"]
+                            "required": ["shared_key_configured", "shared_key_enabled", "shared_key_remote_enabled", "anonymous_enabled", "oauth2_enabled", "oauth2_shared_key_bridge_enabled"]
+                        },
+                        "mcp_host": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "description": "Effective Server-side MCP Host timing policy. This adapts MCP waiting only; it is not a command runtime timeout or Runner configuration.",
+                            "properties": {
+                                "profile": {"type": "string", "enum": ["direct", "host_code_mode"]},
+                                "host_budget_secs": {"type": "integer", "minimum": 1},
+                                "max_sync_wait_secs": {"type": "integer", "minimum": 1},
+                                "continuation_wait_secs": {"type": "integer", "minimum": 1}
+                            },
+                            "required": ["profile", "host_budget_secs", "max_sync_wait_secs", "continuation_wait_secs"]
+                        },
+                        "mcp_tool_exposure": {
+                            "type": "object", "additionalProperties": false,
+                            "description": "Startup MCP workflow-tool defaults and exact OAuth-client override count. No client identifiers or credentials.",
+                            "properties": {
+                                "adaptive": mcp_workflow_tools_schema(),
+                                "cli": mcp_workflow_tools_schema(),
+                                "oauth_client_overrides": {"type":"integer", "minimum":0, "maximum":64}
+                            },
+                            "required":["adaptive", "cli", "oauth_client_overrides"]
                         },
                         "tool_request_trace_mode": {
                             "type": "string",
@@ -47,7 +108,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                             "description": "Effective bounded tool-request trace mode; no trace paths, request bodies, headers, or environment values are exposed."
                         }
                     },
-                    "required": ["auth", "tool_request_trace_mode"]
+                    "required": ["auth", "mcp_host", "mcp_tool_exposure", "tool_request_trace_mode"]
                 }),
             ),
             ("version", schema_type("string", "Runtime version.")),
@@ -79,11 +140,11 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "projects",
-                open_object_schema("Project counts from the Runner registry. Prefer projects.effective for model-facing status."),
+                open_object_schema("Project counts from the Runner registry; sparse returns count, online_count and status. Full includes effective and runner_registered."),
             ),
             (
-                "agents",
-                open_object_schema("Runner counts and client summaries. Per-client host_context is bounded Runner-configured advisory data, not observed truth or authority. job_concurrency contains the static Runner limit plus caller-visible running and queued counts. Canonical top-level counts are count, online_count, and stale_count in full, compact, and summary_only output."),
+                "runners",
+                open_object_schema("Sparse fleet returns aggregate counts only. Full includes a single clients collection using runner_instance_id and runner_protocol_generation; summary contains only aggregate counts. Omitted in focused compact/summary mode. Per-client host_context is bounded Runner-configured advisory data, not observed truth or authority. job_concurrency contains the static Runner limit plus caller-visible running and queued counts. Canonical top-level counts are count, online_count, and stale_count in full, compact, and summary_only output."),
             ),
             (
                 "jobs",
@@ -100,9 +161,23 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
         ])),
         "read_tool_trace" => Some(wrapped_output_schema(vec![
-            ("trace_mode", schema_type("string", "Trace mode; read_tool_trace requires full.")),
+            ("trace_mode", schema_type("string", "Observed captured mode: metadata, full, or unknown.")),
+            ("capture_mode", schema_type("string", "Current capture switch; separate from retained data.")),
+            ("capture_health", open_object_schema("Process-since-start queue/budget/write failure counters; not per-trace completeness or prior-process history.")),
+            ("response_handoff_observed", schema_type("boolean", "A handler-return event exists in the retained index; absence is inconclusive and presence does not prove remote delivery.")),
+            ("status", schema_type("string", "available or unavailable; missing capture does not prove absent execution.")),
+            ("coverage", schema_type("string", "Coverage boundary; observed events are not a completeness guarantee.")),
+            ("events", array_schema(open_object_schema("One retained lifecycle or bounded diagnostic event."), "Byte- and count-bounded event page.")),
+            ("calls", array_schema(open_object_schema("One observed ActionAudit call, with exact trace and optional Window identity."), "Time/filter-bounded call page.")),
+            ("windows", array_schema(open_object_schema("Window candidate aggregated only from the returned call page."), "Observed candidate Windows; no guessed links.")),
+            ("query", open_object_schema("Effective fixed query interval and filters; reuse on the next page.")),
+            ("entry_count", schema_type("integer", "Retained trace event count.")),
+            ("max_page_bytes", schema_type("integer", "Diagnostic event page byte bound.")),
+            ("possible_reasons", array_schema(schema_type("string", "Possible, not established, absence reason."), "Unknown missing-capture causes.")),
+            ("delivery_boundary", schema_type("string", "Server handoff is not downstream receipt or model reading.")),
+            ("window_summary_scope", schema_type("string", "Window counts describe only returned calls.")),
             ("payload_count", schema_type("integer", "Total indexed payloads in this trace.")),
-            ("returned_count", schema_type("integer", "Payload metadata entries returned in listing mode.")),
+            ("returned_count", schema_type("integer", "Entries returned in the selected call/event listing mode.")),
             ("offset", schema_type("integer", "Listing offset.")),
             ("next_offset", nullable_schema("integer", "Next listing offset or null.")),
             ("payloads", array_schema(open_object_schema("Safe payload metadata: payload_index, phase, payload_bytes, compressed_bytes, payload_sha256, and payload_available. Native paths are never returned."), "Bounded payload metadata.")),
@@ -115,19 +190,43 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("reason", schema_type("string", "Bounded reason when a payload is not model-readable.")),
             ("payload", json!({"description": "Selected raw JSON trace payload of any JSON type. May contain sensitive tool data; operator-only."})),
         ])),
+        "resolve_workspace" => Some(wrapped_output_schema(vec![
+            ("resolution", json!({"type":"string","enum":["resolved","ambiguous","not_found","incomplete"]})),
+            ("source", schema_type("string", "Registered Project inventory, not filesystem discovery.")),
+            ("client_id", schema_type("string", "Exact selected Runner.")),
+            ("connected", schema_type("boolean", "Last observed Runner connection state.")),
+            ("matched_count", schema_type("integer", "Observed matching registrations before limit; not a complete count while resolution=incomplete.")),
+            ("truncated", schema_type("boolean", "More candidates require a narrower query.")),
+            ("workspace", open_object_schema("Unique exact registration; Git fields remain unverified inventory.")),
+            ("candidates", array_schema(open_object_schema("Authorized candidate."), "Observed candidates when ambiguous, incomplete or not found; never auto-selected.")),
+        ])),
+        "unregister_projects" => Some(wrapped_output_schema(vec![
+            ("dry_run", schema_type("boolean", "True for observational preflight; never a future lease.")),
+            ("changed", schema_type("boolean", "At least one registration is known changed.")),
+            ("outcome_unknown", schema_type("boolean", "An item requires reconciliation; later items were not attempted.")),
+            ("items", array_schema(open_object_schema("Input-indexed Project result with success/output/error; partial outcomes are not atomic."), "Per-item results.")),
+        ])),
         "list_projects" => Some(wrapped_output_schema(vec![
+            ("hint", schema_type("string", "Guidance when no caller-visible Projects match the filters; does not disclose hidden resources.")),
             (
                 "projects",
-                array_schema(open_object_schema("Project summary including capabilities.git_available, supports_cleanup_verification, and recommended_for_smoke."), "Runtime projects."),
+                {
+                    let mut schema = array_schema(open_object_schema("Project identity/path/state summary; exact id and optional principal-scoped project_ref remain reusable. Full mode also includes revision, policy, shell and smoke capabilities."), "Bounded page of caller-visible Runtime projects.");
+                    schema["maxItems"] = json!(100);
+                    schema
+                },
             ),
-            ("count", schema_type("integer", "Project count.")),
+            ("count", schema_type("integer", "Projects returned on this page.")),
+            ("offset", schema_type("integer", "Effective live offset after authorization, filtering and stable Runtime ID ordering.")),
+            ("limit", schema_type("integer", "Effective page size; default 30, maximum 100 for canonical tools.")),
+            ("next_offset", nullable_schema("integer", "Next live offset or null when no later page remains. Changes to registry or visibility may repeat/omit rows; restart at zero and deduplicate IDs.")),
             (
                 "matched_count",
                 schema_type("integer", "Caller-visible Project count matching filters before limit."),
             ),
             (
                 "truncated",
-                schema_type("boolean", "Whether limit truncated matching Projects."),
+                schema_type("boolean", "Whether later matching Projects remain after this page."),
             ),
             (
                 "recommended_for_smoke",
@@ -138,13 +237,20 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
         ])),
         "list_runners" => Some(wrapped_output_schema(vec![
+            ("hint", schema_type("string", "Guidance when no caller-visible Runners match the filters; does not disclose hidden resources.")),
+            ("matched_count", schema_type("integer", "Visible matching Runners before paging.")),
+            ("truncated", schema_type("boolean", "The page omits some currently matching Runners, including earlier pages.")),
+            ("offset", schema_type("integer", "Requested zero-based offset in stable client_id order.")),
+            ("limit", schema_type("integer", "Effective page size, default 30 and at most 100.")),
+            ("has_more", schema_type("boolean", "More matching Runners follow this page in the current authorized inventory.")),
+            ("next_offset", json!({"type":["integer","null"],"minimum":0,"description":"Continue with the same filters and this offset; null at the end. Inventory or authorization changes may repeat/skip entries; restart at zero to reconcile."})),
             (
-                "agents",
-                array_schema(open_object_schema("Runner summary including bounded Runner-configured host_context advisory data, never authority or proof of current state, plus job_concurrency limit/running/queued facts."), "Legacy compatibility key containing Runner summaries."),
+                "runners",
+                json!({"type":"array","maxItems":100,"items":open_object_schema("Compact Runner identity/status and Project/Job counts by default. Explicit detail adds build, capabilities, path-free project_inventory synchronization status and advisory host_context. Explicit projects contains at most 100 enabled entries with projects_offset, projects_returned_count, projects_truncated and nullable projects_next_offset; continue list_runners with exact client_id and projects_offset. projects_count is the full enabled count. Never authority."),"description":"Canonical Runner collection in client_id order; runner_instance_id and runner_protocol_generation remain exact."}),
             ),
             (
-                "clients",
-                array_schema(open_object_schema("Runner client summary including job_concurrency limit/running/queued facts."), "Runner client summaries."),
+                "summary",
+                open_object_schema("Aggregate count, online, offline, and stale counts; Runner entries appear only in runners."),
             ),
             ("count", schema_type("integer", "Runner/client count.")),
         ])),
@@ -218,7 +324,9 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("string", "Recommended next discovery action."),
             ),
         ])),
-        "tool_manifest" => Some(wrapped_output_schema(vec![
+        "read_tool_manifest" => {
+            let fields = vec![
+            ("query", nullable_schema("string", "Literal discovery filter; never invocation authority.")),
             (
                 "name",
                 schema_type(
@@ -235,23 +343,14 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "route",
-                json!({
-                    "type": "object",
-                    "description": "Current ModelSurface invocation route only. This never grants scope, project authority, feature availability, or permission.",
-                    "additionalProperties": false,
-                    "properties": {
-                        "mode": {
-                            "type": "string",
-                            "enum": ["direct", "gateway", "unavailable"]
-                        },
-                        "via": {
-                            "type": "string",
-                            "const": "call_runtime_tool",
-                            "description": "Gateway entry point, present only when mode=gateway."
-                        }
-                    },
-                    "required": ["mode"]
-                }),
+                tool_manifest_invocation_route_schema(),
+            ),
+            (
+                "routing_note",
+                schema_type(
+                    "string",
+                    "Model-facing routing guidance. read_tool_manifest discovery never dynamically registers a new Host tool.",
+                ),
             ),
             (
                 "input_schema",
@@ -300,6 +399,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "execution",
                 execution_selection_schema(),
+            ),
+            (
+                "host_orchestration",
+                host_orchestration_schema(),
             ),
             (
                 "schema_version",
@@ -369,7 +472,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                                 "availability": {
                                     "type": "string",
                                     "enum": ["direct", "gateway", "unavailable"],
-                                    "description": "Invocation route on the current MCP ModelSurface only; authorization, feature gates, and project authority are checked separately."
+                                    "description": "Invocation route on canonical Adaptive Runtime only; authorization, feature gates, and project authority are checked separately."
                                 },
                                 "gateway_tool": {
                                     "anyOf": [
@@ -402,8 +505,8 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "available_intents",
                 array_schema(
-                    schema_type("string", "Supported tool_manifest intent name."),
-                    "Stable list of supported tool_manifest intent names used for discovery filtering only.",
+                    schema_type("string", "Supported read_tool_manifest intent name."),
+                    "Stable list of supported read_tool_manifest intent names used for discovery filtering only.",
                 ),
             ),
             (
@@ -463,13 +566,182 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             (
                 "recommended_flows",
                 array_schema(
-                    open_object_schema("Recommended tool flow with name, purpose, and tools; filtered partial projections also identify partial=true and omitted_tools."),
+                    open_object_schema("Recommended tool flow with name, purpose, and tools; filtered partial projections also identify partial=true and omitted_tools for canonical members not selected into that projection."),
                     "Short list of recommended tool flows for common tasks.",
                 ),
             ),
-        ])),
+        ];
+            #[cfg(feature = "experimental-code-mode")]
+            let fields = {
+                let mut fields = fields;
+                fields.push((
+                    "code_mode_callable_contract",
+                    open_object_schema(
+                        "Bounded presentation-only callable contract attached only to exact Code Mode entry-tool discovery. It is derived from canonical ToolSpecs plus the existing Code Mode admission policy and grants no authority.",
+                    ),
+                ));
+                fields
+            };
+            Some(wrapped_output_schema(fields))
+        }
         _ => None,
     }
+}
+
+fn current_window_activity_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Descriptive factual metrics over the bounded visible event scan. Gap fields are WebCodex-observed serial request timing only; they do not identify Host cells, model turns, thinking time, frontend delay, network delay, or user delay.",
+        "additionalProperties": false,
+        "properties": {
+            "events_scanned": {"type":"integer"},
+            "meaningful_call_count": {"type":"integer"},
+            "observe_jobs_count": {"type":"integer"},
+            "observe_jobs_ratio_denominator": {"type":"integer"},
+            "observe_jobs_ratio": {"type":["number","null"]},
+            "handler_returned_count": {"type":"integer"},
+            "missing_handoff_count": {"type":"integer"},
+            "overlapping_call_count": {"type":"integer","description":"Count of persisted window_transition_kind=overlap facts; never inferred from a short gap."},
+            "serial_call_count": {"type":"integer"},
+            "observed_next_call_gap_count": {"type":"integer"},
+            "gaps_lt_1s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps below 1 second."},
+            "gaps_lt_2s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps below 2 seconds; includes gaps_lt_1s."},
+            "gaps_lt_5s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps below 5 seconds; includes the lower less-than thresholds."},
+            "gaps_ge_5s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps at least 5 seconds."},
+            "gaps_ge_10s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps at least 10 seconds; a subset of gaps_ge_5s."},
+            "gaps_ge_30s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps at least 30 seconds."},
+            "gaps_ge_120s": {"type":"integer","description":"Cumulative count of observed serial next-call gaps at least 120 seconds."},
+            "total_service_ms": {"type":"integer"},
+            "total_positive_observed_next_call_gap_ms": {"type":"integer"},
+            "max_service_ms": {"type":["integer","null"]},
+            "max_observed_next_call_gap_ms": {"type":["integer","null"]},
+            "returned_nested_code_mode_child_count": {"type":"integer"}
+        },
+        "required": [
+            "events_scanned",
+            "meaningful_call_count",
+            "observe_jobs_count",
+            "observe_jobs_ratio_denominator",
+            "observe_jobs_ratio",
+            "handler_returned_count",
+            "missing_handoff_count",
+            "overlapping_call_count",
+            "serial_call_count",
+            "observed_next_call_gap_count",
+            "gaps_lt_1s",
+            "gaps_lt_2s",
+            "gaps_lt_5s",
+            "gaps_ge_5s",
+            "gaps_ge_10s",
+            "gaps_ge_30s",
+            "gaps_ge_120s",
+            "total_service_ms",
+            "total_positive_observed_next_call_gap_ms",
+            "max_service_ms",
+            "max_observed_next_call_gap_ms",
+            "returned_nested_code_mode_child_count"
+        ]
+    })
+}
+
+fn tool_manifest_invocation_route_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Parser-ready Adaptive Runtime invocation routing. Discovery never registers a Host tool and never grants authority.",
+        "additionalProperties": false,
+        "properties": {
+            "primary": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["direct", "gateway", "unavailable"]
+                    },
+                    "tool": {
+                        "anyOf": [
+                            {"type": "string"},
+                            {"type": "null"}
+                        ]
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "Canonical runtime target when primary execution uses the gateway or the tool is unavailable."
+                    }
+                },
+                "required": ["mode", "tool"]
+            },
+            "fallback": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": {
+                            "mode": {"type": "string", "const": "gateway"},
+                            "tool": {"type": "string", "const": "call_runtime_tool"},
+                            "target": {"type": "string"},
+                            "when": {
+                                "type": "string",
+                                "const": "direct_callable_unavailable"
+                            },
+                            "blocked_when_mcp_apps_enabled": {"type": "boolean"}
+                        },
+                        "required": [
+                            "mode",
+                            "tool",
+                            "target",
+                            "when",
+                            "blocked_when_mcp_apps_enabled"
+                        ]
+                    },
+                    {"type": "null"}
+                ],
+                "description": "Gateway fallback for an ordinary direct tool when the Host direct callable is absent; null when no fallback applies."
+            },
+            "tool_manifest_registers_host_tool": {
+                "type": "boolean",
+                "const": false
+            },
+            "discovery_effect": {
+                "type": "string",
+                "const": "none"
+            }
+        },
+        "required": [
+            "primary",
+            "fallback",
+            "tool_manifest_registers_host_tool",
+            "discovery_effect"
+        ]
+    })
+}
+
+fn host_orchestration_schema() -> Value {
+    json!({
+        "type": "object",
+        "description": "Static guidance-only Host-native orchestration hints derived from ToolDefinition. They grant no authority and do not change ToolCompositionPolicy, effects, permissions, retry, idempotency, or runtime scheduling.",
+        "additionalProperties": false,
+        "properties": {
+            "guidance_only": {"type": "boolean", "const": true},
+            "concurrency": {
+                "type": "string",
+                "enum": ["unspecified", "independent_parallel_read", "sequential"]
+            },
+            "native_batch_field": {
+                "anyOf": [
+                    {"type": "string", "maxLength": 64},
+                    {"type": "null"}
+                ]
+            },
+            "compound_preferred": {"type": "boolean"}
+        },
+        "required": [
+            "guidance_only",
+            "concurrency",
+            "native_batch_field",
+            "compound_preferred"
+        ]
+    })
 }
 
 fn execution_selection_schema() -> Value {

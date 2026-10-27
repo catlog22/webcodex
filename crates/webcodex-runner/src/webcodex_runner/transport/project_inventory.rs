@@ -1,12 +1,12 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::runner_protocol::{
+use crate::webcodex_runner::config::RunnerConfig;
+use crate::webcodex_runner::projects::RunnerProjectCache;
+use webcodex_core::runner_protocol::{
     RunnerEnvelope, RunnerProjectSummary, ShellProjectInventoryPage, ShellProjectInventoryStatus,
     PROJECT_INVENTORY_PAGE_MAX_SERIALIZED_BYTES, PROJECT_INVENTORY_PAGE_MAX_SUMMARIES,
 };
-use crate::webcodex_runner::config::RunnerConfig;
-use crate::webcodex_runner::projects::RunnerProjectCache;
 
 use super::{format_delay, RetryBackoff, RunnerRuntimeState, StreamTransport};
 
@@ -27,6 +27,43 @@ pub(super) const PROJECT_INVENTORY_STAGING_RETRY_BACKOFF_STEPS: [Duration; 5] = 
 pub(super) const POLLING_PROJECT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 static NEXT_PROJECT_INVENTORY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Fixtures can supply an exact snapshot; production scans only after the
+/// authenticated registration acknowledgement, off the transport thread.
+pub(super) enum InitialProjectInventory {
+    Snapshot(Vec<RunnerProjectSummary>),
+    Scan,
+    #[cfg(test)]
+    Disabled,
+}
+
+pub(super) type ProjectScanReceiver =
+    tokio::sync::watch::Receiver<Option<std::sync::Arc<Vec<RunnerProjectSummary>>>>;
+
+/// Shared across transport sessions so a mutation fences an in-flight scan even
+/// after its original stream disconnects.
+pub(super) struct InitialProjectScanState {
+    pub(super) receiver: Option<ProjectScanReceiver>,
+    pub(super) invalidated: bool,
+    pub(super) changed: tokio::sync::watch::Sender<()>,
+}
+
+impl Default for InitialProjectScanState {
+    fn default() -> Self {
+        let (changed, _) = tokio::sync::watch::channel(());
+        Self {
+            receiver: None,
+            invalidated: false,
+            changed,
+        }
+    }
+}
+
+impl From<Vec<RunnerProjectSummary>> for InitialProjectInventory {
+    fn from(projects: Vec<RunnerProjectSummary>) -> Self {
+        Self::Snapshot(projects)
+    }
+}
 
 fn next_project_inventory_sequence() -> u64 {
     NEXT_PROJECT_INVENTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
@@ -241,7 +278,11 @@ pub(super) fn try_queue_project_inventory_page(
         .map(|state| (state.total_reported(), state.current_page()));
     match next {
         Some((_, Ok(Some(page)))) => {
-            let _ = out_tx.try_send(RunnerEnvelope::ProjectInventoryPage { page });
+            let _ = super::try_send_runner_stream_control(
+                transport,
+                out_tx,
+                RunnerEnvelope::ProjectInventoryPage { page },
+            );
         }
         Some((_, Ok(None))) => {
             *sync = None;
@@ -383,6 +424,13 @@ impl StreamingProjectInventoryCoordinator {
             project_cache: RunnerProjectCache::default(),
             retry_backoff: RetryBackoff::new(&PROJECT_INVENTORY_STAGING_RETRY_BACKOFF_STEPS),
             retry_at: None,
+        }
+    }
+
+    pub(super) fn pending_scan() -> Self {
+        Self {
+            supported: true,
+            ..Self::new(None)
         }
     }
 

@@ -3,6 +3,7 @@ use super::jobs::{
     notify_job_update, observe_job_terminal, parse_job_lifecycle, replace_log_from_snapshot,
     COMMAND_PREVIEW_MAX_CHARS,
 };
+use super::requests::retire_job_request_locked;
 use super::state::{
     JobLifecycleState, JobObservationState, JobRecoveryPhase, JobRecoveryReason, JobRecoveryState,
     RunnerRegistryInner, ShellJobLogState, ShellJobRecord, ShellJobVisibility,
@@ -78,58 +79,19 @@ fn validate_context(
         }
     }
     if context.purpose.as_deref().is_some_and(|purpose| {
-        !matches!(
-            purpose,
-            "validation"
-                | "test"
-                | "build"
-                | "format"
-                | "release"
-                | "diagnostic"
-                | "operation"
-                | "other"
-        )
+        webcodex_core::workflow_session_contract::ExecutionPurpose::parse(purpose).is_none()
     }) {
         return Err("job inventory purpose is invalid".to_string());
     }
     if context.shell.as_deref().is_some_and(|shell| {
-        !matches!(
-            shell,
-            "sh" | "bash"
-                | "powershell"
-                | "javascript"
-                | "typescript"
-                | "direct_argv"
-                | "configured"
-                | "custom"
-                | "remote"
-        )
+        !webcodex_core::runner_protocol::ShellJobContext::is_valid_shell(shell)
     }) {
         return Err("job inventory shell is invalid".to_string());
     }
-    if context.validation_steps.len() > 3
-        || context
-            .validation_steps
-            .iter()
-            .collect::<HashSet<_>>()
-            .len()
-            != context.validation_steps.len()
-        || context
-            .validation_steps
-            .iter()
-            .any(|step| !matches!(step.as_str(), "format" | "check" | "test"))
-    {
+    if !context.validation_steps_are_valid() {
         return Err("job inventory validation_steps are invalid".to_string());
     }
-    if context.validation.as_ref().is_some_and(|validation| {
-        !validation.is_valid()
-            || validation
-                .steps
-                .iter()
-                .map(|step| step.name.clone())
-                .collect::<Vec<_>>()
-                != context.validation_steps
-    }) {
+    if !context.validation_metadata_is_valid() {
         return Err("job inventory validation metadata is invalid".to_string());
     }
     if context
@@ -285,9 +247,52 @@ fn validate_snapshot(
             return Err("job inventory command_execution_state is inconsistent".to_string());
         }
     }
+    webcodex_core::project_build::validate_build_artifact_report(
+        snapshot
+            .context
+            .structured_execution
+            .as_ref()
+            .map(|m| m.execution_source.as_str())
+            .unwrap_or("shell"),
+        &snapshot.status,
+        snapshot.exit_code,
+        snapshot.command_execution_state,
+        snapshot.build_artifacts.as_deref(),
+    )
+    .map_err(str::to_string)?;
+    webcodex_core::project_format::validate_mutation_report(
+        snapshot
+            .context
+            .structured_execution
+            .as_ref()
+            .map(|m| m.execution_source.as_str())
+            .unwrap_or("shell"),
+        &snapshot.status,
+        snapshot.exit_code,
+        snapshot.command_execution_state,
+        snapshot.format_mutation,
+        snapshot.error.as_deref(),
+    )
+    .map_err(str::to_string)?;
     validate_context(client_id, projects, require_project_membership, snapshot)?;
     validate_stream_snapshot(&snapshot.stdout, "stdout")?;
     validate_stream_snapshot(&snapshot.stderr, "stderr")?;
+    if let Some(evidence) = snapshot.test_count_evidence.as_ref() {
+        let cargo_test = snapshot
+            .context
+            .validation
+            .as_ref()
+            .is_some_and(|metadata| {
+                matches!(
+                    metadata.adapter.as_str(),
+                    "cargo_test" | "node:vitest:test" | "node:jest:test"
+                ) && metadata.kind == "test"
+                    && metadata.no_run != Some(true)
+            });
+        if !cargo_test || !lifecycle.is_terminal() || !evidence.is_valid() {
+            return Err("job inventory test_count_evidence is inconsistent".to_string());
+        }
+    }
     if snapshot.context.validation_steps.is_empty() && snapshot.validation_progress.is_some() {
         return Err("job inventory validation_progress is unexpected".to_string());
     }
@@ -393,11 +398,11 @@ fn validate_snapshot(
                     );
                 }
                 if let Some(validation) = snapshot.context.validation.as_ref() {
-                    if validation
-                        .steps
-                        .get(progress.completed)
-                        .is_none_or(|step| step.program != "cargo" || !step.is_canonical())
-                    {
+                    if validation.steps.get(progress.completed).is_none_or(|step| {
+                        step.program != "cargo"
+                            || !(step.is_canonical()
+                                || (validation.is_valid() && step.is_project_workspace_cargo()))
+                    }) {
                         return Err(
                             "job inventory Cargo activity is inconsistent with validation metadata"
                                 .to_string(),
@@ -511,6 +516,40 @@ fn same_context(job: &ShellJobRecord, snapshot: &ShellJobSnapshot) -> bool {
         && job.structured_execution == context.structured_execution
 }
 
+fn receipt_terminal_validation_enrichment_matches(
+    job: &ShellJobRecord,
+    runner_instance_id: &str,
+    snapshot: &ShellJobSnapshot,
+) -> bool {
+    let context = &snapshot.context;
+    job.lifecycle.is_terminal()
+        && job.observation.receipt_expires_at.is_some()
+        && job.runner_instance_id == runner_instance_id
+        && parse_job_lifecycle(&snapshot.status).ok() == Some(job.lifecycle)
+        && snapshot.update_seq == job.last_update_seq
+        && job.request_id.as_deref() == Some(snapshot.request_id.as_str())
+        && job.project_id == context.runtime_project_id
+        && job.session_id == context.workflow_session_id
+        && job.ssh_resource == context.ssh_resource
+        && job.cwd == context.cwd
+        && job.project_cwd == context.project_cwd
+        && job.purpose == context.purpose
+        && job.shell == context.shell
+        && job.command_preview == context.command_preview
+        && job.validation_steps == context.validation_steps
+        && job.structured_execution == context.structured_execution
+        && job.started_at == snapshot.started_at
+        && job.ended_at == snapshot.ended_at
+        && job.exit_code == snapshot.exit_code
+        && job.duration_ms == snapshot.duration_ms
+        && job.error == snapshot.error
+        && job.command_execution_state == snapshot.command_execution_state
+        && job.validation_progress == snapshot.validation_progress
+        && job.validation.is_none()
+        && job.test_count_evidence.is_none()
+        && context.validation.is_some()
+}
+
 fn detached_instance_transfer_allowed(job: &ShellJobRecord, snapshot: &ShellJobSnapshot) -> bool {
     job.kind == "run_detached_process"
         && job
@@ -552,8 +591,10 @@ pub(super) fn preflight_inventory_locked(
             ));
         }
         if existing.lifecycle.is_terminal() && existing.observation.receipt_expires_at.is_some() {
-            // Historical receipts have no live lease or executable validation
-            // plan. Incoming inventory is ignored, never applied to this record.
+            // Historical receipts have no live lease. Reconciliation may later
+            // enrich validation provenance only when the same Runner instance
+            // proves the exact retained terminal execution; otherwise inventory
+            // remains non-authoritative for this historical record.
             continue;
         }
         let detached_instance_transfer = existing.runner_instance_id != runner_instance_id
@@ -619,12 +660,8 @@ fn remove_job_request_mapping(
     let Some(request_id) = request_id else {
         return;
     };
-    inner.pending_by_id.remove(request_id);
+    retire_job_request_locked(inner, client_id, request_id);
     inner.persistent_waiters.remove(request_id);
-    inner.request_to_job.remove(request_id);
-    if let Some(queue) = inner.queues_by_runner.get_mut(client_id) {
-        queue.retain(|queued| queued != request_id);
-    }
 }
 
 fn remove_job_control_requests(
@@ -654,6 +691,8 @@ pub(crate) fn record_from_snapshot(
     runner_instance_id: &str,
     auth_group: Option<RunnerAccessGroup>,
     observation_epoch: std::sync::Arc<str>,
+    receipt_candidates: Option<crate::receipts::ReceiptCandidates>,
+    terminal_event_candidates: Option<crate::receipts::TerminalEventCandidates>,
     snapshot: &ShellJobSnapshot,
     now: i64,
 ) -> ShellJobRecord {
@@ -698,6 +737,9 @@ pub(crate) fn record_from_snapshot(
         validation_steps: context.validation_steps.clone(),
         validation: context.validation.clone(),
         validation_progress: snapshot.validation_progress.clone(),
+        test_count_evidence: snapshot.test_count_evidence.clone(),
+        format_mutation: snapshot.format_mutation,
+        build_artifacts: snapshot.build_artifacts.clone(),
         activity: snapshot.activity,
         visibility: super::state::ShellJobVisibility::Public,
         last_update_seq: snapshot.update_seq,
@@ -708,7 +750,11 @@ pub(crate) fn record_from_snapshot(
             reason: Some(JobRecoveryReason::ServerRestartReconciliation),
             recovering_since: None,
         },
-        observation: JobObservationState::new(observation_epoch),
+        observation: JobObservationState {
+            receipt_candidates,
+            terminal_event_candidates,
+            ..JobObservationState::new(observation_epoch)
+        },
     };
     observe_job_terminal(&mut record, now);
     record
@@ -731,6 +777,9 @@ fn apply_snapshot(
     job.command_execution_state = snapshot.command_execution_state;
     job.structured_execution = snapshot.context.structured_execution.clone();
     job.validation_progress = snapshot.validation_progress.clone();
+    job.test_count_evidence = snapshot.test_count_evidence.clone();
+    job.format_mutation = snapshot.format_mutation;
+    job.build_artifacts = snapshot.build_artifacts.clone();
     job.activity = snapshot.activity;
     job.validation = snapshot.context.validation.clone();
     replace_log_from_snapshot(&mut job.stdout, &snapshot.stdout);
@@ -971,6 +1020,8 @@ pub(super) fn reconcile_inventory_locked(
     runner_instance_id: &str,
     auth_group: Option<RunnerAccessGroup>,
     observation_epoch: std::sync::Arc<str>,
+    receipt_candidates: Option<crate::receipts::ReceiptCandidates>,
+    terminal_event_candidates: Option<crate::receipts::TerminalEventCandidates>,
     inventory: &ShellJobInventory,
     now: i64,
 ) -> ReconciliationSummary {
@@ -1037,9 +1088,22 @@ pub(super) fn reconcile_inventory_locked(
             });
         if let Some(existing) = inner.jobs_by_id.get_mut(&snapshot.job_id) {
             if existing.lifecycle.is_terminal() {
-                // A server-authoritative terminal state (deadline, replacement,
-                // or a previously accepted terminal result) never revives or
-                // changes terminal class.
+                // A Server-authoritative terminal state never revives or changes
+                // terminal class. A receipt-restored record may, however, regain
+                // the validation provenance the receipt deliberately omitted when
+                // the exact same Runner terminal snapshot proves the same execution.
+                if receipt_terminal_validation_enrichment_matches(
+                    existing,
+                    runner_instance_id,
+                    snapshot,
+                ) {
+                    existing.validation = snapshot.context.validation.clone();
+                    existing.test_count_evidence = snapshot.test_count_evidence.clone();
+                    existing.format_mutation = snapshot.format_mutation;
+                    existing.build_artifacts = snapshot.build_artifacts.clone();
+                    notify_job_update(existing);
+                    summary.updated += 1;
+                }
                 continue;
             }
             let detached_instance_transfer = existing.runner_instance_id != runner_instance_id
@@ -1072,6 +1136,8 @@ pub(super) fn reconcile_inventory_locked(
                 runner_instance_id,
                 auth_group.clone(),
                 observation_epoch.clone(),
+                receipt_candidates.clone(),
+                terminal_event_candidates.clone(),
                 snapshot,
                 now,
             );

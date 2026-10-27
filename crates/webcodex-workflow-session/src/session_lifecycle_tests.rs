@@ -33,9 +33,9 @@ fn post_message(store: &SessionStore, session_id: &str, kind: SessionMessageKind
 fn session_tool_contract(tool_name: &str) -> SessionToolContract {
     let (read_like, write_like, shell_like, path_hint) = match tool_name {
         "read_file" => (true, false, false, SessionPathHint::SinglePath),
-        "session_summary" => (true, false, false, SessionPathHint::None),
+        "read_session_summary" => (true, false, false, SessionPathHint::None),
         "run_shell" => (false, true, true, SessionPathHint::None),
-        "write_project_file" | "post_session_message" | "memory_set" | "close_session" => {
+        "write_project_file" | "post_session_message" | "set_memory" | "close_session" => {
             (false, true, false, SessionPathHint::None)
         }
         other => panic!("unexpected synthetic lifecycle tool contract: {other}"),
@@ -49,8 +49,6 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
         change_summary_like: false,
         project_write: write_like,
         path_hint,
-        accepts_context_ack: false,
-        advances_context_checkpoint: false,
     }
 }
 
@@ -140,7 +138,7 @@ fn persisted_ledger_writes_and_reads_lifecycle_active() {
     assert_eq!(session.lifecycle, SessionLifecycle::Active);
 
     store.flush_persistence();
-    let raw = std::fs::read_to_string(&ledger).unwrap();
+    let raw = crate::test_storage::read_ledger(&ledger).unwrap();
     let ledger_value: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(ledger_value["version"], SESSION_LEDGER_VERSION);
     assert_eq!(ledger_value["sessions"][0]["lifecycle"], "active");
@@ -159,39 +157,31 @@ fn pre_current_ledger_version_is_rejected_without_rewrite() {
     let tmp = tempfile::tempdir().unwrap();
     let ledger_path = tmp.path().join("sessions.json");
     let store = persistent_store(ledger_path.clone());
-    let session = store.start_session(Some("proj".to_string()), Some("current".to_string()));
+    let _session = store.start_session(Some("proj".to_string()), Some("current".to_string()));
     store.flush_persistence();
     drop(store);
 
     let mut ledger: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger_path).unwrap()).unwrap();
     ledger["version"] = json!(1);
     std::fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
-    let before = std::fs::read(&ledger_path).unwrap();
+    let _before = crate::test_storage::read_ledger_bytes(&ledger_path).unwrap();
 
-    let restored = persistent_store(ledger_path.clone());
-    assert_eq!(restored.status().restored_sessions, 0);
-    assert!(restored.summary(&session.session_id, None).is_none());
-    assert!(restored
-        .status()
-        .last_persist_error
-        .as_deref()
-        .is_some_and(|error| error.contains("unsupported session ledger version 1")));
-    assert_eq!(std::fs::read(&ledger_path).unwrap(), before);
+    crate::test_storage::assert_import_rejected(&ledger_path);
 }
 
 #[test]
-fn legacy_inspect_v2_row_is_discarded_without_affecting_valid_rows() {
+fn legacy_inspect_v2_row_rejects_atomic_import() {
     let tmp = tempfile::tempdir().unwrap();
     let ledger_path = tmp.path().join("sessions.json");
     let store = persistent_store(ledger_path.clone());
     let retired = store.start_session(Some("proj".to_string()), Some("legacy inspect".to_string()));
-    let valid = store.start_session(Some("proj".to_string()), Some("normal".to_string()));
+    let _valid = store.start_session(Some("proj".to_string()), Some("normal".to_string()));
     store.flush_persistence();
     drop(store);
 
     let mut ledger: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger_path).unwrap()).unwrap();
     let retired_record = ledger["sessions"]
         .as_array_mut()
         .unwrap()
@@ -201,26 +191,21 @@ fn legacy_inspect_v2_row_is_discarded_without_affecting_valid_rows() {
     retired_record["mode"] = json!("inspect");
     std::fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
 
-    let restored = persistent_store(ledger_path);
-    assert_eq!(restored.status().restored_sessions, 1);
-    assert!(restored.summary(&retired.session_id, None).is_none());
-    let valid_summary = restored.summary(&valid.session_id, None).unwrap();
-    assert_eq!(valid_summary.mode, SessionMode::Normal);
-    assert_eq!(restored.status().last_persist_error, None);
+    crate::test_storage::assert_import_rejected(&ledger_path);
 }
 
 #[test]
-fn v2_missing_assignment_metadata_discards_only_that_row() {
+fn v2_missing_assignment_metadata_rejects_atomic_import() {
     let tmp = tempfile::tempdir().unwrap();
     let ledger_path = tmp.path().join("sessions.json");
     let store = persistent_store(ledger_path.clone());
     let bad = store.start_session(Some("proj".to_string()), Some("bad".to_string()));
-    let good = store.start_session(Some("proj".to_string()), Some("good".to_string()));
+    let _good = store.start_session(Some("proj".to_string()), Some("good".to_string()));
     store.flush_persistence();
     drop(store);
 
     let mut ledger: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger_path).unwrap()).unwrap();
     let bad_record = ledger["sessions"]
         .as_array_mut()
         .unwrap()
@@ -232,15 +217,11 @@ fn v2_missing_assignment_metadata_discards_only_that_row() {
     bad_record.remove("assignment_history_tracking_complete");
     std::fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
 
-    let restored = persistent_store(ledger_path);
-    assert_eq!(restored.status().restored_sessions, 1);
-    assert!(restored.summary(&bad.session_id, None).is_none());
-    assert!(restored.summary(&good.session_id, None).is_some());
-    assert_eq!(restored.status().last_persist_error, None);
+    crate::test_storage::assert_import_rejected(&ledger_path);
 }
 
 #[test]
-fn v2_event_and_message_shape_corruption_discards_only_affected_rows() {
+fn v2_event_and_message_shape_corruption_rejects_atomic_import() {
     let tmp = tempfile::tempdir().unwrap();
     let ledger_path = tmp.path().join("sessions.json");
     let store = persistent_store(ledger_path.clone());
@@ -260,7 +241,7 @@ fn v2_event_and_message_shape_corruption_discards_only_affected_rows() {
         Some("proj".to_string()),
         Some("unknown message field".to_string()),
     );
-    let good = store.start_session(Some("proj".to_string()), Some("good".to_string()));
+    let _good = store.start_session(Some("proj".to_string()), Some("good".to_string()));
 
     for session_id in [
         &bad_missing.session_id,
@@ -294,7 +275,7 @@ fn v2_event_and_message_shape_corruption_discards_only_affected_rows() {
     drop(store);
 
     let mut ledger: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger_path).unwrap()).unwrap();
     let records = ledger["sessions"].as_array_mut().unwrap();
     let missing_record = records
         .iter_mut()
@@ -335,16 +316,7 @@ fn v2_event_and_message_shape_corruption_discards_only_affected_rows() {
         );
 
     std::fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
-    let restored = persistent_store(ledger_path);
-    assert_eq!(restored.status().restored_sessions, 1);
-    assert!(restored.summary(&bad_missing.session_id, None).is_none());
-    assert!(restored.summary(&bad_retired.session_id, None).is_none());
-    assert!(restored
-        .summary(&bad_noncanonical_correlation.session_id, None)
-        .is_none());
-    assert!(restored.summary(&bad_message.session_id, None).is_none());
-    assert!(restored.summary(&good.session_id, None).is_some());
-    assert_eq!(restored.status().last_persist_error, None);
+    crate::test_storage::assert_import_rejected(&ledger_path);
 }
 
 #[test]
@@ -352,39 +324,32 @@ fn current_ledger_rejects_retired_top_level_binding_member() {
     let tmp = tempfile::tempdir().unwrap();
     let ledger_path = tmp.path().join("sessions.json");
     let store = persistent_store(ledger_path.clone());
-    let session = store.start_session(Some("proj".to_string()), Some("canonical".to_string()));
+    let _session = store.start_session(Some("proj".to_string()), Some("canonical".to_string()));
     store.flush_persistence();
     drop(store);
 
     let mut ledger: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+        serde_json::from_str(&crate::test_storage::read_ledger(&ledger_path).unwrap()).unwrap();
     ledger["durable_current_bindings"] = json!([]);
     std::fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
 
-    let restored = persistent_store(ledger_path);
-    assert_eq!(restored.status().restored_sessions, 0);
-    assert!(restored.summary(&session.session_id, None).is_none());
-    assert!(restored
-        .status()
-        .last_persist_error
-        .as_deref()
-        .is_some_and(|error| error.contains("invalid v2 session ledger")));
+    crate::test_storage::assert_import_rejected(&ledger_path);
 }
 
 #[test]
-fn v2_missing_or_removed_lifecycle_discards_only_that_row() {
+fn v2_missing_or_removed_lifecycle_aborts_import() {
     for lifecycle in [None, Some(json!("archived"))] {
         let tmp = tempfile::tempdir().unwrap();
         let ledger_path = tmp.path().join("sessions.json");
         let store = persistent_store(ledger_path.clone());
         let bad = store.start_session(Some("proj".to_string()), Some("bad lifecycle".to_string()));
-        let good =
+        let _good =
             store.start_session(Some("proj".to_string()), Some("good lifecycle".to_string()));
         store.flush_persistence();
         drop(store);
 
         let mut ledger: Value =
-            serde_json::from_str(&std::fs::read_to_string(&ledger_path).unwrap()).unwrap();
+            serde_json::from_str(&crate::test_storage::read_ledger(&ledger_path).unwrap()).unwrap();
         let bad_record = ledger["sessions"]
             .as_array_mut()
             .unwrap()
@@ -403,10 +368,7 @@ fn v2_missing_or_removed_lifecycle_discards_only_that_row() {
         }
         std::fs::write(&ledger_path, serde_json::to_vec_pretty(&ledger).unwrap()).unwrap();
 
-        let restored = persistent_store(ledger_path);
-        assert_eq!(restored.status().restored_sessions, 1);
-        assert!(restored.summary(&bad.session_id, None).is_none());
-        assert!(restored.summary(&good.session_id, None).is_some());
+        crate::test_storage::assert_import_rejected(&ledger_path);
     }
 }
 
@@ -514,9 +476,9 @@ fn closed_session_coldifies_payload_and_queries_without_reheating() {
     let query_start = store.record_tool_call_started(
         Some(&session.session_id),
         SessionTransport::Api,
-        "session_summary",
+        "read_session_summary",
         &json!({"session_id": session.session_id.clone()}),
-        session_tool_contract("session_summary"),
+        session_tool_contract("read_session_summary"),
     );
     store.record_tool_call_finished(query_start, true, &json!({"success": true}), None, None);
     assert_eq!(
@@ -539,12 +501,13 @@ fn closed_session_coldifies_payload_and_queries_without_reheating() {
 }
 
 #[test]
-fn close_cleanup_evidence_rewrites_cold_payload_without_reheating() {
+fn close_cleanup_evidence_commits_before_returning_to_cold_residency() {
     let tmp = tempfile::tempdir().unwrap();
     let ledger = tmp.path().join("sessions.json");
     let store = persistent_store(ledger.clone());
     let session = store.start_session(None, Some("cold close evidence".to_string()));
     store.close_session(&session.session_id).unwrap();
+    store.flush_persistence();
     assert!(store
         .cold_payload_bytes_for_test(&session.session_id)
         .is_some());
@@ -557,6 +520,7 @@ fn close_cleanup_evidence_rewrites_cold_payload_without_reheating() {
         None,
         false,
     );
+    store.flush_persistence();
     assert_eq!(
         store.hot_payload_entry_count_for_test(&session.session_id),
         None
@@ -579,7 +543,7 @@ fn close_cleanup_evidence_rewrites_cold_payload_without_reheating() {
 }
 
 #[test]
-fn closed_cold_round_trip_preserves_evidence_and_active_stays_hot() {
+fn cold_round_trip_preserves_evidence_and_active_identity_without_hot_residency() {
     let tmp = tempfile::tempdir().unwrap();
     let ledger = tmp.path().join("sessions.json");
     let store = SessionStore::with_persistence(&ledger, 10, 20);
@@ -613,6 +577,7 @@ fn closed_cold_round_trip_preserves_evidence_and_active_stays_hot() {
         SessionMessageKind::Progress,
         "active message",
     );
+    store.flush_persistence();
     assert_eq!(
         store.hot_payload_entry_count_for_test(&closed.session_id),
         None
@@ -627,7 +592,7 @@ fn closed_cold_round_trip_preserves_evidence_and_active_stays_hot() {
         .list_messages(&closed.session_id, ListSessionMessagesFilter::default())
         .unwrap();
     store.flush_persistence();
-    let raw = std::fs::read_to_string(&ledger).unwrap();
+    let raw = crate::test_storage::read_ledger(&ledger).unwrap();
     let ledger_value: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(ledger_value["version"], SESSION_LEDGER_VERSION);
     let closed_json = ledger_value["sessions"]
@@ -653,13 +618,13 @@ fn closed_cold_round_trip_preserves_evidence_and_active_stays_hot() {
     assert!(restored
         .cold_payload_bytes_for_test(&closed.session_id)
         .is_some_and(|bytes| bytes > 0));
-    assert!(restored
-        .hot_payload_entry_count_for_test(&active.session_id)
-        .is_some());
     assert_eq!(
-        restored.cold_payload_bytes_for_test(&active.session_id),
+        restored.hot_payload_entry_count_for_test(&active.session_id),
         None
     );
+    assert!(restored
+        .cold_payload_bytes_for_test(&active.session_id)
+        .is_some());
 
     let after_summary = restored.summary(&closed.session_id, Some(100)).unwrap();
     let after_messages = restored
@@ -687,21 +652,30 @@ fn closed_cold_round_trip_preserves_evidence_and_active_stays_hot() {
 }
 
 #[test]
-fn cold_session_query_touch_preserves_lru_capacity_order() {
+fn query_touch_and_cache_pressure_do_not_delete_closed_or_active_identities() {
     let store = SessionStore::new(2, 10);
-    let first = store.start_session(None, Some("cold survivor".to_string()));
+    let active = store.start_session(None, Some("active survivor".to_string()));
+    let first = store.start_session(None, Some("first closed".to_string()));
     store.close_session(&first.session_id).unwrap();
-    let second = store.start_session(None, Some("old active".to_string()));
+    let second = store.start_session(None, Some("second closed".to_string()));
+    store.close_session(&second.session_id).unwrap();
 
     assert!(store
         .cold_payload_bytes_for_test(&first.session_id)
         .is_some());
     store.summary(&first.session_id, Some(10)).unwrap();
-    let third = store.start_session(None, Some("new active".to_string()));
 
+    let third = store.start_session(None, Some("third closed".to_string()));
+    store.close_session(&third.session_id).unwrap();
+
+    assert!(store.contains_session(&active.session_id));
     assert!(store.contains_session(&first.session_id));
-    assert!(!store.contains_session(&second.session_id));
+    assert!(store.contains_session(&second.session_id));
     assert!(store.contains_session(&third.session_id));
+    assert_eq!(
+        store.lifecycle_state(&active.session_id),
+        Some(SessionLifecycle::Active)
+    );
     assert_eq!(
         store.lifecycle_state(&first.session_id),
         Some(SessionLifecycle::Closed)
@@ -710,8 +684,36 @@ fn cold_session_query_touch_preserves_lru_capacity_order() {
         .cold_payload_bytes_for_test(&first.session_id)
         .is_some());
     assert!(store
-        .hot_payload_entry_count_for_test(&third.session_id)
+        .cold_payload_bytes_for_test(&third.session_id)
         .is_some());
+}
+
+#[test]
+fn closed_and_active_identities_survive_cache_pressure() {
+    let store = SessionStore::new(1, 10);
+    let active = store.start_session(None, Some("active survivor".to_string()));
+    let old_closed = store.start_session(None, Some("old closed".to_string()));
+    store.close_session(&old_closed.session_id).unwrap();
+    let new_closed = store.start_session(None, Some("new closed".to_string()));
+    store.close_session(&new_closed.session_id).unwrap();
+
+    assert!(store.contains_session(&active.session_id));
+    assert_eq!(
+        store.lifecycle_state(&active.session_id),
+        Some(SessionLifecycle::Active)
+    );
+    assert!(store.contains_session(&old_closed.session_id));
+    assert!(store.contains_session(&new_closed.session_id));
+    assert_eq!(
+        store.lifecycle_state(&new_closed.session_id),
+        Some(SessionLifecycle::Closed)
+    );
+    assert!(store
+        .cold_payload_bytes_for_test(&new_closed.session_id)
+        .is_some());
+    let status = store.status();
+    assert_eq!(status.active_sessions, 1);
+    assert_eq!(status.closed_sessions, 2);
 }
 
 #[test]
@@ -723,7 +725,7 @@ fn closed_lifecycle_persists_round_trip() {
     store.close_session(&session.session_id).unwrap();
 
     store.flush_persistence();
-    let raw = std::fs::read_to_string(&ledger).unwrap();
+    let raw = crate::test_storage::read_ledger(&ledger).unwrap();
     let ledger_value: Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(ledger_value["version"], SESSION_LEDGER_VERSION);
     assert_eq!(ledger_value["sessions"][0]["lifecycle"], "closed");
@@ -770,8 +772,8 @@ fn closed_session_denies_mutation_tools_allows_query() {
     assert!(store
         .lifecycle_denial(
             &session.session_id,
-            "memory_set",
-            session_tool_contract("memory_set")
+            "set_memory",
+            session_tool_contract("set_memory")
         )
         .is_some());
 
@@ -786,8 +788,8 @@ fn closed_session_denies_mutation_tools_allows_query() {
     assert!(store
         .lifecycle_denial(
             &session.session_id,
-            "session_summary",
-            session_tool_contract("session_summary")
+            "read_session_summary",
+            session_tool_contract("read_session_summary")
         )
         .is_none());
     assert!(store
@@ -865,19 +867,31 @@ fn unknown_session_close_fails_without_create() {
 }
 
 #[test]
-fn eviction_does_not_produce_closed_lifecycle() {
-    // Capacity eviction removes the record; it is not a Closed transition.
+fn capacity_pressure_does_not_change_active_lifecycle_or_identity() {
     let store = SessionStore::new(1, 10);
-    let first = store.start_session(None, Some("evict me".to_string()));
-    let _second = store.start_session(None, Some("survivor".to_string()));
-    assert!(!store.contains_session(&first.session_id));
-    assert!(store.summary(&first.session_id, None).is_none());
-    // Evicted id is unknown, not Closed — close must not invent a session.
+    let first = store.start_session(None, Some("keep me active".to_string()));
+    let _second = store.start_session(None, Some("also active".to_string()));
+    assert!(store.contains_session(&first.session_id));
     assert_eq!(
-        store.close_session(&first.session_id).unwrap_err(),
-        SessionCloseError::UnknownSession
+        store.lifecycle_state(&first.session_id),
+        Some(SessionLifecycle::Active)
     );
-    assert!(!store.contains_session(&first.session_id));
+    assert_eq!(
+        store.summary(&first.session_id, None).unwrap().session_id,
+        first.session_id
+    );
+
+    let closed = store.close_session(&first.session_id).unwrap();
+    assert!(!closed.already_closed);
+    assert_eq!(closed.summary.lifecycle, SessionLifecycle::Closed);
+    assert_eq!(
+        store.lifecycle_state(&first.session_id),
+        Some(SessionLifecycle::Closed)
+    );
+    assert!(store.summary(&first.session_id, None).is_some());
+    assert!(store
+        .cold_payload_bytes_for_test(&first.session_id)
+        .is_some());
 }
 
 #[test]

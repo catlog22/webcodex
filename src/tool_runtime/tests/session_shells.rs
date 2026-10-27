@@ -4,6 +4,7 @@ use crate::runner_protocol::{
     PersistentShellResult, RunnerCapabilities, RunnerPersistentShellResultRequest,
     RunnerProjectSummary,
 };
+use crate::tool_runtime::dispatch::DispatchContext;
 
 const CLIENT: &str = "persistent-agent";
 const PROJECT_ID: &str = "demo";
@@ -162,13 +163,19 @@ fn dispatch_recorded(
     tokio::spawn(async move {
         let auth = auth_context(None, true);
         let (call, metadata) =
-            ToolCall::from_tool_name_with_recorder_metadata(tool_name, arguments).unwrap();
+            crate::tool_runtime::parse_tool_call_with_recorder_metadata(tool_name, arguments)
+                .unwrap();
         runtime
-            .dispatch_with_auth_transport_options_and_metadata(
+            .dispatch_with_context(
                 call,
-                Some(&auth),
-                crate::tool_runtime::sessions::SessionTransport::Mcp,
-                metadata,
+                DispatchContext {
+                    recorder: metadata,
+                    ..DispatchContext::internal(
+                        Some(&auth),
+                        crate::tool_runtime::sessions::SessionTransport::Mcp,
+                        None,
+                    )
+                },
             )
             .await
     })
@@ -195,11 +202,12 @@ async fn persistent_shell_handoff(runtime: &ToolRuntime, session_id: &str) -> To
     runtime
         .dispatch(
             ToolCall::from_tool_name(
-                "session_handoff_summary",
+                "read_session_handoff",
                 serde_json::json!({
                     "session_id": session_id,
                     "include_workspace": false,
                     "include_checkpoints": false,
+                    "diagnostic": true,
                 }),
             )
             .unwrap(),
@@ -215,7 +223,7 @@ async fn persistent_shell_result_expectation_observe_preserves_nonzero_tool_resu
 
     let exec_task = dispatch_recorded(
         runtime.clone(),
-        "session_shell_exec",
+        "execute_session_shell",
         serde_json::json!({
             "project": project,
             "session_id": session.session_id,
@@ -250,7 +258,9 @@ async fn persistent_shell_result_expectation_observe_preserves_nonzero_tool_resu
         .events
         .iter()
         .rev()
-        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "session_shell_exec")
+        .find(|event| {
+            event.kind == "tool_call_finished" && event.tool_name == "execute_session_shell"
+        })
         .unwrap();
     assert_eq!(finished.result_expectation.as_deref(), Some("observe"));
     assert_eq!(
@@ -275,7 +285,7 @@ async fn persistent_shell_result_expectation_success_default_keeps_nonzero_actio
 
     let exec_task = dispatch_recorded(
         runtime.clone(),
-        "session_shell_exec",
+        "execute_session_shell",
         serde_json::json!({
             "project": project,
             "session_id": session.session_id,
@@ -307,7 +317,9 @@ async fn persistent_shell_result_expectation_success_default_keeps_nonzero_actio
         .events
         .iter()
         .rev()
-        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "session_shell_exec")
+        .find(|event| {
+            event.kind == "tool_call_finished" && event.tool_name == "execute_session_shell"
+        })
         .unwrap();
     assert_eq!(finished.result_expectation, None);
     assert_eq!(
@@ -331,7 +343,7 @@ async fn persistent_shell_result_expectation_observe_keeps_shell_reset_actionabl
 
     let exec_task = dispatch_recorded(
         runtime.clone(),
-        "session_shell_exec",
+        "execute_session_shell",
         serde_json::json!({
             "project": project,
             "session_id": session.session_id,
@@ -367,7 +379,9 @@ async fn persistent_shell_result_expectation_observe_keeps_shell_reset_actionabl
         .events
         .iter()
         .rev()
-        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "session_shell_exec")
+        .find(|event| {
+            event.kind == "tool_call_finished" && event.tool_name == "execute_session_shell"
+        })
         .unwrap();
     assert_eq!(finished.result_expectation.as_deref(), Some("observe"));
     assert_eq!(
@@ -449,12 +463,16 @@ async fn server_lifecycle_uses_distinct_ids_and_never_routes_through_run_shell()
     let exec_started = ledger
         .events
         .iter()
-        .find(|event| event.kind == "tool_call_started" && event.tool_name == "session_shell_exec")
+        .find(|event| {
+            event.kind == "tool_call_started" && event.tool_name == "execute_session_shell"
+        })
         .unwrap();
     let exec_finished = ledger
         .events
         .iter()
-        .find(|event| event.kind == "tool_call_finished" && event.tool_name == "session_shell_exec")
+        .find(|event| {
+            event.kind == "tool_call_finished" && event.tool_name == "execute_session_shell"
+        })
         .unwrap();
     let evidence = exec_finished.persistent_shell.as_ref().unwrap();
     assert_eq!(evidence.action, "exec");
@@ -1061,6 +1079,74 @@ async fn setup_ssh(
 }
 
 #[tokio::test]
+async fn named_ssh_run_shell_rejects_unsupported_long_lifetime_before_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, project, session) =
+        setup_ssh_with_capabilities(temp.path(), "prod", true, true).await;
+    let auth = auth_context(None, true);
+
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::RunShell {
+                login: false,
+                project,
+                command: "printf remote-long".to_string(),
+                session_id: Some(session.session_id.clone()),
+                timeout_secs: Some(600),
+                sync_wait_secs: None,
+                cwd: None,
+                purpose: None,
+                shell: None,
+            },
+            Some(&auth),
+        )
+        .await;
+
+    assert!(!result.success, "{result:?}");
+    assert_eq!(result.output["execution_state"], "not_started");
+    assert_eq!(result.output["command_started"], false);
+    assert_eq!(result.output["failure_kind"], "capability_unavailable");
+    assert!(result.error.as_deref().unwrap_or_default().contains("120"));
+    assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+}
+
+#[tokio::test]
+async fn named_ssh_run_shell_rejects_sync_wait_before_dispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let (runtime, project, session) =
+        setup_ssh_with_capabilities(temp.path(), "prod", true, true).await;
+    let auth = auth_context(None, true);
+
+    let result = runtime
+        .dispatch_with_auth(
+            ToolCall::RunShell {
+                login: false,
+                project,
+                command: "printf remote".to_string(),
+                session_id: Some(session.session_id.clone()),
+                timeout_secs: Some(30),
+                sync_wait_secs: Some(1),
+                cwd: None,
+                purpose: None,
+                shell: None,
+            },
+            Some(&auth),
+        )
+        .await;
+
+    assert!(!result.success, "{result:?}");
+    assert_eq!(result.output["execution_state"], "not_started");
+    assert_eq!(result.output["command_started"], false);
+    assert_eq!(result.output["failure_kind"], "unsupported_resource");
+    assert!(result
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("sync_wait_secs"));
+    assert!(probe_patch_agent_request(&runtime, CLIENT).await.is_none());
+}
+
+#[tokio::test]
 async fn ssh_persistent_shell_enqueues_with_bound_resource_and_routes_by_record() {
     let temp = tempfile::tempdir().unwrap();
     let (runtime, project, session) = setup_ssh(temp.path(), "prod").await;
@@ -1069,10 +1155,12 @@ async fn ssh_persistent_shell_enqueues_with_bound_resource_and_routes_by_record(
     let one_shot = runtime
         .dispatch_with_auth(
             ToolCall::RunShell {
+                login: false,
                 project: project.clone(),
                 command: "printf one-shot".to_string(),
                 session_id: Some(session.session_id.clone()),
                 timeout_secs: Some(30),
+                sync_wait_secs: None,
                 cwd: None,
                 purpose: None,
                 shell: None,

@@ -150,7 +150,7 @@ fn project_single_search(canonical: &ToolResult) -> ToolResult {
         .output
         .as_object_mut()
         .expect("canonical search output object");
-    crate::tool_runtime::dispatch::sparsify_search_output_for_model(output, true, false);
+    crate::tool_runtime::result_projection::sparsify_search_output_for_model(output, true, false);
     projected
 }
 
@@ -162,9 +162,13 @@ fn extract_single_search_batch_result(batch: &ToolResult) -> ToolResult {
     assert_eq!(items.len(), 1, "one-query search batch: {}", batch.output);
     let item = &items[0];
     ToolResult {
-        success: item["success"]
-            .as_bool()
-            .expect("one-query search item success"),
+        success: if batch.output.get("requested_count").is_none() {
+            assert!(item.get("success").is_none());
+            assert!(item.get("error").is_none());
+            true // The complete sparse batch branch proves every item succeeded.
+        } else {
+            item["success"].as_bool().expect("full search item success")
+        },
         output: item.get("output").cloned().unwrap_or(Value::Null),
         error: item
             .get("error")
@@ -410,14 +414,7 @@ fn search_project_text_model_projection_compacts_files_count_and_guides_truncati
     assert_eq!(truncated_sparse.output["result_mode"], "matches");
     assert_eq!(truncated_sparse.output["truncated"], true);
     assert_eq!(truncated_sparse.output["truncation_reason"], "limit");
-    assert_eq!(
-        truncated_sparse.output["continuation"]["kind"],
-        "refine_query"
-    );
-    assert_eq!(
-        truncated_sparse.output["continuation"]["safe_cursor"],
-        false
-    );
+    assert!(truncated_sparse.output.get("continuation").is_none());
     assert!(truncated_sparse.output.get("next_index").is_none());
     assert!(truncated_sparse.output.get("match_offset").is_none());
     assert!(truncated_sparse.output.get("next_match").is_none());
@@ -440,52 +437,74 @@ fn search_project_text_model_projection_compacts_files_count_and_guides_truncati
 }
 
 #[tokio::test]
-async fn search_project_texts_four_query_projection_measures_canonical_vs_sparse_bytes() {
-    let root = tempfile::tempdir().unwrap();
-    let runtime = ToolRuntime::new_for_tests();
-    let client_id = "search-four-query-bytes";
-    register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
-    let queries = (0..4)
-        .map(|index| query(&format!("needle-{index}"), None))
-        .collect::<Vec<_>>();
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        async move {
-            runtime
-                .search_project_texts("demo".to_string(), queries)
-                .await
+async fn search_project_texts_item_projection_measures_canonical_vs_sparse_bytes() {
+    for count in [1, 8] {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ToolRuntime::new_for_tests();
+        let client_id = "search-four-query-bytes";
+        register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+        let queries = (0..count)
+            .map(|index| query(&format!("needle-{index}"), None))
+            .collect::<Vec<_>>();
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .search_project_texts("demo".to_string(), queries)
+                    .await
+            }
+        });
+        for _ in 0..count {
+            let request = wait_for_patch_agent_request(&runtime, client_id).await;
+            let pattern = request_pattern(&request);
+            complete_search_success(&runtime, client_id, &request, &format!("src/{pattern}.rs"))
+                .await;
         }
-    });
-    for _ in 0..4 {
-        let request = wait_for_patch_agent_request(&runtime, client_id).await;
-        let pattern = request_pattern(&request);
-        complete_search_success(&runtime, client_id, &request, &format!("src/{pattern}.rs")).await;
-    }
-    let canonical = task.await.unwrap();
-    assert!(canonical.success, "{:?}", canonical.error);
-    assert_eq!(canonical.output["items"].as_array().unwrap().len(), 4);
-    assert_eq!(canonical.output["output_truncated"], false);
-    assert!(canonical.output["next_index"].is_null());
+        let canonical = task.await.unwrap();
+        assert!(canonical.success, "{:?}", canonical.error);
+        assert_eq!(canonical.output["items"].as_array().unwrap().len(), count);
+        assert_eq!(canonical.output["output_truncated"], false);
+        assert!(canonical.output["next_index"].is_null());
 
-    let mut sparse = ToolResult::ok(canonical.output.clone());
-    crate::tool_runtime::dispatch::sparsify_search_batch_success_for_model(&[true; 4], &mut sparse);
-    assert!(sparse.output.get("project").is_none());
-    assert!(sparse.output.get("requested_count").is_none());
-    assert!(sparse.output.get("next_index").is_none());
-    let items = sparse.output["items"].as_array().unwrap();
-    assert_eq!(items.len(), 4);
-    for item in items {
-        assert!(item["output"].get("backend").is_none());
-        let search_match = &item["output"]["matches"][0];
-        assert!(search_match.get("context_before").is_none());
-        assert!(search_match.get("context_after").is_none());
-        assert!(search_match["read_hint"].get("path").is_none());
-    }
+        let mut sparse = ToolResult::ok(canonical.output.clone());
+        crate::tool_runtime::result_projection::sparsify_search_batch_success_for_model(
+            &vec![true; count],
+            &mut sparse,
+        );
+        assert!(sparse.output.get("project").is_none());
+        assert!(sparse.output.get("requested_count").is_none());
+        assert!(sparse.output.get("next_index").is_none());
+        let items = sparse.output["items"].as_array().unwrap();
+        assert_eq!(items.len(), count);
+        for item in items {
+            assert!(item.get("success").is_none());
+            assert!(item.get("error").is_none());
+            assert!(item["output"].get("backend").is_none());
+            let search_match = &item["output"]["matches"][0];
+            assert!(search_match.get("context_before").is_none());
+            assert!(search_match.get("context_after").is_none());
+            assert!(search_match["read_hint"].get("path").is_none());
+        }
 
-    let canonical_bytes = serialized_output_bytes(&canonical);
-    let sparse_bytes = serialized_output_bytes(&sparse);
-    eprintln!("search_four_query_batch_bytes canonical={canonical_bytes} sparse={sparse_bytes}");
-    assert!(sparse_bytes < canonical_bytes);
+        let canonical_bytes = serialized_output_bytes(&canonical);
+        let sparse_bytes = serialized_output_bytes(&sparse);
+        eprintln!("search_{count}_items: {canonical_bytes} -> {sparse_bytes} bytes");
+        assert!(sparse_bytes < canonical_bytes);
+        let mut previous_wrapper = sparse.output.clone();
+        for item in previous_wrapper["items"].as_array_mut().unwrap() {
+            item["success"] = json!(true);
+            item["error"] = Value::Null;
+        }
+        assert_eq!(
+            serde_json::to_vec(&previous_wrapper).unwrap().len() - sparse_bytes,
+            28 * count
+        );
+        startup_brief::validate_schema_instance_for_test(
+            &serde_json::to_value(&sparse).unwrap(),
+            &registry::output_schema_for_tool("search_project_texts"),
+        )
+        .unwrap();
+    }
 }
 
 #[test]
@@ -554,7 +573,7 @@ fn search_project_texts_schema_and_parser_enforce_strict_batch_contract() {
         .as_str()
         .unwrap();
     assert!(budget_description.contains("runtime-clamped"));
-    assert!(budget_description.contains("whole-query"));
+    assert!(budget_description.to_lowercase().contains("whole-query"));
     assert!(budget_description.contains("narrow"));
     let removed_input_cursor = ["match", "offset"].join("_");
     assert!(schema["properties"]["queries"]["items"]["properties"]
@@ -689,7 +708,7 @@ async fn search_project_texts_one_query_default_success_is_sparse_after_session_
             runtime
                 .dispatch_with_auth(
                     ToolCall::SearchProjectTexts {
-                        project: project,
+                        project,
                         queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
                             pattern: "needle".to_string(),
                             pattern_mode: None,
@@ -789,7 +808,7 @@ async fn search_project_texts_one_query_nondefault_success_keeps_effective_selec
             runtime
                 .dispatch_with_auth(
                     ToolCall::SearchProjectTexts {
-                        project: project,
+                        project,
                         queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
                             pattern: "needle".to_string(),
                             pattern_mode: None,
@@ -853,7 +872,7 @@ async fn search_project_texts_one_query_literal_mode_keeps_effective_metadata() 
             runtime
                 .dispatch_with_auth(
                     ToolCall::SearchProjectTexts {
-                        project: project,
+                        project,
                         queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
                             pattern: "RuntimeInfo {".to_string(),
                             pattern_mode: Some(SearchPatternMode::Literal),
@@ -931,7 +950,7 @@ async fn search_project_texts_literal_query_preserves_mode_to_runner_and_output(
 
     let result = task.await.unwrap();
     assert!(result.success, "{:?}", result.error);
-    assert_eq!(result.output["items"][0]["success"], true);
+    assert!(result.output["items"][0].get("success").is_none());
     assert_eq!(
         result.output["items"][0]["output"]["pattern_mode"],
         "literal"
@@ -955,7 +974,7 @@ async fn search_project_texts_one_query_grep_fallback_keeps_backend_metadata() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::SearchProjectTexts {
-                        project: project,
+                        project,
                         queries: vec![crate::tool_runtime::SearchProjectTextsQuery {
                             pattern: "needle".to_string(),
                             pattern_mode: None,
@@ -1050,7 +1069,7 @@ async fn search_project_texts_default_matches_items_are_sparse_and_schema_valid(
     }
     let items = result.output["items"].as_array().unwrap();
     for item in items {
-        assert_eq!(item["success"], true);
+        assert!(item.get("success").is_none());
         assert!(item["error"].is_null());
         let matches = item["output"]["matches"].as_array().unwrap();
         assert_eq!(matches.len(), 1);
@@ -1260,7 +1279,7 @@ async fn search_project_texts_retries_one_dropped_agent_request_and_restores_ord
         }
     });
 
-    let first_two = vec![
+    let first_two = [
         wait_for_patch_agent_request(&runtime, client_id).await,
         wait_for_patch_agent_request(&runtime, client_id).await,
     ];
@@ -1358,7 +1377,7 @@ async fn search_project_texts_retry_stays_inside_existing_concurrency_slot() {
         }
     });
 
-    let first_two = vec![
+    let first_two = [
         wait_for_patch_agent_request(&runtime, client_id).await,
         wait_for_patch_agent_request(&runtime, client_id).await,
     ];
@@ -1400,17 +1419,21 @@ async fn search_project_texts_retry_uses_only_remaining_absolute_deadline() {
         ToolRuntime::new_for_tests().with_search_project_texts_deadline(Duration::from_secs(6));
     let client_id = "batch-search-retry-deadline";
     register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let mut retry_query = query("deadline-retry", None);
+    retry_query.timeout_secs = Some(120);
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
             runtime
-                .search_project_texts("demo".to_string(), vec![query("deadline-retry", None)])
+                .search_project_texts("demo".to_string(), vec![retry_query])
                 .await
         }
     });
 
     let first = wait_for_patch_agent_request(&runtime, client_id).await;
     tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(first.timeout_secs < 120);
+    assert!(first.timeout_secs <= 6);
     runtime
         .runner_registry
         .cancel_request(&first.request_id)
@@ -1461,20 +1484,102 @@ async fn search_project_texts_retry_uses_only_remaining_absolute_deadline() {
     let late = runtime
         .runner_registry
         .complete(RunnerResultRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            request_id: request.request_id,
             exit_code: Some(0),
             stdout: Some(search_stdout("matches", "src/late.rs", "late")),
             stderr: Some(String::new()),
             duration_ms: Some(200),
-            error: None,
+            ..runner_result_request(
+                client_id.to_string(),
+                "inst".to_string(),
+                request.request_id,
+            )
         })
         .await;
     assert!(
         late.is_err(),
         "expired request remained pending after batch timeout"
     );
+}
+
+#[tokio::test]
+async fn search_project_texts_batch_limited_backend_timeout_reports_batch_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime =
+        ToolRuntime::new_for_tests().with_search_project_texts_deadline(Duration::from_secs(6));
+    let client_id = "batch-search-clamped-timeout";
+    register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let mut item = query("batch-clamped", None);
+    item.timeout_secs = Some(120);
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .search_project_texts("demo".to_string(), vec![item])
+                .await
+        }
+    });
+
+    let request = wait_for_patch_agent_request(&runtime, client_id).await;
+    assert!(request.timeout_secs < 120);
+    assert!(request.timeout_secs <= 6);
+    complete_patch_agent_request(
+        &runtime,
+        client_id,
+        &request.request_id,
+        -1,
+        r#"{"webcodex_search":{"backend":"rg","feature_unavailable":false}}
+"#,
+        &format!("command timed out after {} seconds", request.timeout_secs),
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert_eq!(
+        result.output["items"][0]["output"]["reason_code"],
+        "timeout"
+    );
+    assert_eq!(
+        result.output["items"][0]["output"]["failure_stage"],
+        "batch_deadline"
+    );
+}
+
+#[tokio::test]
+async fn search_project_texts_queued_query_does_not_start_after_absolute_deadline() {
+    let root = tempfile::tempdir().unwrap();
+    let runtime =
+        ToolRuntime::new_for_tests().with_search_project_texts_deadline(Duration::from_millis(100));
+    let client_id = "batch-search-queued-expiry";
+    register_runner_project_at_path(&runtime, client_id, "demo", root.path()).await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .search_project_texts(
+                    "demo".to_string(),
+                    vec![
+                        query("first", None),
+                        query("second", None),
+                        query("queued", None),
+                    ],
+                )
+                .await
+        }
+    });
+
+    let _first = wait_for_patch_agent_request(&runtime, client_id).await;
+    let _second = wait_for_patch_agent_request(&runtime, client_id).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("shared batch deadline should finish queued work deterministically")
+        .unwrap();
+    let items = result.output["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    for item in items {
+        assert_eq!(item["output"]["reason_code"], "timeout");
+        assert_eq!(item["output"]["failure_stage"], "batch_deadline");
+    }
+    assert_no_agent_request(&runtime, client_id).await;
 }
 
 #[tokio::test]
@@ -2075,14 +2180,15 @@ async fn search_project_texts_deadline_preserves_fast_result_and_cancels_unfinis
         let late = runtime
             .runner_registry
             .complete(RunnerResultRequest {
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-                request_id: request.request_id,
                 exit_code: Some(0),
                 stdout: Some(search_stdout("matches", "src/late.rs", "late")),
                 stderr: Some(String::new()),
                 duration_ms: Some(200),
-                error: None,
+                ..runner_result_request(
+                    client_id.to_string(),
+                    "inst".to_string(),
+                    request.request_id,
+                )
             })
             .await;
         assert!(late.is_err(), "timed-out Runner request was not cancelled");
@@ -2170,7 +2276,8 @@ async fn search_project_texts_records_one_event_without_patterns_and_aggregates_
         ]
     );
     assert_eq!(
-        super::super::handoff::review_evidence_summary_for_session(&summary)["search_count"],
+        super::super::closeout_evidence::ReviewEvidence::from_events(&summary.events).to_value()
+            ["search_count"],
         1
     );
     let memory_ledger = serde_json::to_string(&summary.events).unwrap();
@@ -2179,7 +2286,7 @@ async fn search_project_texts_records_one_event_without_patterns_and_aggregates_
     assert!(!memory_ledger.contains(&root.path().to_string_lossy().to_string()));
 
     runtime.sessions.flush_persistence();
-    let persisted = std::fs::read_to_string(&ledger).unwrap();
+    let persisted = webcodex_workflow_session::root_test_support::read_ledger(&ledger).unwrap();
     assert!(!persisted.contains("RAW_BATCH_PATTERN_ALPHA"));
     assert!(!persisted.contains("RAW_BATCH_PATTERN_BETA"));
     assert!(!persisted.contains(&root.path().to_string_lossy().to_string()));
@@ -2191,10 +2298,8 @@ async fn search_project_texts_records_one_event_without_patterns_and_aggregates_
 #[tokio::test]
 async fn search_project_texts_outer_recording_session_preserves_complete_sparse_shape() {
     use crate::tool_runtime::kernel::{
-        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
-        ToolProtocolCapabilities, ToolTransport,
+        ToolCallRequest, ToolInvocationMetadata, ToolProtocolCapabilities,
     };
-    use crate::tool_runtime::sessions::SessionContextRevisionAck;
 
     let root = tempfile::tempdir().unwrap();
     let runtime = ToolRuntime::new_for_tests();
@@ -2221,20 +2326,11 @@ async fn search_project_texts_outer_recording_session_preserves_complete_sparse_
                         tool_name: "search_project_texts".to_string(),
                         arguments,
                     },
-                    ToolCallContext {
-                        transport: ToolTransport::Mcp,
-                        session_id: Some(&session_id),
-                        auth: Some(&auth),
-                        window: None,
-                        record_oauth_scope_denials: false,
-                        host_file_import_trust: HostFileImportTrust::Untrusted,
-                    },
+                    mcp_recording_context(&session_id, &auth),
                     ToolInvocationMetadata {
-                        ack_session_context_revision: SessionContextRevisionAck::Revision(0),
                         ..Default::default()
                     },
                     ToolProtocolCapabilities {
-                        context_continuity: true,
                         context_sidecar: true,
                         ..Default::default()
                     },
@@ -2279,8 +2375,7 @@ async fn search_project_texts_outer_recording_session_preserves_complete_sparse_
 #[tokio::test]
 async fn search_project_texts_outer_recorder_observes_canonical_batch_before_primary_projection() {
     use crate::tool_runtime::kernel::{
-        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
-        ToolProtocolCapabilities, ToolTransport,
+        ToolCallRequest, ToolInvocationMetadata, ToolProtocolCapabilities,
     };
 
     let root = tempfile::tempdir().unwrap();
@@ -2309,14 +2404,7 @@ async fn search_project_texts_outer_recorder_observes_canonical_batch_before_pri
                         tool_name: "search_project_texts".to_string(),
                         arguments,
                     },
-                    ToolCallContext {
-                        transport: ToolTransport::Mcp,
-                        session_id: Some(&session_id),
-                        auth: Some(&auth),
-                        window: None,
-                        record_oauth_scope_denials: false,
-                        host_file_import_trust: HostFileImportTrust::Untrusted,
-                    },
+                    mcp_recording_context(&session_id, &auth),
                     ToolInvocationMetadata::default(),
                     ToolProtocolCapabilities::default(),
                 )
@@ -2351,10 +2439,8 @@ async fn search_project_texts_outer_recorder_observes_canonical_batch_before_pri
 #[tokio::test]
 async fn search_project_texts_outer_recording_session_keeps_final_response_under_hard_cap() {
     use crate::tool_runtime::kernel::{
-        HostFileImportTrust, ToolCallContext, ToolCallRequest, ToolInvocationMetadata,
-        ToolProtocolCapabilities, ToolTransport,
+        ToolCallRequest, ToolInvocationMetadata, ToolProtocolCapabilities,
     };
-    use crate::tool_runtime::sessions::SessionContextRevisionAck;
     use webcodex_core::runtime_contract::MODEL_INSPECTION_MAX_RESULT_BYTES as MAX_SERIALIZED_OUTPUT_BYTES;
 
     let root = tempfile::tempdir().unwrap();
@@ -2365,10 +2451,7 @@ async fn search_project_texts_outer_recording_session_keeps_final_response_under
         Some(project.clone()),
         Some("search final response cap".to_string()),
     );
-    assert_eq!(
-        seed_model_facing_recovery_events(&runtime, &session.session_id, &project, 20),
-        20
-    );
+    seed_recovery_events(&runtime, &session.session_id, &project, 20);
     let auth = auth_context(None, true);
     let arguments = json!({
         "project": project,
@@ -2389,21 +2472,13 @@ async fn search_project_texts_outer_recording_session_keeps_final_response_under
                         tool_name: "search_project_texts".to_string(),
                         arguments,
                     },
-                    ToolCallContext {
-                        transport: ToolTransport::Mcp,
-                        session_id: Some(&session_id),
-                        auth: Some(&auth),
-                        window: None,
-                        record_oauth_scope_denials: false,
-                        host_file_import_trust: HostFileImportTrust::Untrusted,
-                    },
+                    mcp_recording_context(&session_id, &auth),
                     ToolInvocationMetadata {
                         context_request: vec!["webcodex.workflow".to_string()],
-                        ack_session_context_revision: SessionContextRevisionAck::Revision(0),
+
                         ..Default::default()
                     },
                     ToolProtocolCapabilities {
-                        context_continuity: true,
                         context_sidecar: true,
                         ..Default::default()
                     },
@@ -2432,7 +2507,6 @@ async fn search_project_texts_outer_recording_session_keeps_final_response_under
     assert!(result.output.get("session_continuity").is_none());
     assert!(result.output.get("session_recovery").is_none());
     assert!(result.output.get("session_context_revision").is_none());
-    assert_eq!(result.output["context_projection"]["timing"], "post_tool");
     assert_eq!(
         result.output["context_projection"]["materials"][0]["key"],
         "webcodex.workflow"

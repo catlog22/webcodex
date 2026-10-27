@@ -11,7 +11,8 @@ use std::io::{Cursor, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 use webcodex_core::runner_skill::{
-    RunnerSkillDescriptor, RunnerSkillReadResponse, RUNNER_SKILL_RESPONSE_FORMAT,
+    RunnerSkillDescriptor, RunnerSkillExecutionRequest, RunnerSkillReadResponse, RunnerSkillSource,
+    RUNNER_SKILL_RESPONSE_FORMAT,
 };
 use webcodex_core::skill_metadata::{
     parse_skill_metadata, SkillMetadata, MAX_SKILL_DEFINITION_BYTES,
@@ -50,6 +51,12 @@ const DEFAULT_RESOURCE_MAX_BYTES: usize = 512 * 1024;
 pub(super) struct ManagedSkillCatalogSnapshot {
     pub(super) namespace_revision: String,
     pub(super) skills: Vec<RunnerSkillDescriptor>,
+}
+
+#[derive(Debug)]
+pub(super) struct PreparedManagedSkillExecution {
+    pub(super) snapshot: tempfile::TempDir,
+    pub(super) script: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +227,8 @@ impl SkillStore {
         reject_symlink_or_non_file_if_exists(&path, "Skill store lock")?;
         let file = OpenOptions::new()
             .create(true)
+            // Lock acquisition must preserve the existing file and its inode.
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)
@@ -311,8 +320,10 @@ impl SkillStore {
         hasher.update(self.namespace.as_bytes());
         hasher.update(b"\0");
         hasher.update(skill_key.as_bytes());
-        let digest = format!("{:x}", hasher.finalize());
-        format!("wc_skill_{}", &digest[..32])
+        format!(
+            "wc_skill_{}",
+            webcodex_core::compact::encode(&hasher.finalize()[..16])
+        )
     }
 
     fn list_skill_keys(&self) -> Result<Vec<String>, String> {
@@ -497,7 +508,10 @@ impl SkillStore {
             hasher.update((version.package_revision.len() as u64).to_be_bytes());
             hasher.update(version.package_revision.as_bytes());
         }
-        format!("wc_skillstate_{:x}", hasher.finalize())
+        format!(
+            "wc_skillstate_{}",
+            webcodex_core::compact::encode(hasher.finalize())
+        )
     }
 
     fn namespace_revision(&self, descriptors: &[RunnerSkillDescriptor]) -> String {
@@ -521,7 +535,10 @@ impl SkillStore {
                 hasher.update(value.as_bytes());
             }
         }
-        format!("wc_skillstore_{:x}", hasher.finalize())
+        format!(
+            "wc_skillstore_{}",
+            webcodex_core::compact::encode(hasher.finalize())
+        )
     }
 
     pub(super) fn list_active(&self) -> Result<ManagedSkillCatalogSnapshot, String> {
@@ -611,6 +628,67 @@ impl SkillStore {
         })
     }
 
+    pub(super) fn prepare_execution_snapshot(
+        &self,
+        request: &RunnerSkillExecutionRequest,
+    ) -> Result<PreparedManagedSkillExecution, String> {
+        request
+            .validate()
+            .map_err(|_| "skill_store_invalid_request".to_string())?;
+        if request.expected_source != RunnerSkillSource::Managed {
+            return Err("skill_source_changed".to_string());
+        }
+        let path = validate_resource_path(&request.path)?;
+        if webcodex_core::sensitive_paths::is_secret_path(&path) {
+            return Err("skill_sensitive_path".to_string());
+        }
+        let _lock = self.lock()?;
+        let skill_key = self
+            .resolve_skill_key(&request.skill_id)?
+            .ok_or_else(|| "skill_not_found".to_string())?;
+        let before = self.read_state(&skill_key)?;
+        let active = before
+            .active_package_revision
+            .clone()
+            .ok_or_else(|| "skill_not_found".to_string())?;
+        if request.expected_package_revision.as_deref() != Some(active.as_str()) {
+            return Err("skill_package_changed".to_string());
+        }
+        let metadata = self.read_revision_metadata(&skill_key, &active)?;
+        if metadata.definition_revision != request.expected_definition_revision {
+            return Err("skill_definition_changed".to_string());
+        }
+        let files = self.verify_package_immutable(&skill_key, &metadata)?;
+        let resource = files
+            .get(&path)
+            .ok_or_else(|| "skill_store_revision_modified".to_string())?;
+        if sha256_hex(resource) != request.expected_resource_sha256 {
+            return Err("skill_store_revision_modified".to_string());
+        }
+        let script = std::str::from_utf8(resource)
+            .map_err(|_| "skill_resource_unsupported_encoding".to_string())?
+            .to_string();
+        if script.contains('\0') {
+            return Err("skill_resource_unsupported_encoding".to_string());
+        }
+        let after = self.read_state(&skill_key)?;
+        if after.active_package_revision.as_deref() != Some(active.as_str()) {
+            return Err("skill_package_changed".to_string());
+        }
+        let snapshot = tempfile::Builder::new()
+            .prefix("webcodex-skill-")
+            .tempdir()
+            .map_err(|_| "skill_store_unavailable".to_string())?;
+        for (relative, bytes) in files {
+            let target = snapshot.path().join(&relative);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).map_err(|_| "skill_store_unavailable".to_string())?;
+            }
+            fs::write(&target, bytes).map_err(|_| "skill_store_unavailable".to_string())?;
+        }
+        Ok(PreparedManagedSkillExecution { snapshot, script })
+    }
+
     pub(super) fn read_resource(
         &self,
         skill_id: &str,
@@ -669,21 +747,20 @@ impl SkillStore {
             return Err("skill_resource_too_large".to_string());
         }
         let range = file_read_range::EffectiveRange::new(Some(start_line), Some(limit));
-        let read = file_read_range::read_range_with_budget(
-            &target,
-            range,
-            MAX_SKILL_STORE_READ_TEXT_BYTES,
-        )
-        .map_err(|error| match error.reason {
-            file_read_range::ReadFileReason::InvalidUtf8 => {
-                "skill_resource_unsupported_encoding".to_string()
-            }
-            file_read_range::ReadFileReason::NotFound => "skill_resource_not_found".to_string(),
-            file_read_range::ReadFileReason::RangeTooLarge => {
-                "skill_read_result_too_large".to_string()
-            }
-            _ => "skill_resource_unavailable".to_string(),
-        })?;
+        let read =
+            file_read_range::read_page_with_budget(&target, range, MAX_SKILL_STORE_READ_TEXT_BYTES)
+                .map_err(|error| match error.reason {
+                    file_read_range::ReadFileReason::InvalidUtf8 => {
+                        "skill_resource_unsupported_encoding".to_string()
+                    }
+                    file_read_range::ReadFileReason::NotFound => {
+                        "skill_resource_not_found".to_string()
+                    }
+                    file_read_range::ReadFileReason::RangeTooLarge => {
+                        "skill_read_result_too_large".to_string()
+                    }
+                    _ => "skill_resource_unavailable".to_string(),
+                })?;
         // The package revision covers the full normalized package tree, not
         // only SKILL.md. Revalidate the complete immutable tree after reading
         // so an out-of-band regular-file edit cannot be returned under the old
@@ -1693,7 +1770,10 @@ fn compute_package_revision(files: &BTreeMap<String, Vec<u8>>) -> String {
         hasher.update((bytes.len() as u64).to_be_bytes());
         hasher.update(bytes);
     }
-    format!("wc_skillpkg_{:x}", hasher.finalize())
+    format!(
+        "wc_skillpkg_{}",
+        webcodex_core::compact::encode(hasher.finalize())
+    )
 }
 
 fn snapshot_installed_package(root: &Path) -> Result<BTreeMap<String, Vec<u8>>, String> {
@@ -1920,11 +2000,10 @@ fn validate_management_common(skill_key: &str, idempotency_key: &str) -> Result<
 }
 
 fn valid_runtime_skill_id(value: &str) -> bool {
-    value.len() == "wc_skill_".len() + 32
-        && value.starts_with("wc_skill_")
-        && value["wc_skill_".len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    value
+        .strip_prefix("wc_skill_")
+        .and_then(webcodex_core::compact::decode::<16>)
+        .is_some()
 }
 
 fn hash_install_intent(
@@ -2450,7 +2529,8 @@ mod tests {
                 None,
             )
             .unwrap();
-        let stale_expected = format!("wc_skillstate_{}", "f".repeat(64));
+        let stale_expected =
+            "wc_skillstate___________________________________________8".to_string();
         let prepared_intent = hash_simple_intent(
             "activate",
             &["demo", &installed.package_revision, &stale_expected],
@@ -3078,7 +3158,9 @@ mod tests {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let next = SkillActiveState {
             schema_version: STORE_SCHEMA_VERSION,
-            active_package_revision: Some(format!("wc_skillpkg_{}", "a".repeat(64))),
+            active_package_revision: Some(
+                "wc_skillpkg_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string(),
+            ),
         };
         assert!(store.write_state(skill, &next).is_err());
         assert_eq!(
@@ -3359,6 +3441,76 @@ mod tests {
                 .unwrap_err(),
             "skill_resource_path_invalid"
         );
+    }
+
+    #[test]
+    fn resource_read_pages_at_text_budget_with_complete_revision_and_cursor() {
+        let source = tempfile::tempdir().unwrap();
+        let store_root = tempfile::tempdir().unwrap();
+        let store = SkillStore::for_test(store_root.path().join("store"), "runner-a");
+        let policy = RunnerPolicy {
+            allow_cwd_anywhere: true,
+            ..RunnerPolicy::default()
+        };
+        let definition = b"---\nname: demo\ndescription: operator demo\n---\n";
+        let resource = (0..100)
+            .map(|i| format!("{i:03} {}", "x".repeat(1000)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let archive = zip_bytes(&[
+            ("SKILL.md", definition, None),
+            ("references/guide.md", resource.as_bytes(), None),
+        ]);
+        fs::write(source.path().join("skill.zip"), &archive).unwrap();
+        let installed = store
+            .install(
+                &policy,
+                "demo",
+                "project-a",
+                &source.path().to_string_lossy(),
+                "skill.zip",
+                &sha256_hex(&archive),
+                "install-page-test",
+                true,
+                None,
+            )
+            .unwrap();
+        let mut start = 1;
+        let mut lines = Vec::new();
+        loop {
+            let read = store
+                .read_resource(
+                    &installed.skill_id,
+                    "references/guide.md",
+                    start,
+                    100,
+                    Some(&installed.package_revision),
+                    Some(&installed.definition_revision),
+                )
+                .unwrap();
+            assert_eq!(read.sha256, sha256_hex(resource.as_bytes()));
+            assert_eq!(
+                read.skill.package_revision(),
+                Some(installed.package_revision.as_str())
+            );
+            assert_eq!(
+                read.skill.definition_revision(),
+                installed.definition_revision
+            );
+            assert!(read.returned_lines <= 100);
+            assert!(read.text.len() <= MAX_SKILL_STORE_READ_TEXT_BYTES);
+            assert!(read.returned_lines > 0);
+            lines.extend(read.text.split('\n').map(str::to_owned));
+            if let Some(next) = read.next_start_line {
+                assert!(read.has_more);
+                assert_eq!(next, start + read.returned_lines);
+                start = next;
+            } else {
+                assert!(!read.has_more);
+                break;
+            }
+        }
+        assert_eq!(lines.join("\n"), resource);
     }
 
     #[test]

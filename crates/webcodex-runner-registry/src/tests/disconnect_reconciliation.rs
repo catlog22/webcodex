@@ -5,6 +5,7 @@ async fn reconcile_disconnect_marks_running_jobs_lost() {
     let registry = RunnerRegistry::default();
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -25,20 +26,10 @@ async fn reconcile_disconnect_marks_running_jobs_lost() {
         .unwrap();
     let job = registry
         .start_job(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("oe".to_string()),
-                cwd: None,
-                command: Some("sleep 10".to_string()),
-                timeout_secs: Some(10),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            shell_job_start_request("oe", "sleep 10", Some(10)),
             "test".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -63,6 +54,7 @@ async fn reconcile_disconnect_fails_pending_sync_requests_fast() {
     let registry = RunnerRegistry::default();
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
+            computer_session_availability: None,
             process_started_at: None,
             build: None,
             job_concurrency_limit: None,
@@ -86,6 +78,7 @@ async fn reconcile_disconnect_fails_pending_sync_requests_fast() {
     let (_request_id, rx) = registry
         .enqueue_run(
             ShellRunRequest {
+                login: false,
                 client_id: "oe".to_string(),
                 cwd: Some("/tmp".to_string()),
                 command: "echo hi".to_string(),

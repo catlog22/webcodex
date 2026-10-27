@@ -6,16 +6,14 @@ use super::support::*;
 use crate::projects::ProjectConfig;
 use crate::runner_protocol::RunnerCapabilities;
 
-#[tokio::test]
-async fn start_session_without_project_instructions_when_no_candidate_exists() {
-    // The agent is registered (so the project resolves) but no instruction
-    // candidate file exists on the agent host. Every candidate file_read is
-    // answered with a not-found error, the loader skips them all, and
-    // start_session still succeeds with project_instructions.loaded=false.
-    let runtime = runtime_with_agent_project("instr-empty");
+async fn start_instruction_session(
+    client_id: &str,
+    title: &str,
+) -> (ToolRuntime, tokio::task::JoinHandle<ToolResult>) {
+    let runtime = runtime_with_agent_project(client_id);
     register_agent(
         &runtime,
-        "instr-empty",
+        client_id,
         None,
         RunnerCapabilities {
             file_read: true,
@@ -23,16 +21,16 @@ async fn start_session_without_project_instructions_when_no_candidate_exists() {
         },
     )
     .await;
-    let project = agent_test_project_id("instr-empty");
+    let project = agent_test_project_id(client_id);
+    let title = title.to_string();
     let task = tokio::spawn({
         let runtime = runtime.clone();
-        let project = project.clone();
         async move {
             runtime
                 .dispatch_with_auth(
                     ToolCall::StartSession {
                         project: Some(project),
-                        title: Some("empty".to_string()),
+                        title: Some(title),
                         mode: SessionMode::Normal,
                         deny_write_tools: false,
                         deny_shell_tools: false,
@@ -43,6 +41,16 @@ async fn start_session_without_project_instructions_when_no_candidate_exists() {
                 .await
         }
     });
+    (runtime, task)
+}
+
+#[tokio::test]
+async fn start_session_without_project_instructions_when_no_candidate_exists() {
+    // The agent is registered (so the project resolves) but no instruction
+    // candidate file exists on the agent host. Every candidate file_read is
+    // answered with a not-found error, the loader skips them all, and
+    // start_session still succeeds with project_instructions.loaded=false.
+    let (runtime, task) = start_instruction_session("instr-empty", "empty").await;
     // Drive every candidate file_read in order; each fails with not-found.
     for expected_path in project_instructions::INSTRUCTION_CANDIDATE_PATHS {
         let req = wait_for_runner_request_for_instance(&runtime, "instr-empty", "inst").await;
@@ -73,45 +81,15 @@ async fn start_session_without_project_instructions_when_no_candidate_exists() {
         pi["candidate_paths"].as_array().unwrap().len(),
         project_instructions::INSTRUCTION_CANDIDATE_PATHS.len()
     );
-    assert!(pi["note"]
-        .as_str()
-        .unwrap()
-        .contains("project-local guidance only"));
+    let note = pi["note"].as_str().unwrap();
+    assert!(note.contains("Runner-configured and project-local instructions"));
+    assert!(note.contains("model guidance only"));
+    assert!(note.contains("do not override system, platform, or WebCodex safety policy"));
 }
 
 #[tokio::test]
 async fn start_session_loads_agents_md_from_agent_project() {
-    let runtime = runtime_with_agent_project("instr-loader");
-    register_agent(
-        &runtime,
-        "instr-loader",
-        None,
-        RunnerCapabilities {
-            file_read: true,
-            ..Default::default()
-        },
-    )
-    .await;
-    let project = agent_test_project_id("instr-loader");
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        let project = project.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(
-                    ToolCall::StartSession {
-                        project: Some(project),
-                        title: Some("load instructions".to_string()),
-                        mode: SessionMode::Normal,
-                        deny_write_tools: false,
-                        deny_shell_tools: false,
-                        execution_context: None,
-                    },
-                    None,
-                )
-                .await
-        }
-    });
+    let (runtime, task) = start_instruction_session("instr-loader", "load instructions").await;
     // The loader tries AGENTS.md first; drive that single file_read.
     let req = wait_for_runner_request_for_instance(&runtime, "instr-loader", "inst").await;
     assert_eq!(req.kind, "file_read");
@@ -143,45 +121,15 @@ async fn start_session_loads_agents_md_from_agent_project() {
     );
     assert_eq!(files[0]["limit"], 400);
     assert_eq!(files[0]["start_line"], 1);
-    assert!(pi["note"]
-        .as_str()
-        .unwrap()
-        .contains("project-local guidance only"));
+    let note = pi["note"].as_str().unwrap();
+    assert!(note.contains("Runner-configured and project-local instructions"));
+    assert!(note.contains("model guidance only"));
+    assert!(note.contains("do not override system, platform, or WebCodex safety policy"));
 }
 
 #[tokio::test]
 async fn start_session_truncates_large_instruction_file() {
-    let runtime = runtime_with_agent_project("instr-trunc");
-    register_agent(
-        &runtime,
-        "instr-trunc",
-        None,
-        RunnerCapabilities {
-            file_read: true,
-            ..Default::default()
-        },
-    )
-    .await;
-    let project = agent_test_project_id("instr-trunc");
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        let project = project.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(
-                    ToolCall::StartSession {
-                        project: Some(project),
-                        title: Some("trunc".to_string()),
-                        mode: SessionMode::Normal,
-                        deny_write_tools: false,
-                        deny_shell_tools: false,
-                        execution_context: None,
-                    },
-                    None,
-                )
-                .await
-        }
-    });
+    let (runtime, task) = start_instruction_session("instr-trunc", "trunc").await;
     let req = wait_for_runner_request_for_instance(&runtime, "instr-trunc", "inst").await;
     assert_eq!(req.kind, "file_read");
     assert_eq!(req.path.as_deref(), Some("AGENTS.md"));
@@ -224,37 +172,7 @@ async fn start_session_truncates_large_instruction_file() {
 
 #[tokio::test]
 async fn session_summary_returns_project_instructions_without_content() {
-    let runtime = runtime_with_agent_project("instr-summary");
-    register_agent(
-        &runtime,
-        "instr-summary",
-        None,
-        RunnerCapabilities {
-            file_read: true,
-            ..Default::default()
-        },
-    )
-    .await;
-    let project = agent_test_project_id("instr-summary");
-    let task = tokio::spawn({
-        let runtime = runtime.clone();
-        let project = project.clone();
-        async move {
-            runtime
-                .dispatch_with_auth(
-                    ToolCall::StartSession {
-                        project: Some(project),
-                        title: Some("summary".to_string()),
-                        mode: SessionMode::Normal,
-                        deny_write_tools: false,
-                        deny_shell_tools: false,
-                        execution_context: None,
-                    },
-                    None,
-                )
-                .await
-        }
-    });
+    let (runtime, task) = start_instruction_session("instr-summary", "summary").await;
     let req = wait_for_runner_request_for_instance(&runtime, "instr-summary", "inst").await;
     complete_patch_agent_request(
         &runtime,
@@ -262,7 +180,7 @@ async fn session_summary_returns_project_instructions_without_content() {
         &req.request_id,
         0,
         &canonical_agent_file_read_output(
-            "secret project rule that must not leak into session_summary\n",
+            "secret project rule that must not leak into read_session_summary\n",
             1,
         ),
         "",
@@ -293,7 +211,7 @@ async fn session_summary_returns_project_instructions_without_content() {
     // Summary-only: content must NOT be present on the file entry.
     assert!(
         files[0].get("content").is_none(),
-        "session_summary project_instructions file must be summary-only"
+        "read_session_summary project_instructions file must be summary-only"
     );
     assert!(files[0]["chars"].as_u64().is_some());
     assert_eq!(files[0]["truncated"], false);
@@ -305,7 +223,7 @@ async fn session_summary_returns_project_instructions_without_content() {
     let serialized = serde_json::to_string(&summary_result.output).unwrap();
     assert!(
         !serialized.contains("secret project rule"),
-        "session_summary leaked instruction content: {serialized}"
+        "read_session_summary leaked instruction content: {serialized}"
     );
 }
 
@@ -373,4 +291,137 @@ async fn load_project_instructions_empty_when_no_candidates_exist() {
     let snapshot = runtime.load_project_instructions(&config).await;
     assert!(!snapshot.loaded);
     assert!(snapshot.files.is_empty());
+}
+#[tokio::test]
+async fn instruction_snapshot_from_obsolete_config_is_not_projected() {
+    use crate::runner_protocol::{RunnerPolicySummary, RunnerRegisterRequest, ToolProvidersStatus};
+    use webcodex_core::project_instructions::{
+        InstructionSourceScope, LoadedInstructionCandidate, ProjectInstructionsSnapshot,
+    };
+    use webcodex_core::runner_instruction::{
+        RunnerInstructionSnapshotResponse, RUNNER_INSTRUCTION_REQUEST_KIND,
+        RUNNER_INSTRUCTION_RESPONSE_FORMAT,
+    };
+    let runtime = runtime_with_agent_project("instr-generation");
+    let mut providers: ToolProvidersStatus = serde_json::from_value(serde_json::json!({
+        "strategy": "native",
+        "claude_code": {
+            "enabled": false, "version": null, "available": false,
+            "process_state": "not_started", "discovered_tool_names": [],
+            "capabilities": {}, "last_error_code": null
+        }
+    }))
+    .unwrap();
+    runtime
+        .runner_registry
+        .register(RunnerRegisterRequest {
+            policy: Some(RunnerPolicySummary {
+                tool_providers: Some(providers.clone()),
+                ..Default::default()
+            }),
+            ..crate::test_support::runner_registration(
+                "instr-generation",
+                "inst",
+                RunnerCapabilities {
+                    file_read: true,
+                    instruction_runtime: true,
+                    ..Default::default()
+                },
+            )
+        })
+        .await
+        .unwrap();
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        "instr-generation",
+        "inst",
+        vec![registered_project("agent-proj", "/tmp/agent-proj")],
+    )
+    .await;
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    ToolCall::StartSession {
+                        project: Some(agent_test_project_id("instr-generation")),
+                        title: Some("generation fence".into()),
+                        mode: SessionMode::Normal,
+                        deny_write_tools: false,
+                        deny_shell_tools: false,
+                        execution_context: None,
+                    },
+                    None,
+                )
+                .await
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !task.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "generation fixture timed out"
+        );
+        if let Some(request) = probe_patch_agent_request(&runtime, "instr-generation").await {
+            if request.kind == RUNNER_INSTRUCTION_REQUEST_KIND {
+                // Deterministically publish a reload while the old snapshot is in flight.
+                providers.config_reload.generation = 2;
+                runtime
+                    .runner_registry
+                    .update_tool_providers("instr-generation", "inst", Some(providers.clone()))
+                    .await
+                    .unwrap();
+                let old = ProjectInstructionsSnapshot::from_candidates(
+                    vec![LoadedInstructionCandidate {
+                        source_scope: InstructionSourceScope::Runner,
+                        path: "runner/0/old.md".into(),
+                        content: "OBSOLETE_RULE_BODY".into(),
+                        total_lines: 1,
+                        full_sha256: None,
+                    }],
+                    true,
+                );
+                let stdout = serde_json::to_string(&RunnerInstructionSnapshotResponse {
+                    format: RUNNER_INSTRUCTION_RESPONSE_FORMAT.into(),
+                    generation: 1,
+                    scan_complete: true,
+                    files: old.files,
+                })
+                .unwrap();
+                complete_patch_agent_request(
+                    &runtime,
+                    "instr-generation",
+                    &request.request_id,
+                    0,
+                    &stdout,
+                    "",
+                )
+                .await;
+            } else {
+                assert_eq!(request.kind, "file_read");
+                complete_patch_agent_request(
+                    &runtime,
+                    "instr-generation",
+                    &request.request_id,
+                    1,
+                    "",
+                    "no such file or directory",
+                )
+                .await;
+            }
+        } else {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+    let result = task.await.unwrap();
+    assert!(result.success, "{:?}", result.error);
+    assert_eq!(
+        result.output["project_instructions"]["scan_complete"],
+        false
+    );
+    assert!(result.output["project_instructions"]["files"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(!result.output.to_string().contains("OBSOLETE_RULE_BODY"));
 }

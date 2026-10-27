@@ -73,6 +73,10 @@ fn reload_field_classification_is_exhaustive_and_allowlisted() {
     hot_only.policy.max_timeout_secs += 1;
     hot_only.shell.program = "bash".to_string();
     hot_only.skills.roots.push(PathBuf::from("live-skill-root"));
+    hot_only
+        .instructions
+        .files
+        .push(PathBuf::from("/tmp/global-AGENTS.md"));
     hot_only.plugins.request_timeout_secs += 1;
     hot_only.mcp_gateway.request_timeout_secs += 1;
     hot_only.tool_providers.strategy =
@@ -142,6 +146,156 @@ fn skill_roots_config_change_is_hot_reloadable_and_generation_fenced() {
     assert_eq!(active.generation, 2);
     assert_eq!(active.skills.roots, vec![live_root]);
     assert!(old.skills.roots.is_empty());
+}
+
+#[test]
+fn instruction_files_config_change_is_hot_reloadable_and_generation_fenced() {
+    let (tmp, path, runtime) = reload_fixture();
+    let old = runtime.snapshot();
+    assert!(old.instructions.files.is_empty());
+    let instruction_file = tmp.path().join("AGENTS.md");
+    std::fs::write(&instruction_file, "runner guidance\n").unwrap();
+    let candidate = format!(
+        "{}\n[instructions]\nfiles = [{:?}]\n",
+        reload_toml(
+            "oe",
+            None,
+            60,
+            1024,
+            "sh",
+            "native",
+            false,
+            "claude",
+            "project_search_generation_1",
+        ),
+        instruction_file.to_string_lossy().as_ref()
+    );
+    std::fs::write(&path, candidate).unwrap();
+
+    let checked = runtime.check_config();
+    assert_eq!(checked.valid, Some(true));
+    assert!(!checked.restart_required);
+    assert!(checked.restart_required_fields.is_empty());
+    assert_eq!(checked.current_generation, Some(1));
+
+    let reloaded = runtime.reload_config(1);
+    assert_eq!(reloaded.valid, Some(true));
+    assert!(!reloaded.restart_required);
+    assert_eq!(reloaded.current_generation, Some(2));
+    let active = runtime.snapshot();
+    assert_eq!(active.instructions.files, vec![instruction_file]);
+    assert!(old.instructions.files.is_empty());
+}
+
+#[test]
+fn instruction_files_do_not_expand_project_allowed_roots() {
+    let tmp = tempfile::tempdir().unwrap();
+    let workspace = tmp.path().join("workspace");
+    let external_dir = tmp.path().join("runner-guidance");
+    let instruction_file = external_dir.join("AGENTS.md");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::create_dir_all(&external_dir).unwrap();
+    std::fs::write(&instruction_file, "runner-only guidance\n").unwrap();
+
+    let path = tmp.path().join("runner.toml");
+    let base = reload_toml(
+        "oe",
+        None,
+        60,
+        1024,
+        "sh",
+        "native",
+        false,
+        "claude",
+        "project_search_generation_1",
+    )
+    .replace(
+        "policy.allow_cwd_anywhere = true",
+        "policy.allow_cwd_anywhere = false",
+    )
+    .replace(
+        "policy.allowed_roots = [\"/\"]",
+        &format!(
+            "policy.allowed_roots = [{:?}]",
+            workspace.to_string_lossy().as_ref()
+        ),
+    );
+    std::fs::write(
+        &path,
+        format!(
+            "{base}\n[instructions]\nfiles = [{:?}]\n",
+            instruction_file.to_string_lossy().as_ref()
+        ),
+    )
+    .unwrap();
+
+    let config = load_config(&path).unwrap();
+    assert_eq!(config.policy.allowed_roots, vec![workspace]);
+    assert_eq!(config.instructions.files, vec![instruction_file]);
+}
+
+#[test]
+fn invalid_instruction_paths_are_structured_config_diagnostics() {
+    let (_tmp, path, runtime) = reload_fixture();
+    let base = reload_toml(
+        "oe",
+        None,
+        60,
+        1024,
+        "sh",
+        "native",
+        false,
+        "claude",
+        "project_search_generation_1",
+    );
+    std::fs::write(
+        &path,
+        format!("{base}\n[instructions]\nfiles = [\"relative/AGENTS.md\"]\n"),
+    )
+    .unwrap();
+    let checked = runtime.check_config();
+    assert_eq!(checked.valid, Some(false));
+    assert_eq!(
+        checked.error_field,
+        Some(runner_protocol::RunnerConfigErrorField::InstructionsFiles)
+    );
+    assert_eq!(
+        checked.error_reason,
+        Some(runner_protocol::RunnerConfigErrorReason::InvalidPath)
+    );
+    assert!(!checked.restart_required);
+
+    let absolute_with_parent = std::env::temp_dir().join("a").join("..").join("AGENTS.md");
+    std::fs::write(
+        &path,
+        format!(
+            "{base}\n[instructions]\nfiles = [{:?}]\n",
+            absolute_with_parent.to_string_lossy().as_ref()
+        ),
+    )
+    .unwrap();
+    let checked = runtime.check_config();
+    assert_eq!(checked.valid, Some(false));
+    assert_eq!(
+        checked.error_field,
+        Some(runner_protocol::RunnerConfigErrorField::InstructionsFiles)
+    );
+
+    let duplicate = std::env::temp_dir().join("global-AGENTS.md");
+    std::fs::write(
+        &path,
+        format!(
+            "{base}\n[instructions]\nfiles = [{0:?}, {0:?}]\n",
+            duplicate.to_string_lossy().as_ref()
+        ),
+    )
+    .unwrap();
+    let checked = runtime.check_config();
+    assert_eq!(checked.valid, Some(false));
+    assert_eq!(
+        checked.error_field,
+        Some(runner_protocol::RunnerConfigErrorField::InstructionsFiles)
+    );
 }
 
 #[test]
@@ -526,7 +680,10 @@ fn first_class_check_reports_sanitized_parse_and_structural_failures() {
     let malformed = runtime.check_config();
     assert_eq!(malformed.valid, Some(false));
     assert_eq!(malformed.current_generation, Some(1));
-    assert_eq!(malformed.error_code.as_deref(), Some("config_parse_failed"));
+    assert_eq!(
+        malformed.error_code,
+        Some(runner_protocol::RunnerConfigErrorCode::ConfigParseFailed)
+    );
     assert!(malformed.error_field.is_none());
     assert!(malformed.error_reason.is_none());
 
@@ -549,14 +706,17 @@ fn first_class_check_reports_sanitized_parse_and_structural_failures() {
     assert_eq!(structural.valid, Some(false));
     assert_eq!(structural.current_generation, Some(1));
     assert_eq!(
-        structural.error_code.as_deref(),
-        Some("config_validation_failed")
+        structural.error_code,
+        Some(runner_protocol::RunnerConfigErrorCode::ConfigValidationFailed)
     );
     assert_eq!(
-        structural.error_field.as_deref(),
-        Some("max_concurrent_jobs")
+        structural.error_field,
+        Some(runner_protocol::RunnerConfigErrorField::MaxConcurrentJobs)
     );
-    assert_eq!(structural.error_reason.as_deref(), Some("out_of_range"));
+    assert_eq!(
+        structural.error_reason,
+        Some(runner_protocol::RunnerConfigErrorReason::OutOfRange)
+    );
 
     let serialized = format!(
         "{} {}",
@@ -615,8 +775,8 @@ fn first_class_reload_applies_hot_candidate_once_and_fences_stale_generation() {
     assert_eq!(stale.valid, None);
     assert_eq!(stale.current_generation, Some(2));
     assert_eq!(
-        stale.error_code.as_deref(),
-        Some("config_generation_conflict")
+        stale.error_code,
+        Some(runner_protocol::RunnerConfigErrorCode::ConfigGenerationConflict)
     );
     assert_eq!(runtime.snapshot().generation, 2);
     assert_eq!(runtime.snapshot().policy.max_timeout_secs, 120);
@@ -635,7 +795,10 @@ fn first_class_invalid_reload_preserves_active_snapshot_and_generation() {
     );
     assert_eq!(rejected.valid, Some(false));
     assert_eq!(rejected.current_generation, Some(1));
-    assert_eq!(rejected.error_code.as_deref(), Some("config_parse_failed"));
+    assert_eq!(
+        rejected.error_code,
+        Some(runner_protocol::RunnerConfigErrorCode::ConfigParseFailed)
+    );
     let after = runtime.snapshot();
     assert!(Arc::ptr_eq(&before, &after));
     assert_eq!(after.generation, 1);

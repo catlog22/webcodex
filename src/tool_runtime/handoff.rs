@@ -1,4 +1,4 @@
-//! `session_handoff_summary` — read-only structured handoff for degraded or
+//! `read_session_handoff` — read-only structured handoff for degraded or
 //! contaminated execution context recovery (GPT long-task window routed to a
 //! degraded/contaminated context, context pollution, or continuing in a fresh
 //! window), multi-agent, and multi-window scenarios.
@@ -10,32 +10,32 @@
 //! full diffs, file contents, stdout/stderr bodies, validation commands,
 //! secrets, tokens, or raw session input payloads.
 
+use super::closeout_evidence::{CloseoutSessionEvidence, CLOSEOUT_SESSION_EVENT_LIMIT};
+use super::closeout_facts::{
+    CloseoutFacts, Observation, ValidationFacts, ValidationStatus, WorkspaceFacts,
+};
+use super::closeout_projection::{install_closeout_decision, workspace_observation};
 use super::continuation_feedback::{
-    continuation_feedback_value, continuation_projection_hooks, continuation_validation_snapshot,
-    ContinuationFeedbackInput, ContinuationToolFailureSnapshot,
+    continuation_feedback_value, continuation_projection_hooks, ContinuationFeedbackInput,
+    ContinuationToolFailureSnapshot,
 };
 use super::handoff_brief::{build_handoff_brief, HandoffBriefInput};
+use super::jobs::ActiveJobsSummary;
 use super::permissions::permission_summary_from_events;
 use super::session_context::{session_project_mismatch_result, SessionProjectMismatch};
-use super::sessions::{
-    canonical_tool_call_finished_events, tool_failure_summary_from_events, SessionEvent,
-    SessionSummary, TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
-};
+use super::sessions::canonical_tool_call_finished_events;
 use super::sessions::{SessionDiscussionCounts, SessionDiscussionSummary, SessionMessage};
 use super::tool_result::ToolResult;
 use super::ToolRuntime;
 use crate::auth::AuthContext;
 use serde_json::{json, Value};
 use std::collections::HashSet;
-use webcodex_tool_contracts::{
-    runtime_tool_session_evidence_policy, ToolFailureEvidence, ToolReviewEvidence,
-};
 
 pub(crate) use webcodex_workflow_session::closeout_work_projection;
 
 pub(super) const DEFAULT_HANDOFF_LIMIT: usize = 20;
+pub(super) use super::closeout_facts::UNPROVEN_SOURCE_REVIEW_ACTION;
 const MAX_HANDOFF_LIMIT: usize = 100;
-const HANDOFF_CLOSEOUT_SESSION_EVENT_LIMIT: usize = 200;
 const MAX_RECENT_FAILED_TOOLS: usize = 10;
 const MAX_RECENT_PROGRESS: usize = 10;
 const MAX_RECENT_DECISIONS: usize = 10;
@@ -44,12 +44,95 @@ const MAX_OPEN_ITEMS: usize = 20;
 const MAX_RECENT_CHECKPOINTS: usize = 10;
 const HANDOFF_MESSAGE_CHARS: usize = 240;
 
-/// Actionable guidance only for a validation failure that still belongs to the
-/// current evidence window. Identity reuse is conditional: it strengthens
-/// correlation when the same logical validation is intentionally rerun, but is
-/// never a requirement to clean stale audit history.
-pub(crate) const VALIDATION_IDENTITY_REUSE_ACTION: &str =
-    "address the current validation failure; when intentionally rerunning it, reuse the original assertion_name when supplied and the same validation identity";
+pub(crate) use super::closeout_facts::VALIDATION_IDENTITY_REUSE_ACTION;
+
+fn workspace_continuity_projection(
+    workspace: &Value,
+    session_changed_paths: &[Value],
+    history_complete: bool,
+) -> Value {
+    let session_paths = session_changed_paths
+        .iter()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let current_paths = workspace
+        .get("files")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    let current_total = workspace
+        .get("files_total")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(current_paths.len());
+    let files_returned = workspace
+        .get("files_returned")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(current_paths.len());
+    let files_truncated = workspace
+        .get("files_truncated")
+        .and_then(Value::as_bool)
+        .unwrap_or(current_total != files_returned);
+    let git_available = workspace
+        .get("git_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let clean = workspace
+        .get("clean")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let overlap_count = current_paths.intersection(&session_paths).count();
+    let unattributed_paths_count = current_paths.len().saturating_sub(overlap_count);
+    let complete_workspace_paths =
+        git_available && !files_truncated && current_total == current_paths.len();
+
+    let status = if !history_complete || !complete_workspace_paths {
+        "unproven"
+    } else if current_paths.is_empty() {
+        if clean {
+            "clean"
+        } else {
+            "unproven"
+        }
+    } else if clean {
+        "unproven"
+    } else if overlap_count == current_paths.len() {
+        "consistent_with_session_history"
+    } else if overlap_count > 0 {
+        "partially_attributed"
+    } else {
+        "unattributed"
+    };
+
+    json!({
+        "status": status,
+        "current_dirty_paths_count": current_paths.len(),
+        "session_changed_paths_count": session_paths.len(),
+        "overlap_count": overlap_count,
+        "unattributed_paths_count": unattributed_paths_count,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn workspace_continuity_projection_for_test(
+    workspace: &Value,
+    session_changed_paths: &[Value],
+    history_complete: bool,
+) -> Value {
+    workspace_continuity_projection(workspace, session_changed_paths, history_complete)
+}
+
+pub(crate) struct HandoffObservation {
+    pub(crate) result: ToolResult,
+    pub(crate) evidence: CloseoutSessionEvidence,
+    pub(crate) jobs: ActiveJobsSummary,
+    pub(crate) external_observations: Value,
+}
 
 impl ToolRuntime {
     pub(crate) async fn session_handoff_summary(
@@ -59,10 +142,39 @@ impl ToolRuntime {
         include_workspace: Option<bool>,
         include_checkpoints: Option<bool>,
         include_validation: Option<bool>,
-        summary_only: bool,
+        diagnostic: bool,
         limit: Option<usize>,
         auth: Option<&AuthContext>,
     ) -> ToolResult {
+        match self
+            .session_handoff_observation(
+                session_id,
+                project,
+                include_workspace,
+                include_checkpoints,
+                include_validation,
+                diagnostic,
+                limit,
+                auth,
+            )
+            .await
+        {
+            Ok(observation) => observation.result,
+            Err(result) => result,
+        }
+    }
+
+    pub(crate) async fn session_handoff_observation(
+        &self,
+        session_id: String,
+        project: Option<String>,
+        include_workspace: Option<bool>,
+        include_checkpoints: Option<bool>,
+        include_validation: Option<bool>,
+        diagnostic: bool,
+        limit: Option<usize>,
+        auth: Option<&AuthContext>,
+    ) -> Result<HandoffObservation, ToolResult> {
         let limit = limit
             .filter(|n| *n > 0)
             .unwrap_or(DEFAULT_HANDOFF_LIMIT)
@@ -74,13 +186,17 @@ impl ToolRuntime {
         let include_validation = include_validation.unwrap_or(true);
 
         let authorized_target = match self
-            .authorize_session_target(&session_id, "session_handoff_summary", auth)
+            .authorize_session_target(&session_id, "read_session_handoff", auth)
             .await
         {
             Ok(resolved) => resolved,
-            Err(result) => return result,
+            Err(result) => return Err(result),
         };
-        if let Some(request_project) = project
+        let session_project = self
+            .sessions
+            .session_project(&session_id)
+            .expect("authorized Workflow Session must still exist");
+        let requested_project = if let Some(request_project) = project
             .as_deref()
             .map(str::trim)
             .filter(|project| !project.is_empty())
@@ -90,34 +206,67 @@ impl ToolRuntime {
                 .await
             {
                 Ok(resolved) => resolved,
-                Err(err) => return err.into_tool_result(),
+                Err(err) => return Err(err.into_tool_result()),
             };
-            if let Some(target) = authorized_target.as_ref() {
-                if target.resolved_id != requested.resolved_id {
-                    return session_project_mismatch_result(
+            if let Some(session_project) = session_project.as_deref() {
+                if session_project != requested.resolved_id {
+                    return Err(session_project_mismatch_result(
                         &session_id,
-                        "session_handoff_summary",
+                        "read_session_handoff",
                         &SessionProjectMismatch {
-                            session_project: target.resolved_id.clone(),
+                            session_project: session_project.to_string(),
                             request_project: requested.resolved_id,
                         },
-                    );
+                    ));
                 }
             }
-        }
+            Some(requested)
+        } else {
+            None
+        };
+
+        // The exact authorized business Session owns recovery. Recorder identity
+        // never selects its Project or changes its evidence. Local/dev authority
+        // deliberately returns no resolved target, so independently resolve the
+        // already-authorized stored Project instead of treating it as unscoped.
+        let project = if let Some(requested) = requested_project {
+            Some(requested.resolved_id)
+        } else if let Some(target) = authorized_target {
+            Some(target.resolved_id)
+        } else {
+            // The Session project was canonicalized and authority-fenced when the
+            // Session was created. Concrete workspace/Job reads keep their own
+            // normal project resolution and authorization; do not add a second
+            // registry-availability precondition merely to choose the recovery
+            // target here.
+            session_project
+        };
+        let observed_revision = self.sessions.handoff_revision(&session_id);
 
         // --- session basic info + display-bounded events ---
         let summary = match self.sessions.summary(&session_id, Some(limit)) {
             Some(summary) => summary,
-            None => return super::unknown_session_result(&session_id),
+            None => {
+                return Err(super::session_context::absent_workflow_session_result(
+                    &self.sessions,
+                    &session_id,
+                    auth,
+                ));
+            }
         };
         // Canonical closeout evidence must not depend on the caller's display
         // limit. Reuse one fixed bounded Session snapshot for validation,
         // tool-failure actionability, review evidence, and outcome projection.
         let closeout_session = self
             .sessions
-            .summary(&session_id, Some(HANDOFF_CLOSEOUT_SESSION_EVENT_LIMIT))
+            .summary(&session_id, Some(CLOSEOUT_SESSION_EVENT_LIMIT))
             .unwrap_or_else(|| summary.clone());
+        // External observations live in an intentionally separate evidence plane,
+        // so capture their own bounded snapshot inside the handoff window. The
+        // final comparison below detects accepted reports that arrive while the
+        // remaining workspace/Job/validation snapshots are assembled.
+        let external_observations =
+            self.handoff_external_observations(&session_id, summary.project.as_deref());
 
         // --- message board state ---
         let (discussion, guidance_available) =
@@ -178,12 +327,6 @@ impl ToolRuntime {
             .collect();
 
         let failed_tool_calls = recent_failed_tools.len();
-        let tool_failures = handoff_tool_failure_summary(&summary.events, &closeout_session.events);
-        let expected_failed_tool_calls = output_recent(&tool_failures, "recent_expected");
-        let unexpected_failed_tool_calls = output_recent(&tool_failures, "recent_unexpected");
-        let expectation_mismatches = output_recent(&tool_failures, "recent_mismatches");
-        let unexpected_success_tool_calls =
-            output_recent(&tool_failures, "recent_unexpected_successes");
 
         let open_todos = bound_messages(&discussion.open_todos, MAX_OPEN_ITEMS);
         let high_priority_open_todos =
@@ -225,13 +368,15 @@ impl ToolRuntime {
             None => summary.project.clone().unwrap_or_default(),
         };
         let jobs_project = (!jobs_project.is_empty()).then_some(jobs_project);
-        let jobs = self
-            .active_jobs_summary(jobs_project.as_deref(), Some(&summary.session_id), auth, 10)
+        let job_snapshot = self
+            .active_jobs_snapshot(jobs_project.as_deref(), Some(&summary.session_id), auth, 10)
             .await;
+        let jobs = job_snapshot.to_value();
         if let Some(job_warnings) = jobs.get("warnings").and_then(Value::as_array) {
             warnings.extend(job_warnings.iter().cloned());
         }
 
+        let session_ref = self.session_reference_for_id(&summary.session_id, auth);
         let mut output = json!({
             "session_id": summary.session_id,
             "project": summary.project,
@@ -254,16 +399,16 @@ impl ToolRuntime {
             "recent_progress": recent_progress,
             "recent_decisions": recent_decisions,
             "recent_failed_tools": recent_failed_tools,
-            "tool_failures": tool_failures,
-            "expected_failed_tool_calls": expected_failed_tool_calls,
-            "unexpected_failed_tool_calls": unexpected_failed_tool_calls,
-            "expectation_mismatches": expectation_mismatches,
-            "unexpected_success_tool_calls": unexpected_success_tool_calls,
-            "review_evidence": review_evidence_summary_for_session(&closeout_session),
             "jobs": jobs,
             "warnings": warnings,
         });
 
+        if let Some(session_ref) = session_ref.as_deref() {
+            output["session_ref"] = json!(session_ref);
+        }
+
+        // Keep observation success independent of the bounded workspace projection.
+        let mut closeout_workspace = Observation::NotChecked;
         // --- optional workspace summary ---
         let has_project = project
             .as_deref()
@@ -271,8 +416,22 @@ impl ToolRuntime {
             .unwrap_or(false);
         if has_project && include_workspace {
             let project = project.clone().unwrap_or_default();
-            let workspace = self.handoff_workspace_summary(&project).await;
+            let (continuity_changed_paths, history_complete) = self
+                .sessions
+                .retained_changed_path_evidence(&session_id)
+                .map(|(paths, complete)| {
+                    (
+                        paths.into_iter().map(Value::String).collect::<Vec<_>>(),
+                        complete,
+                    )
+                })
+                .unwrap_or_else(|| (Vec::new(), false));
+            let (workspace, continuity, observation) = self
+                .handoff_workspace_summary(&project, &continuity_changed_paths, history_complete)
+                .await;
+            closeout_workspace = observation;
             output["workspace"] = workspace;
+            output["workspace_continuity"] = continuity;
         }
 
         // --- optional checkpoint candidates ---
@@ -289,32 +448,42 @@ impl ToolRuntime {
         // canonical closeout classification. When validation is not requested,
         // continuation feedback reports it as explicitly unavailable rather than
         // masquerading as `not_run`.
-        let feedback_validation: Value = if include_validation {
-            self.validation_summary_for_session_with_jobs(
-                &closeout_session,
+        let evidence = self
+            .observe_closeout_session_evidence(
+                closeout_session,
+                observed_revision,
+                include_validation,
                 DEFAULT_HANDOFF_LIMIT,
                 auth,
             )
-            .await
+            .await;
+        let projection_closeout_session = &evidence.summary;
+        let feedback_validation = if include_validation {
+            evidence.validation.to_value()
         } else {
-            json!({ "available": false, "not_requested": true })
+            json!({"available": false, "not_requested": true})
         };
+        let tool_failures = evidence.failures.with_display_events(&summary.events);
+        output["expected_failed_tool_calls"] = output_recent(&tool_failures, "recent_expected");
+        output["unexpected_failed_tool_calls"] = output_recent(&tool_failures, "recent_unexpected");
+        output["expectation_mismatches"] = output_recent(&tool_failures, "recent_mismatches");
+        output["unexpected_success_tool_calls"] =
+            output_recent(&tool_failures, "recent_unexpected_successes");
+        output["tool_failures"] = tool_failures;
+        output["review_evidence"] = evidence.review.to_value();
         if include_validation {
             output["validation"] = feedback_validation.clone();
         }
-        let continuation_current_validation =
-            super::validation_events::current_validation_evidence_for_session(
-                &closeout_session,
-                20,
-            );
         let (work_performed, changed_paths) = closeout_work_projection(&summary.events);
         output["work_performed"] = work_performed;
         output["changed_paths"] = changed_paths;
-        let reconciliation = reconcile_closeout_evidence(
-            output.get("tool_failures").unwrap_or(&Value::Null),
-            &closeout_session,
-            &feedback_validation,
-        );
+        let mut facts = evidence.facts(closeout_workspace, None, job_snapshot.facts());
+        if !include_validation {
+            facts.validation = ValidationFacts {
+                status: Some(ValidationStatus::NotRun),
+                ..Default::default()
+            };
+        }
 
         // Continuation feedback: a read-only attempt-summary + validation-delta
         // projection reused across handoff, finish, and start. Built from the
@@ -322,66 +491,150 @@ impl ToolRuntime {
         // metadata already gathered here; never re-runs validation, mutates the
         // ledger, refreshes activity, or consumes guidance.
         output["continuation_feedback"] = continuation_feedback_value(ContinuationFeedbackInput {
-            session_summary: &closeout_session,
+            session_summary: &projection_closeout_session,
             validation: &feedback_validation,
-            jobs: output.get("jobs").unwrap_or(&Value::Null),
+            jobs: job_snapshot.continuation_snapshot(),
             discussion: &discussion,
             continuation: "continued",
             suggest_exploration_continuity: false,
-            workspace_conflicts: output
-                .pointer("/workspace/counts/conflicted")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-                > 0,
+            workspace_conflicts: facts.workspace_conflicts().is_some_and(|count| count > 0),
             hooks: continuation_projection_hooks(),
-            current_validation: continuation_validation_snapshot(&continuation_current_validation),
+            current_validation: evidence
+                .validation
+                .continuation_snapshot(include_validation),
             tool_failures: ContinuationToolFailureSnapshot::new(
-                &reconciliation.actionable_unexpected_event_ids,
+                &evidence.failures.actionable_unexpected_event_ids,
             ),
         });
-        output["tool_failures"] = reconciliation.tool_failures;
-        if include_validation {
-            output["validation"] = reconciliation.validation;
+
+        let external_observations_changed_during_snapshot = external_observations
+            != self.handoff_external_observations(
+                &session_id,
+                projection_closeout_session.project.as_deref(),
+            );
+        let session_changed_during_snapshot = observed_revision.is_none()
+            || observed_revision != self.sessions.handoff_revision(&session_id);
+        if session_changed_during_snapshot {
+            if let Some(continuity) = output
+                .get_mut("workspace_continuity")
+                .and_then(Value::as_object_mut)
+            {
+                continuity.insert("status".to_string(), json!("unproven"));
+            }
         }
 
         // --- bounded suggested next actions ---
-        output["suggested_next_actions"] = json!(handoff_suggested_next_actions(&output));
+        output["suggested_next_actions"] =
+            json!(handoff_suggested_next_actions(&output, &facts, &discussion));
+        if let Some(goal_context) = self.recovery_goal_context_for_session(auth, &session_id) {
+            output["goal_context"] = goal_context;
+        }
         output["handoff_brief"] = build_handoff_brief(HandoffBriefInput {
-            session_summary: &closeout_session,
+            session_summary: &projection_closeout_session,
+            discussion: guidance_available.then_some(&discussion),
             continuation_feedback: output.get("continuation_feedback").unwrap_or(&Value::Null),
             workspace_requested: include_workspace,
             workspace: output.get("workspace"),
             validation_requested: include_validation,
             validation: Some(&feedback_validation),
             jobs: output.get("jobs"),
+            external_observations: Some(&external_observations),
             guidance_available,
+            session_changed_during_snapshot,
+            external_observations_changed_during_snapshot,
             existing_suggested_actions: output.get("suggested_next_actions"),
         });
 
-        let compact = compact_handoff_output(&output);
-        if summary_only {
-            return ToolResult::ok(compact);
+        let retained_outputs = super::task_outputs::retained_task_outputs(
+            &projection_closeout_session,
+        )
+        .and_then(|value| {
+            serde_json::from_value::<webcodex_core::task_outputs::TaskOutputs>(value).ok()
+        });
+        output["acceptance"] = super::acceptance_evidence::acceptance_evidence(
+            &facts,
+            super::acceptance_evidence::AcceptanceContext {
+                outputs: retained_outputs.as_ref(),
+                outputs_historical: true,
+                history_partial: projection_closeout_session.events_truncated
+                    || projection_closeout_session.retention_truncated,
+                snapshot_changed: session_changed_during_snapshot
+                    || external_observations_changed_during_snapshot,
+            },
+        );
+        if !diagnostic {
+            let mut handoff = json!({
+                "session_id": output["session_id"],
+                "project": output["project"],
+                "handoff_brief": output["handoff_brief"],
+                "acceptance": output["acceptance"],
+            });
+            if let Some(session_ref) = output.get("session_ref") {
+                handoff["session_ref"] = session_ref.clone();
+            }
+            if let Some(workspace_continuity) = output.get("workspace_continuity") {
+                handoff["workspace_continuity"] = workspace_continuity.clone();
+            }
+            if let Some(goal_context) = output.get("goal_context") {
+                handoff["goal_context"] = goal_context.clone();
+            }
+            return Ok(HandoffObservation {
+                result: ToolResult::ok(handoff),
+                evidence,
+                jobs: job_snapshot,
+                external_observations,
+            });
         }
-        for field in [
-            "facts",
-            "hard_blockers",
-            "advisories",
-            "task_outcome",
-            "evidence_history",
-            "evidence_integrity",
-            "informational_notes",
-            "verdict",
-        ] {
-            output[field] = compact.get(field).cloned().unwrap_or(Value::Null);
+        let snapshot_changed =
+            session_changed_during_snapshot || external_observations_changed_during_snapshot;
+        if snapshot_changed {
+            // Keep the diagnostic actions aligned with the bounded brief. The
+            // captured facts remain useful history, but cannot authorize a next
+            // task step until the exact Session has been observed again.
+            let recovery_actions = output["handoff_brief"]["next_actions"].clone();
+            output["suggested_next_actions"] = recovery_actions.clone();
+            if let Some(actions) =
+                output.pointer_mut("/continuation_feedback/attempt/suggested_next_actions")
+            {
+                *actions = recovery_actions;
+            }
         }
-
-        ToolResult::ok(output)
+        let mut compact = compact_handoff_output(&output, &facts);
+        if snapshot_changed {
+            // These optional aggregate completion conclusions require a coherent
+            // snapshot. Preserve facts, blockers, history and integrity without
+            // presenting the stale closeout decision as a current verdict.
+            let compact = compact.as_object_mut().expect("handoff projection object");
+            compact.remove("verdict");
+            compact.remove("task_outcome");
+        }
+        for (key, value) in compact.as_object().unwrap() {
+            if !include_validation && key == "validation" {
+                continue;
+            }
+            output
+                .as_object_mut()
+                .unwrap()
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+        Ok(HandoffObservation {
+            result: ToolResult::ok(output),
+            evidence,
+            jobs: job_snapshot,
+            external_observations,
+        })
     }
 
-    /// Build a bounded workspace summary reusing the read-only `show_changes`
+    /// Build a bounded workspace summary reusing the read-only `read_workspace_changes`
     /// git inspection path. Returns only clean/branch/head/counts/warnings/
     /// suggested_next_actions — never hunks, full diffs, or file contents.
-    async fn handoff_workspace_summary(&self, project: &str) -> Value {
+    async fn handoff_workspace_summary(
+        &self,
+        project: &str,
+        session_changed_paths: &[Value],
+        history_complete: bool,
+    ) -> (Value, Value, Observation<WorkspaceFacts>) {
         let show_result = self
             .show_changes(project.to_string(), None, Some(false), None, None, None)
             .await;
@@ -398,18 +651,22 @@ impl ToolRuntime {
                 "kind": "git_unavailable",
                 "message": "git-backed workspace inspection unavailable; project may not be a git repository",
             }));
-            return json!({
-                "project": project,
-                "git_available": false,
-                "non_git_project": show_result.output.get("non_git_project").cloned().unwrap_or(json!(false)),
-                "clean": true,
-                "branch": null,
-                "head": null,
-                "changed_files_count": 0,
-                "counts": {},
-                "warnings": json!(warnings),
-                "suggested_next_actions": [],
-            });
+            return (
+                json!({
+                    "project": project,
+                    "git_available": false,
+                    "non_git_project": show_result.output.get("non_git_project").cloned().unwrap_or(json!(false)),
+                    "clean": true,
+                    "branch": null,
+                    "head": null,
+                    "changed_files_count": 0,
+                    "counts": {},
+                    "warnings": json!(warnings),
+                    "suggested_next_actions": [],
+                }),
+                workspace_continuity_projection(&show_result.output, session_changed_paths, false),
+                Observation::Failed,
+            );
         }
         let counts = show_result
             .output
@@ -450,22 +707,32 @@ impl ToolRuntime {
             }));
         }
 
-        json!({
-            "project": project,
-            "git_available": json!(git_available),
-            "non_git_project": show_result.output.get("non_git_project").cloned().unwrap_or(json!(false)),
-            "clean": show_result.output.get("clean").cloned().unwrap_or(json!(true)),
-            "branch": show_result.output.get("branch").cloned().unwrap_or(Value::Null),
-            "head": show_result.output.get("head").cloned().unwrap_or(Value::Null),
-            "changed_files_count": changed_files_count,
-            "counts": counts,
-            "warnings": json!(warnings),
-            "suggested_next_actions": show_result.output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
-        })
+        let observation = workspace_observation(&show_result.output, true, true);
+        let continuity = workspace_continuity_projection(
+            &show_result.output,
+            session_changed_paths,
+            history_complete,
+        );
+        (
+            json!({
+                "project": project,
+                "git_available": json!(git_available),
+                "non_git_project": show_result.output.get("non_git_project").cloned().unwrap_or(json!(false)),
+                "clean": show_result.output.get("clean").cloned().unwrap_or(json!(true)),
+                "branch": show_result.output.get("branch").cloned().unwrap_or(Value::Null),
+                "head": show_result.output.get("head").cloned().unwrap_or(Value::Null),
+                "changed_files_count": changed_files_count,
+                "counts": counts,
+                "warnings": json!(warnings),
+                "suggested_next_actions": show_result.output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
+            }),
+            continuity,
+            observation,
+        )
     }
 
     /// Build a bounded checkpoint summary using the read-only
-    /// `workspace_checkpoint_list` path. Returns the latest
+    /// `list_workspace_checkpoints` path. Returns the latest
     /// `last_known_good` checkpoint (preferring `validation_status == passed`)
     /// and a bounded recent list. Never returns validation.commands or diffs.
     #[cfg(feature = "workspace-checkpoints")]
@@ -594,43 +861,15 @@ fn bound_chars(value: &str, max_chars: usize) -> String {
     out
 }
 
-fn handoff_tool_failure_summary(
-    display_events: &[SessionEvent],
-    closeout_events: &[SessionEvent],
-) -> Value {
-    let display = tool_failure_summary_from_events(display_events, MAX_RECENT_FAILED_TOOLS);
-    let mut canonical = tool_failure_summary_from_events(closeout_events, MAX_RECENT_FAILED_TOOLS);
-    // Counts and actionability are canonical closeout facts, while bounded
-    // recent lists remain presentation-only and respect the caller display
-    // window exactly as before.
-    for key in [
-        "recent_expected",
-        "recent_unexpected",
-        "recent_mismatches",
-        "recent_unexpected_successes",
-    ] {
-        canonical[key] = output_recent(&display, key);
-    }
-    canonical
-}
-
 fn output_recent(tool_failures: &Value, key: &str) -> Value {
     tool_failures.get(key).cloned().unwrap_or_else(|| json!([]))
 }
 
-fn compact_handoff_output(output: &Value) -> Value {
-    let workspace_checked = output.get("workspace").is_some();
-    let workspace_clean = output
-        .get("workspace")
-        .and_then(|workspace| workspace.get("clean"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let workspace_conflicts = output
-        .pointer("/workspace/counts/conflicted")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+fn compact_handoff_output(output: &Value, facts: &CloseoutFacts) -> Value {
+    let workspace_clean = facts.workspace_clean();
+    let workspace_conflicts = facts.workspace_conflicts().unwrap_or(0);
     let mut compact = json!({
-        "summary_only": true,
+        "diagnostic": true,
         "project": output.get("project").cloned().unwrap_or(Value::Null),
         "session_id": output.get("session_id").cloned().unwrap_or(Value::Null),
         "workspace_clean": workspace_clean,
@@ -662,7 +901,8 @@ fn compact_handoff_output(output: &Value) -> Value {
         "warnings": output.get("warnings").cloned().unwrap_or_else(|| json!([])),
         "suggested_next_actions": output.get("suggested_next_actions").cloned().unwrap_or_else(|| json!([])),
     });
-    apply_compact_workflow_outcomes(&mut compact, workspace_checked, None);
+    let initial_actions = string_array(output.get("suggested_next_actions"));
+    install_closeout_decision(&mut compact, facts, &initial_actions);
     compact
 }
 
@@ -728,59 +968,6 @@ pub(crate) fn validation_has_cargo_test_zero_tests(validation: &Value) -> bool {
             == Some(true)
 }
 
-pub(crate) fn review_evidence_summary_for_session(summary: &SessionSummary) -> Value {
-    review_evidence_summary_from_events(&summary.events)
-}
-
-fn review_evidence_summary_from_events(events: &[SessionEvent]) -> Value {
-    let mut read_only_inspection_count = 0_u64;
-    let mut search_count = 0_u64;
-    let mut diff_review_count = 0_u64;
-    let mut workspace_review_count = 0_u64;
-    let mut hygiene_review_count = 0_u64;
-    let mut total = 0_u64;
-    let mut tools: Vec<String> = Vec::new();
-
-    for event in canonical_tool_call_finished_events(events) {
-        if event.status.as_deref() != Some("succeeded") {
-            continue;
-        }
-        match runtime_tool_session_evidence_policy(event.tool_name.as_str()).review {
-            ToolReviewEvidence::None => continue,
-            ToolReviewEvidence::ReadOnlyInspection => read_only_inspection_count += 1,
-            ToolReviewEvidence::Search => search_count += 1,
-            ToolReviewEvidence::DiffReview => diff_review_count += 1,
-            ToolReviewEvidence::WorkspaceReview => {
-                // `show_changes(include_diff=true)` is one successful call that
-                // contributes both workspace and diff dimensions, but total
-                // still increments only once below.
-                workspace_review_count += 1;
-                if event.diff_review_like {
-                    diff_review_count += 1;
-                }
-            }
-            ToolReviewEvidence::HygieneReview => {
-                workspace_review_count += 1;
-                hygiene_review_count += 1;
-            }
-        }
-        total += 1;
-        push_unique_tool(&mut tools, &event.tool_name);
-    }
-
-    json!({
-        "available": true,
-        "source": "session_ledger",
-        "read_only_inspection_count": read_only_inspection_count,
-        "search_count": search_count,
-        "diff_review_count": diff_review_count,
-        "workspace_review_count": workspace_review_count,
-        "hygiene_review_count": hygiene_review_count,
-        "total": total,
-        "tools": tools,
-    })
-}
-
 pub(crate) fn compact_review_evidence(review_evidence: &Value) -> Value {
     let tools: Vec<Value> = review_evidence
         .get("tools")
@@ -822,12 +1009,6 @@ pub(crate) fn compact_review_evidence(review_evidence: &Value) -> Value {
     })
 }
 
-fn push_unique_tool(tools: &mut Vec<String>, tool_name: &str) {
-    if !tools.iter().any(|tool| tool == tool_name) {
-        tools.push(tool_name.to_string());
-    }
-}
-
 fn compact_validation_latest_status_fallback(validation: &Value) -> Value {
     let latest_status = match validation.get("status").and_then(Value::as_str) {
         Some("passed") => "passed",
@@ -847,475 +1028,11 @@ fn compact_validation_historical_failures_fallback() -> Value {
     })
 }
 
-pub(crate) fn apply_compact_workflow_outcomes(
-    output: &mut Value,
-    workspace_checked: bool,
-    hygiene_checked: Option<bool>,
-) {
-    let outcomes = compact_workflow_outcomes(output, workspace_checked, hygiene_checked);
-    install_compact_workflow_outcomes(output, outcomes);
-}
-
-fn compact_workflow_outcomes(
-    output: &Value,
-    workspace_checked: bool,
-    hygiene_checked: Option<bool>,
-) -> Value {
-    let mut blocking_reasons: Vec<&'static str> = Vec::new();
-    let mut warning_reasons: Vec<&'static str> = Vec::new();
-    let mut integrity_errors: Vec<&'static str> = Vec::new();
-    let mut integrity_warnings: Vec<&'static str> = Vec::new();
-    let mut informational_notes: Vec<&'static str> = Vec::new();
-    let mut actions = string_array(output.get("suggested_next_actions"));
-
-    if !workspace_checked {
-        push_unique(&mut warning_reasons, "workspace_not_checked");
-        push_unique_action(&mut actions, "run show_changes before final handoff");
-    }
-    let workspace_conflicts = count_field(output, "workspace_conflicts");
-    if workspace_conflicts > 0 {
-        push_unique(&mut blocking_reasons, "workspace_conflicts");
-        push_unique_action(&mut actions, "resolve workspace conflicts before closeout");
-    } else if output
-        .get("workspace_clean")
-        .and_then(Value::as_bool)
-        .is_some_and(|clean| !clean)
-    {
-        push_unique(&mut warning_reasons, "workspace_dirty");
-        push_unique_action(&mut actions, "review workspace changes with show_changes");
-    }
-
-    if let Some(false) = hygiene_checked {
-        push_unique(&mut warning_reasons, "hygiene_not_checked");
-        push_unique_action(&mut actions, "run workspace_hygiene_check before closeout");
-    }
-    if output
-        .get("hygiene_clean")
-        .and_then(Value::as_bool)
-        .is_some_and(|clean| !clean)
-    {
-        push_unique(&mut warning_reasons, "workspace_hygiene_findings");
-        push_unique_action(&mut actions, "review workspace hygiene before closeout");
-    }
-    if count_field(output, "hygiene_secret_like_paths") > 0 {
-        push_unique(&mut blocking_reasons, "sensitive_path_risk");
-        push_unique_action(&mut actions, "review secret-like paths before closeout");
-    }
-    if output
-        .get("hygiene_truncated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        push_unique(&mut warning_reasons, "workspace_hygiene_truncated");
-    }
-
-    let jobs = output.get("jobs").unwrap_or(&Value::Null);
-    if jobs
-        .get("blocking_active_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        > 0
-    {
-        push_unique(&mut blocking_reasons, "blocking_active_jobs");
-        push_unique_action(&mut actions, "stop or await blocking active jobs");
-    }
-    if jobs
-        .get("terminal_pending_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        > 0
-    {
-        push_unique(&mut warning_reasons, "jobs_terminal_pending");
-    }
-
-    let validation = output.get("validation").unwrap_or(&Value::Null);
-    let tool_failures = output.get("tool_failures").unwrap_or(&Value::Null);
-    let expected_count = count_field(tool_failures, "expected_count");
-    let unexpected_count = count_field(tool_failures, "unexpected_count");
-    let expectation_mismatch_count = count_field(tool_failures, "expectation_mismatch_count");
-    let unexpected_success_count = count_field(tool_failures, "unexpected_success_count");
-    if actionable_unexpected_failure_count(tool_failures) > 0 {
-        push_unique(&mut blocking_reasons, "unexpected_tool_failures");
-        push_unique_action(
-            &mut actions,
-            "review unexpected failed tool calls before proceeding",
-        );
-    }
-    if expectation_mismatch_count > 0 {
-        push_unique(&mut blocking_reasons, "expectation_mismatches");
-        push_unique(&mut integrity_errors, "expectation_mismatches");
-        push_unique_action(
-            &mut actions,
-            "review result expectation mismatches before proceeding",
-        );
-    }
-    if unexpected_success_count > 0 {
-        push_unique(&mut integrity_warnings, "unexpected_successes");
-        push_unique_action(
-            &mut actions,
-            "review failure expectations that unexpectedly succeeded",
-        );
-    }
-    if expected_count > 0
-        && unexpected_count == 0
-        && expectation_mismatch_count == 0
-        && unexpected_success_count == 0
-    {
-        push_unique(
-            &mut informational_notes,
-            "declared result expectations matched",
-        );
-    }
-    if count_field(tool_failures, "non_actionable_unexpected_count") > 0 {
-        push_unique(
-            &mut informational_notes,
-            "non-actionable failed tool calls are retained as historical/process evidence",
-        );
-    }
-    if validation
-        .pointer("/evidence_gaps/count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        > 0
-    {
-        push_unique(
-            &mut informational_notes,
-            "validation evidence gaps are retained separately from correctness failures",
-        );
-    }
-
-    let validation_status = validation.get("status").and_then(Value::as_str);
-    let current_validation_status = validation
-        .pointer("/current_evidence/status")
-        .and_then(Value::as_str)
-        .or(validation_status);
-    let resolved_failure_count = validation
-        .pointer("/resolved_failures/count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let unresolved_failure_count = validation
-        .pointer("/unresolved_failures/count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let current_unresolved_failure_count = validation
-        .pointer("/current_evidence/unresolved_failure_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(unresolved_failure_count);
-    let evidence_history_status = if validation_historical_failures_resolved(validation) {
-        "mixed_resolved"
-    } else {
-        match validation_status {
-            Some("mixed") => "mixed_unresolved",
-            Some("failed") => "failed",
-            _ if validation_historical_failures_unresolved(validation) => "mixed_unresolved",
-            _ => "clean",
-        }
-    };
-
-    match current_validation_status {
-        Some("not_run") => {
-            let review_evidence_total = output
-                .get("review_evidence")
-                .and_then(|review_evidence| review_evidence.get("total"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            if review_evidence_total > 0 {
-                push_unique(
-                    &mut warning_reasons,
-                    "validation_not_run_with_review_evidence",
-                );
-                push_unique_action(
-                    &mut actions,
-                    "decide whether task-appropriate validation is needed before closeout",
-                );
-            } else {
-                push_unique(&mut warning_reasons, "validation_not_run");
-                push_unique_action(
-                    &mut actions,
-                    "run validation or review before closeout when applicable",
-                );
-            }
-        }
-        Some("stale") => {
-            push_unique(&mut warning_reasons, "validation_stale_after_changes");
-            push_unique_action(
-                &mut actions,
-                "run task-appropriate validation when warranted",
-            );
-        }
-        Some("failed") if current_unresolved_failure_count > 0 => {
-            push_unique(&mut blocking_reasons, "validation_failed");
-            push_unique_action(&mut actions, VALIDATION_IDENTITY_REUSE_ACTION);
-        }
-        Some("inconclusive") => {
-            push_unique(&mut warning_reasons, "validation_inconclusive");
-            push_unique_action(
-                &mut actions,
-                "run validation that proves the intended test assertion, or explicitly set require_tests=false when zero tests are intentional",
-            );
-        }
-        Some("unknown") | None => {
-            push_unique(&mut warning_reasons, "validation_unknown");
-        }
-        Some(_) => {}
-    }
-    if validation_historical_failures_resolved(validation) {
-        push_unique(
-            &mut informational_notes,
-            "historical validation failures were resolved by later successful validation",
-        );
-    } else if validation_historical_failures_unresolved(validation)
-        && current_unresolved_failure_count == 0
-    {
-        push_unique(
-            &mut informational_notes,
-            "historical validation failures remain without exact identity resolution but are not current workspace blockers",
-        );
-    }
-    if validation_has_cargo_test_zero_tests(validation) {
-        push_unique(&mut integrity_warnings, "cargo_test_zero_tests");
-        push_unique_action(
-            &mut actions,
-            "cargo_test ran zero tests; verify the test filter or command",
-        );
-    }
-
-    if actions.is_empty() {
-        actions.push("proceed with handoff or closeout".to_string());
-    }
-    let task_status = if blocking_reasons.is_empty() {
-        if warning_reasons.is_empty() {
-            "pass"
-        } else {
-            "warn"
-        }
-    } else {
-        "fail"
-    };
-    let evidence_integrity_status = if !integrity_errors.is_empty() {
-        "error"
-    } else if !integrity_warnings.is_empty() {
-        "warning"
-    } else {
-        "clean"
-    };
-    let task_warning_reasons = warning_reasons.clone();
-    for reason in &integrity_warnings {
-        push_unique(&mut warning_reasons, *reason);
-    }
-    let legacy_status = if task_status == "fail" || evidence_integrity_status == "error" {
-        "fail"
-    } else if task_status == "warn" || evidence_integrity_status == "warning" {
-        "warn"
-    } else {
-        "pass"
-    };
-    let verdict = json!({
-        "status": legacy_status,
-        "blocking": task_status == "fail" || evidence_integrity_status == "error",
-        "blocking_reasons": blocking_reasons.clone(),
-        "warning_reasons": warning_reasons.clone(),
-        "suggested_next_actions": actions.clone(),
-    });
-    let executions = validation
-        .get("events")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-    let validation_skipped = matches!(current_validation_status, Some("not_run" | "stale"))
-        || validation
-            .get("skipped")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-    let facts = json!({
-        "work_performed": output.get("work_performed").cloned().unwrap_or_else(|| json!([])),
-        "changed_paths": output.get("changed_paths").cloned().unwrap_or_else(|| json!([])),
-        "executions": executions,
-        "validations_passed": validation.get("successes").and_then(Value::as_u64).unwrap_or(0),
-        "validations_failed": validation.get("failures").and_then(Value::as_u64).unwrap_or(0),
-        "validations_skipped": {
-            "count": u64::from(validation_skipped),
-            "reason": validation.get("reason").cloned().unwrap_or(Value::Null),
-        },
-        "resolved_failures": validation.get("resolved_failures").cloned().unwrap_or_else(|| json!({"count": resolved_failure_count, "events": []})),
-        "unresolved_failures": validation.get("unresolved_failures").cloned().unwrap_or_else(|| json!({"count": unresolved_failure_count, "events": []})),
-        "workspace_state": {
-            "checked": workspace_checked,
-            "clean": output.get("workspace_clean").cloned().unwrap_or(Value::Null),
-            "conflicts": workspace_conflicts,
-            "hygiene_checked": hygiene_checked,
-            "hygiene_clean": output.get("hygiene_clean").cloned().unwrap_or(Value::Null),
-        },
-        "active_jobs": output.get("jobs").cloned().unwrap_or_else(|| json!({})),
-        "evidence_integrity": {
-            "status": evidence_integrity_status,
-            "error_reasons": integrity_errors,
-            "warning_reasons": integrity_warnings,
-        },
-    });
-
-    json!({
-        "facts": facts,
-        "hard_blockers": blocking_reasons,
-        "advisories": warning_reasons,
-        "task_outcome": {
-            "status": task_status,
-            "blocking": task_status == "fail",
-            "blocking_reasons": verdict["blocking_reasons"],
-            "warning_reasons": task_warning_reasons,
-        },
-        "evidence_history": {
-            "status": evidence_history_status,
-        },
-        "evidence_integrity": {
-            "status": evidence_integrity_status,
-            "error_reasons": integrity_errors,
-            "warning_reasons": integrity_warnings,
-        },
-        "informational_notes": informational_notes,
-        "verdict": verdict,
-    })
-}
-
 pub(crate) fn actionable_unexpected_failure_count(tool_failures: &Value) -> u64 {
     tool_failures
         .get("actionable_unexpected_count")
         .and_then(Value::as_u64)
         .unwrap_or_else(|| count_field(tool_failures, "unexpected_count"))
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct CloseoutEvidenceReconciliation {
-    pub(crate) validation: Value,
-    pub(crate) tool_failures: Value,
-    pub(crate) actionable_unexpected_event_ids: HashSet<String>,
-}
-
-/// Reconcile immutable ledger history into the single current closeout view used
-/// by both handoff and finish projections. Raw failure counts and validation
-/// events remain intact; only their current actionability/status is projected.
-pub(crate) fn reconcile_closeout_evidence(
-    tool_failures: &Value,
-    summary: &SessionSummary,
-    validation: &Value,
-) -> CloseoutEvidenceReconciliation {
-    let validation = validation.clone();
-    let current = super::validation_events::current_validation_evidence_for_session(summary, 100);
-    let mut projected = tool_failures.clone();
-    let raw_unexpected = count_field(tool_failures, "unexpected_count");
-    let unexpected_events = canonical_tool_call_finished_events(&summary.events)
-        .into_iter()
-        .filter(|event| unexpected_failure_event(event))
-        .collect::<Vec<_>>();
-    let non_actionable_event_ids = unexpected_events
-        .iter()
-        .copied()
-        .filter(|event| {
-            current
-                .non_actionable_tool_failure_event_ids
-                .contains(&event.event_id)
-                || unexpected_failure_is_proven_non_actionable(event)
-        })
-        .map(|event| event.event_id.clone())
-        .collect::<HashSet<_>>();
-    let non_actionable_unexpected = non_actionable_event_ids.len() as u64;
-    let non_actionable_unexpected = non_actionable_unexpected.min(raw_unexpected);
-    let actionable_unexpected_event_ids = unexpected_events
-        .into_iter()
-        .filter(|event| !non_actionable_event_ids.contains(&event.event_id))
-        .map(|event| event.event_id.clone())
-        .collect::<HashSet<_>>();
-    projected["non_actionable_unexpected_count"] = json!(non_actionable_unexpected);
-    projected["actionable_unexpected_count"] =
-        json!(raw_unexpected.saturating_sub(non_actionable_unexpected));
-    CloseoutEvidenceReconciliation {
-        validation,
-        tool_failures: projected,
-        actionable_unexpected_event_ids,
-    }
-}
-
-fn unexpected_failure_event(event: &SessionEvent) -> bool {
-    event.kind == "tool_call_finished"
-        && event.status.as_deref() == Some("failed")
-        && event
-            .failure_expectation_result
-            .as_deref()
-            .unwrap_or(TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE)
-            == TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE
-}
-
-fn unexpected_failure_is_proven_non_actionable(event: &SessionEvent) -> bool {
-    let effect = event.effect_evidence.as_ref();
-    let execution_state = effect.and_then(|effect| effect.execution_state.as_deref());
-    if event.failure_kind.as_deref() == Some("outcome_unknown")
-        || event.error_kind.as_deref() == Some("outcome_unknown")
-        || execution_state == Some("outcome_unknown")
-    {
-        return false;
-    }
-    // ExecutionPurpose is caller-declared evidence metadata, not effect-safety
-    // proof. Once a generic shell/process command has started, a failed result
-    // remains actionable regardless of whether its declared purpose was
-    // diagnostic, validation, or anything else.
-    if effect.and_then(|effect| effect.command_started) == Some(true)
-        || matches!(
-            execution_state,
-            Some("started" | "completed" | "cancelled" | "timed_out")
-        )
-    {
-        return false;
-    }
-    if effect.and_then(|effect| effect.command_started) == Some(false)
-        || execution_state == Some("not_started")
-    {
-        return true;
-    }
-    let failure_evidence = runtime_tool_session_evidence_policy(&event.tool_name).failure;
-    if effect.and_then(|effect| effect.state_changed) == Some(false)
-        && ((!event.shell_like && !event.git_like)
-            || failure_evidence == ToolFailureEvidence::ProvenNoStateChangeNonActionable)
-    {
-        return true;
-    }
-    event.read_like && !event.write_like && !event.shell_like && !event.git_like
-}
-
-fn install_compact_workflow_outcomes(target: &mut Value, outcomes: Value) {
-    for field in [
-        "facts",
-        "hard_blockers",
-        "advisories",
-        "task_outcome",
-        "evidence_history",
-        "evidence_integrity",
-        "informational_notes",
-        "verdict",
-    ] {
-        target[field] = outcomes.get(field).cloned().unwrap_or(Value::Null);
-    }
-}
-
-fn validation_historical_failures_resolved(validation: &Value) -> bool {
-    validation
-        .get("successes")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        > 0
-        && validation
-            .pointer("/historical_failures/resolved")
-            .and_then(Value::as_bool)
-            == Some(true)
-        && validation
-            .pointer("/historical_failures/unresolved")
-            .and_then(Value::as_bool)
-            == Some(false)
-}
-
-fn validation_historical_failures_unresolved(validation: &Value) -> bool {
-    validation
-        .pointer("/historical_failures/unresolved")
-        .and_then(Value::as_bool)
-        == Some(true)
 }
 
 fn count_field(value: &Value, key: &str) -> u64 {
@@ -1335,23 +1052,12 @@ fn string_array(value: Option<&Value>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn push_unique<T>(values: &mut Vec<T>, value: T)
-where
-    T: PartialEq,
-{
-    if !values.iter().any(|existing| existing == &value) {
-        values.push(value);
-    }
-}
-
-fn push_unique_action(actions: &mut Vec<String>, action: &str) {
-    if !actions.iter().any(|existing| existing == action) {
-        actions.push(action.to_string());
-    }
-}
-
 /// Build a bounded list of suggested next actions based on the handoff state.
-fn handoff_suggested_next_actions(output: &Value) -> Vec<String> {
+fn handoff_suggested_next_actions(
+    output: &Value,
+    facts: &CloseoutFacts,
+    discussion: &SessionDiscussionSummary,
+) -> Vec<String> {
     let mut actions = Vec::new();
     let push = |actions: &mut Vec<String>, action: &str| {
         if !actions.iter().any(|existing| existing == action) {
@@ -1359,55 +1065,42 @@ fn handoff_suggested_next_actions(output: &Value) -> Vec<String> {
         }
     };
 
-    let tool_failures = output.get("tool_failures").unwrap_or(&Value::Null);
-    let expectation_mismatch_count = tool_failures
-        .get("expectation_mismatch_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let unexpected_success_count = tool_failures
-        .get("unexpected_success_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if actionable_unexpected_failure_count(tool_failures) > 0 {
+    if facts.failures.actionable_unexpected_count > 0 {
         push(
             &mut actions,
             "review unexpected failed tool calls before proceeding",
         );
     }
-    if expectation_mismatch_count > 0 {
+    if facts.failures.expectation_mismatch_count > 0 {
         push(
             &mut actions,
             "review result expectation mismatches before proceeding",
         );
     }
-    if unexpected_success_count > 0 {
+    if facts.failures.unexpected_success_count > 0 {
         push(
             &mut actions,
             "review failure expectations that unexpectedly succeeded",
         );
     }
-    let open_todos = output["counts"]["open_todos"].as_u64().unwrap_or(0);
-    if open_todos > 0 {
+    if discussion.counts.open_todos > 0 {
         push(&mut actions, "address open todos");
     }
-    let open_risks = output["counts"]["open_risks"].as_u64().unwrap_or(0);
-    if open_risks > 0 {
+    if discussion.counts.open_risks > 0 {
         push(&mut actions, "mitigate open risks");
     }
-    let open_questions = output["counts"]["open_questions"].as_u64().unwrap_or(0);
-    if open_questions > 0 {
+    if discussion.counts.open_questions > 0 {
         push(&mut actions, "answer open questions");
     }
-    if let Some(workspace) = output.get("workspace") {
-        if workspace.get("git_available").and_then(Value::as_bool) == Some(true) {
-            let clean = workspace
-                .get("clean")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            if !clean {
-                push(&mut actions, "review workspace changes with show_changes");
-            }
-        }
+    if facts
+        .workspace
+        .observed()
+        .is_some_and(|workspace| !workspace.non_git && workspace.clean == Some(false))
+    {
+        push(
+            &mut actions,
+            "review workspace changes with read_workspace_changes",
+        );
     }
     if let Some(checkpoints) = output.get("checkpoints") {
         let lkg_is_null = checkpoints
@@ -1420,21 +1113,10 @@ fn handoff_suggested_next_actions(output: &Value) -> Vec<String> {
             );
         }
     }
-    let validation = output.get("validation").unwrap_or(&Value::Null);
-    if validation
-        .pointer("/current_evidence/unresolved_failure_count")
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| {
-            validation
-                .pointer("/unresolved_failures/count")
-                .and_then(Value::as_u64)
-                .unwrap_or(0)
-        })
-        > 0
-    {
+    if facts.validation.current_unresolved_failure_count > 0 {
         push(&mut actions, VALIDATION_IDENTITY_REUSE_ACTION);
     }
-    if validation_has_cargo_test_zero_tests(validation) {
+    if facts.validation.cargo_test_zero_tests {
         push(
             &mut actions,
             "cargo_test ran zero tests; verify the test filter or command",

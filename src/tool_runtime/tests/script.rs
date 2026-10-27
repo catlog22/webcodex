@@ -3,8 +3,8 @@
 use super::super::*;
 use super::support::*;
 use crate::runner_protocol::{
-    RunnerCapabilities, RunnerJobUpdateRequest, RunnerResultPayload, RunnerResultRequest,
-    ShellCommandExecutionState, ShellScriptLanguage, SCRIPT_MAX_BYTES,
+    RunnerCapabilities, RunnerJobUpdateRequest, ShellCommandExecutionState, ShellScriptLanguage,
+    SCRIPT_MAX_BYTES,
 };
 use crate::tool_runtime::activity::{ActivityRecord, ActivityRecorder};
 use crate::tool_runtime::kernel::{ToolCallContext, ToolCallRequest, ToolTransport};
@@ -64,6 +64,7 @@ async fn register_script_agent(
         structured_script_payload,
         structured_script_javascript: structured_script_payload,
         structured_script_typescript: structured_script_payload,
+        structured_script_python: structured_script_payload,
         ..Default::default()
     };
     register_agent_with_projects(
@@ -91,6 +92,7 @@ async fn register_script_job_agent(
         structured_script_payload: true,
         structured_script_javascript: true,
         structured_script_typescript: true,
+        structured_script_python: true,
         structured_execution_jobs: true,
         ..Default::default()
     };
@@ -119,24 +121,20 @@ async fn update_script_job(
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            job_id: request.job_id.clone().expect("structured Job id"),
             request_id: Some(request.request_id.clone()),
-            update_seq: None,
-            status: status.to_string(),
             stdout_chunk: stdout.map(str::to_string),
             stderr_chunk: stderr.map(str::to_string),
-            stdout_tail: None,
-            stderr_tail: None,
-            log_snapshot: None,
             exit_code,
             duration_ms: state.map(|_| 25),
             error: error.map(str::to_string),
             command_execution_state: state,
-            validation_progress: None,
-            activity: None,
-            finished: state.is_some(),
+            ..runner_job_update(
+                client_id.to_string(),
+                "inst".to_string(),
+                request.job_id.clone().expect("structured Job id"),
+                status.to_string(),
+                state.is_some(),
+            )
         })
         .await
         .unwrap();
@@ -152,26 +150,10 @@ async fn complete_script_lifecycle(
     stderr: &str,
     error: Option<&str>,
 ) {
-    runtime
-        .runner_registry
-        .complete(RunnerResultPayload {
-            result: RunnerResultRequest {
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-                request_id,
-                exit_code,
-                stdout: Some(stdout.to_string()),
-                stderr: Some(stderr.to_string()),
-                duration_ms: Some(9),
-                error: error.map(str::to_string),
-            },
-            command_execution_state: Some(state),
-            mcp_gateway: None,
-            plugin_gateway: None,
-            coding_agent: None,
-        })
-        .await
-        .unwrap();
+    complete_patch_agent_execution(
+        runtime, client_id, request_id, state, exit_code, stdout, stderr, error, 9,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -244,6 +226,104 @@ async fn run_script_wire_is_typed_body_free_command_and_supports_more_than_32_ki
             result.output
         );
     }
+}
+
+#[tokio::test]
+async fn python_script_preserves_typed_body_argv_stdin_cwd_and_nonzero_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(temp.path().join("sub")).unwrap();
+    let runtime = test_runtime();
+    let project = register_script_agent(&runtime, "python-typed", temp.path(), true).await;
+    let body = "from pathlib import Path\nprint('雪')\n";
+    let call = ToolCall::RunScript {
+        project,
+        language: ShellScriptLanguage::Python,
+        script: body.to_string(),
+        args: vec!["two words".to_string(), "$(literal)".to_string()],
+        stdin: Some("输入\n".to_string()),
+        session_id: None,
+        timeout_secs: Some(30),
+        sync_wait_secs: Some(30),
+        cwd: Some("sub".to_string()),
+        purpose: Some(ExecutionPurpose::Operation),
+    };
+    let runtime_copy = runtime.clone();
+    let task = tokio::spawn(async move {
+        runtime_copy
+            .dispatch_with_auth(call, Some(&auth_context(None, true)))
+            .await
+    });
+    let request = wait_for_patch_agent_request(&runtime, "python-typed").await;
+    assert_eq!(request.kind, "run_script");
+    assert_eq!(request.command, "");
+    assert!(request.process.is_none());
+    assert_eq!(
+        request.script.as_ref().unwrap().language,
+        ShellScriptLanguage::Python
+    );
+    assert_eq!(request.script.as_ref().unwrap().script, body);
+    assert_eq!(
+        request.script.as_ref().unwrap().args,
+        ["two words", "$(literal)"]
+    );
+    assert_eq!(request.stdin.as_deref(), Some("输入\n"));
+    assert!(request.cwd.as_deref().unwrap().ends_with("sub"));
+    complete_script_lifecycle(
+        &runtime,
+        "python-typed",
+        request.request_id,
+        ShellCommandExecutionState::Completed,
+        Some(7),
+        "雪\n",
+        "",
+        None,
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["language"], "python");
+    assert_eq!(result.output["exit_code"], 7);
+    assert_eq!(result.output["failure_kind"], "command_exit_nonzero");
+}
+
+#[tokio::test]
+async fn python_script_timeout_is_terminal_without_redispatch() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime();
+    let project = register_script_agent(&runtime, "python-timeout", temp.path(), true).await;
+    let runtime_copy = runtime.clone();
+    let task = tokio::spawn(async move {
+        runtime_copy
+            .dispatch_with_auth(
+                script_sync_call(
+                    project,
+                    None,
+                    ShellScriptLanguage::Python,
+                    "import time; time.sleep(99)",
+                ),
+                Some(&auth_context(None, true)),
+            )
+            .await
+    });
+    let request = wait_for_patch_agent_request(&runtime, "python-timeout").await;
+    assert_eq!(request.kind, "run_script");
+    complete_script_lifecycle(
+        &runtime,
+        "python-timeout",
+        request.request_id,
+        ShellCommandExecutionState::TimedOut,
+        None,
+        "",
+        "",
+        None,
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["execution_state"], "timed_out");
+    assert!(probe_patch_agent_request(&runtime, "python-timeout")
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -497,6 +577,85 @@ async fn run_script_fast_missing_interpreter_retains_not_started_through_the_hid
 }
 
 #[tokio::test]
+async fn run_script_fast_post_spawn_uncertainty_preserves_same_job_for_recovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(250));
+    let project = register_script_job_agent(&runtime, "script-fast-unknown", temp.path()).await;
+    let auth = auth_context(None, true);
+    let task = tokio::spawn({
+        let runtime = runtime.clone();
+        let project = project.clone();
+        let auth = auth.clone();
+        async move {
+            runtime
+                .dispatch_with_auth(
+                    script_call(
+                        project,
+                        None,
+                        ShellScriptLanguage::Javascript,
+                        "console.log('uncertain');\n",
+                    ),
+                    Some(&auth),
+                )
+                .await
+        }
+    });
+    let request = wait_for_patch_agent_request(&runtime, "script-fast-unknown").await;
+    let job_id = request.job_id.clone().expect("structured script Job id");
+    update_script_job(
+        &runtime,
+        "script-fast-unknown",
+        &request,
+        "lost",
+        Some(ShellCommandExecutionState::OutcomeUnknown),
+        None,
+        Some("partial\n"),
+        None,
+        Some("script terminal correlation was lost after spawn"),
+    )
+    .await;
+
+    let result = task.await.unwrap();
+    assert!(!result.success);
+    assert_eq!(result.output["execution_state"], "outcome_unknown");
+    assert_eq!(result.output["command_started"], true);
+    assert_eq!(result.output["command_completed"], false);
+    assert_eq!(result.output["promoted_to_job"], true);
+    assert_eq!(result.output["terminal"], false);
+    assert_eq!(result.output["job_id"], job_id);
+    assert_eq!(result.output["job_status"], "lost");
+    assert_eq!(
+        result.output["continuation"]["arguments"]["items"][0]["job_id"],
+        job_id
+    );
+    let schema = crate::tool_runtime::registry::output_schema_for_tool("run_script");
+    let instance = json!({
+        "success": result.success,
+        "output": result.output.clone(),
+        "error": result.error.clone(),
+    });
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(&instance, &schema)
+        .unwrap_or_else(|error| panic!("uncertain run_script result schema mismatch: {error}"));
+
+    let visible = runtime
+        .runner_registry
+        .get_job_for_auth(Some(&crate::test_support::runner_access(&auth)), &job_id)
+        .await
+        .unwrap();
+    assert_eq!(visible.status, "lost");
+    assert_eq!(
+        visible.command_execution_state,
+        Some(ShellCommandExecutionState::OutcomeUnknown)
+    );
+    assert!(runtime
+        .runner_registry
+        .hidden_job_ids_for_test()
+        .await
+        .is_empty());
+    assert!(runtime.runner_registry.remove_job_record(&job_id).await);
+}
+
+#[tokio::test]
 async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata_durable() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(40));
@@ -568,10 +727,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
     .await;
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
-    assert_observe_job_continuation(&handoff.output);
-    assert_eq!(handoff.output["execution_state"], "running");
-    let job_id = handoff.output["job_id"].as_str().unwrap();
+    let job_id = assert_sparse_pending_job_handoff_with_unreported_policy(&handoff.output, 60);
     assert_eq!(request.job_id.as_deref(), Some(job_id));
 
     let job = runtime.runner_registry.get_job(job_id).await.unwrap();
@@ -601,7 +757,7 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
                 include_workspace: Some(false),
                 include_checkpoints: Some(false),
                 include_validation: Some(false),
-                summary_only: false,
+                diagnostic: true,
                 limit: Some(20),
             },
             Some(&auth),
@@ -626,10 +782,12 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
                 items: vec![ObserveJobsItem {
                     job_id: job_id.to_string(),
                     after_observation_token: None,
+                    observation_ref: None,
                 }],
                 tail_lines: 40,
                 wait_secs: None,
                 wake_on: Default::default(),
+                summary_only: false,
             },
             Some(&auth),
         )
@@ -691,6 +849,90 @@ async fn run_script_slow_handoff_keeps_typed_payload_ephemeral_and_safe_metadata
         Some(ShellCommandExecutionState::Completed)
     );
     assert!(probe_patch_agent_request(&runtime, "script-slow-job")
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn python_script_handoff_keeps_one_job_and_redacts_payload() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime().with_structured_execution_sync_wait(Duration::from_millis(40));
+    let project = register_script_job_agent(&runtime, "python-handoff", temp.path()).await;
+    let body = format!("print('secret-{}')\n", uuid::Uuid::new_v4());
+    let argument = format!("private-{}", uuid::Uuid::new_v4());
+    let stdin = format!("input-{}", uuid::Uuid::new_v4());
+    let mut call = script_call(project, None, ShellScriptLanguage::Python, body.clone());
+    if let ToolCall::RunScript {
+        args, stdin: input, ..
+    } = &mut call
+    {
+        *args = vec![argument.clone()];
+        *input = Some(stdin.clone());
+    }
+    let runtime_copy = runtime.clone();
+    let task = tokio::spawn(async move {
+        runtime_copy
+            .dispatch_with_auth(call, Some(&auth_context(None, true)))
+            .await
+    });
+    let request = wait_for_patch_agent_request(&runtime, "python-handoff").await;
+    assert_eq!(request.kind, "start_script_job");
+    let recovery = request.job_context.as_ref().unwrap();
+    assert_eq!(recovery.shell.as_deref(), Some("python"));
+    assert_eq!(
+        recovery.structured_execution.as_ref().unwrap().language,
+        Some(ShellScriptLanguage::Python)
+    );
+    assert_eq!(
+        recovery
+            .structured_execution
+            .as_ref()
+            .unwrap()
+            .execution_source,
+        "run_script"
+    );
+    assert_eq!(
+        request.script.as_ref().unwrap().language,
+        ShellScriptLanguage::Python
+    );
+    update_script_job(
+        &runtime,
+        "python-handoff",
+        &request,
+        "running",
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+    let result = task.await.unwrap();
+    assert!(result.success, "{result:?}");
+    let job_id = assert_sparse_pending_job_handoff_with_unreported_policy(&result.output, 30);
+    assert_eq!(request.job_id.as_deref(), Some(job_id));
+    let job = runtime.runner_registry.get_job(job_id).await.unwrap();
+    assert_eq!(
+        job.structured_execution.as_ref().unwrap().language,
+        Some(ShellScriptLanguage::Python)
+    );
+    let durable = serde_json::to_string(&job).unwrap();
+    for raw in [&body, &argument, &stdin] {
+        assert!(!durable.contains(raw));
+    }
+    update_script_job(
+        &runtime,
+        "python-handoff",
+        &request,
+        "completed",
+        Some(ShellCommandExecutionState::Completed),
+        Some(0),
+        Some("done\n"),
+        None,
+        None,
+    )
+    .await;
+    assert!(probe_patch_agent_request(&runtime, "python-handoff")
         .await
         .is_none());
 }
@@ -764,10 +1006,7 @@ async fn typescript_slow_handoff_keeps_one_execution_and_safe_durable_metadata()
 
     let handoff = task.await.unwrap();
     assert!(handoff.success, "{:?}", handoff.error);
-    assert_eq!(handoff.output["promoted_to_job"], true);
-    assert_observe_job_continuation(&handoff.output);
-    assert_eq!(handoff.output["execution_state"], "running");
-    let job_id = handoff.output["job_id"].as_str().unwrap();
+    let job_id = assert_sparse_pending_job_handoff_with_unreported_policy(&handoff.output, 60);
     assert_eq!(request.job_id.as_deref(), Some(job_id));
     let job = runtime.runner_registry.get_job(job_id).await.unwrap();
     assert_eq!(job.kind, "run_script");
@@ -1091,7 +1330,7 @@ async fn run_script_session_defaults_and_evidence_are_body_and_stdin_free() {
     .await;
     let result = task.await.unwrap();
     assert!(result.success);
-    assert!(result.output.get("cwd").is_none());
+    assert_eq!(result.output["cwd"], "frontend");
 
     let summary = runtime
         .sessions

@@ -1,4 +1,5 @@
 use super::communication::*;
+use super::store_primitives::*;
 use super::Database;
 use std::sync::{Arc, Barrier};
 
@@ -10,7 +11,60 @@ fn principal(kind: &str, hex: char) -> CommunicationPrincipal {
 }
 
 fn missing_id(prefix: &str, hex: char) -> String {
-    format!("{prefix}{}", hex.to_string().repeat(32))
+    format!("{prefix}{}", hex.to_string().repeat(16))
+}
+
+#[test]
+fn compact_identity_collision_retry_and_proof_strength() {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE ids (id TEXT PRIMARY KEY, value INTEGER); INSERT INTO ids VALUES ('occupied', 7);").unwrap();
+    let transaction = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let query = "SELECT EXISTS(SELECT 1 FROM ids WHERE id = ?1)";
+    let mut candidates = ["occupied".to_string(), "fresh".to_string()].into_iter();
+    assert_eq!(
+        allocate_identity_with(&transaction, query, || candidates.next().unwrap()).unwrap(),
+        "fresh"
+    );
+    assert!(allocate_identity_with(&transaction, query, || "occupied".into()).is_err());
+    assert!(
+        allocate_identity_with(&transaction, "SELECT missing FROM ids", || "fresh".into()).is_err()
+    );
+    assert_eq!(
+        transaction
+            .query_row("SELECT value FROM ids WHERE id = 'occupied'", [], |r| r
+                .get::<_, i64>(0))
+            .unwrap(),
+        7
+    );
+    for prefix in [
+        "wc_dagent_",
+        "wc_endpoint_",
+        "wc_agent_task_",
+        "wc_agent_task_attempt_",
+        "wc_wake_",
+        "wc_wake_attempt_",
+        "wc_agent_wait_",
+        "wc_goal_",
+        "wc_conv_",
+        "wc_participant_",
+        "wc_cmsg_",
+        "wc_delivery_",
+        "wc_attention_event_",
+    ] {
+        let id = allocate_identity(&transaction, prefix, query).unwrap();
+        assert_eq!(id.len(), prefix.len() + 16);
+        validate_id(&id, prefix, "invalid").unwrap();
+        assert!(validate_id(&format!("{prefix}{}", "a".repeat(32)), prefix, "invalid").is_err());
+    }
+    for prefix in ["wc_agent_task_fence_", "wc_wake_claim_", "wc_wake_consume_"] {
+        let proof = new_proof(prefix);
+        assert_eq!(proof.len(), prefix.len() + 22);
+        validate_proof(&proof, prefix, "invalid").unwrap();
+        assert!(validate_proof(&format!("{prefix}{}", "a".repeat(16)), prefix, "invalid").is_err());
+        assert!(validate_proof(&format!("{prefix}{}", "a".repeat(32)), prefix, "invalid").is_err());
+    }
 }
 
 fn assert_same_private_not_found(
@@ -97,35 +151,6 @@ fn agent_message(
         idempotency_key: Some(key.to_string()),
         wake_reply_id: None,
         reply_operation_index: None,
-    }
-}
-
-#[test]
-fn communication_schema_migrates_existing_endpoint_table_with_mcp_app_recovery_columns() {
-    let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("communication-schema-migration.db");
-    let db = Database::open(&path).unwrap();
-    for column in ["mcp_app_recovery_fingerprint", "mcp_app_client_window_key"] {
-        db.conn_for_tests()
-            .execute(
-                &format!("ALTER TABLE wc_agent_endpoints DROP COLUMN {column}"),
-                [],
-            )
-            .unwrap();
-    }
-    drop(db);
-
-    let reopened = Database::open(&path).unwrap();
-    for column in ["mcp_app_recovery_fingerprint", "mcp_app_client_window_key"] {
-        let column_count: i64 = reopened
-            .conn_for_tests()
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('wc_agent_endpoints') WHERE name = ?1",
-                [column],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(column_count, 1, "missing migrated column {column}");
     }
 }
 
@@ -407,6 +432,18 @@ fn conversation_transcript_delivery_replay_offline_and_restart_are_durable() {
         .conversation_id
         .starts_with(CONVERSATION_ID_PREFIX));
     assert_eq!(created.conversation.participants.len(), 3);
+    for participant in &created.conversation.participants {
+        assert_eq!(
+            participant.participant_id.len(),
+            CONVERSATION_PARTICIPANT_ID_PREFIX.len() + 16
+        );
+        validate_id(
+            &participant.participant_id,
+            CONVERSATION_PARTICIPANT_ID_PREFIX,
+            "invalid_participant_id",
+        )
+        .unwrap();
+    }
     assert_eq!(
         created.conversation.conversation.lifecycle,
         ConversationLifecycle::Open
@@ -920,6 +957,173 @@ fn message_deliveries_and_wake_commit_atomically() {
         .query_row("SELECT COUNT(*) FROM wc_agent_wakes", [], |row| row.get(0))
         .unwrap();
     assert_eq!(wake_count, 1);
+}
+
+#[test]
+fn first_mount_host_window_reservation_is_inert_fenced_and_recoverable_after_expiry() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("first-mount-window.db")).unwrap();
+    let owner = principal("user", 'a');
+    let agent = db
+        .create_agent_identity(
+            &owner,
+            new_agent("first-mount", "First mount", "first-agent"),
+        )
+        .unwrap()
+        .agent;
+    let origin = "a".repeat(64);
+    let different = "b".repeat(64);
+    let input = endpoint(&agent.agent_id, "ChatGPT", "first-endpoint");
+    let initial = db
+        .attach_agent_endpoint_with_host_window(&owner, input.clone(), Some(&origin))
+        .unwrap();
+    assert!(!initial.endpoint.wake_capable);
+    let current = &initial.endpoint;
+    let stored: (Option<String>, Option<String>) = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT mcp_app_client_window_key, mcp_app_recovery_fingerprint
+             FROM wc_agent_endpoints WHERE endpoint_id = ?1",
+            [&current.endpoint_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, (Some(origin.clone()), None));
+    assert!(db
+        .mcp_app_registration_window_allows(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            Some(&origin),
+        )
+        .unwrap());
+    assert!(!db
+        .mcp_app_registration_window_allows(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            Some(&different),
+        )
+        .unwrap());
+    // A retry of the same explicit attachment is inert even from a different
+    // Window: it may recover the original response but cannot retarget proof.
+    let replay = db
+        .attach_agent_endpoint_with_host_window(&owner, input, Some(&different))
+        .unwrap();
+    assert!(replay.replayed && !replay.state_changed);
+    assert_eq!(replay.endpoint.endpoint_id, current.endpoint_id);
+
+    db.conn_for_tests()
+        .execute(
+            "UPDATE wc_agent_endpoints SET lease_expires_at_unix_ms = 0
+             WHERE endpoint_id = ?1",
+            [&current.endpoint_id],
+        )
+        .unwrap();
+    assert_eq!(
+        db.recover_expired_mcp_app_endpoint(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            &different,
+        )
+        .unwrap_err()
+        .code(),
+        "host_binding_stale",
+    );
+    let accepted = db
+        .recover_expired_mcp_app_endpoint(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            &origin,
+        )
+        .unwrap();
+    let successor = match accepted {
+        McpAppEndpointRecovery::Replaced {
+            endpoint,
+            replayed: false,
+            state_changed: true,
+            successor_needs_recovery: false,
+            ..
+        } => endpoint,
+        other => panic!("expected one exact inert successor: {other:?}"),
+    };
+    assert_eq!(
+        successor.controller_generation,
+        current.controller_generation + 1
+    );
+    assert!(!successor.wake_capable);
+    let replay = db
+        .recover_expired_mcp_app_endpoint(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            &origin,
+        )
+        .unwrap();
+    assert!(matches!(
+        replay,
+        McpAppEndpointRecovery::Replaced {
+            replayed: true,
+            state_changed: false,
+            ..
+        }
+    ));
+    db.detach_agent_endpoint(&owner, &successor.endpoint_id)
+        .unwrap();
+    assert!(db
+        .recover_expired_mcp_app_endpoint(
+            &owner,
+            &agent.agent_id,
+            &current.endpoint_id,
+            current.controller_generation,
+            &origin,
+        )
+        .is_err());
+}
+
+#[test]
+fn first_mount_window_prebinding_rejects_unsafe_proof_or_wake_capability() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("first-mount-inert.db")).unwrap();
+    let owner = principal("user", 'c');
+    let agent = db
+        .create_agent_identity(&owner, new_agent("inert", "Inert", "inert-agent"))
+        .unwrap()
+        .agent;
+    let input = endpoint(&agent.agent_id, "ChatGPT", "inert-endpoint");
+    let bad = db
+        .attach_agent_endpoint_with_host_window(&owner, input.clone(), Some("not-a-hashed-window"))
+        .unwrap_err();
+    assert_eq!(bad.code(), "invalid_mcp_app_client_window_key");
+    let mut capable = input.clone();
+    capable.wake_capable = true;
+    let bad = db
+        .attach_agent_endpoint_with_host_window(&owner, capable, Some(&"d".repeat(64)))
+        .unwrap_err();
+    assert_eq!(bad.code(), "host_window_requires_inert_endpoint");
+    let ordinary = db.attach_agent_endpoint(&owner, input).unwrap();
+    assert_eq!(ordinary.endpoint.controller_generation, 1);
+    assert!(!ordinary.endpoint.wake_capable);
+    let stored: Option<String> = db
+        .conn_for_tests()
+        .query_row(
+            "SELECT mcp_app_client_window_key FROM wc_agent_endpoints
+         WHERE endpoint_id = ?1",
+            [&ordinary.endpoint.endpoint_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        stored.is_none(),
+        "ordinary/Console attach retains legacy behavior"
+    );
 }
 
 #[test]

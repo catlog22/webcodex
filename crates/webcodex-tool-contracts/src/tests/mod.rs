@@ -1,3 +1,4 @@
+mod canonical_names;
 use crate::*;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -57,16 +58,25 @@ fn required_fields(spec: &ToolSpec) -> Vec<String> {
         .unwrap_or_default()
 }
 
-mod action_tools;
 mod artifact_schemas;
 mod catalog_discovery;
 mod computer_schemas;
 mod definitions;
 mod edit_schemas;
+mod identifier_schemas;
+mod input_normalization;
 mod input_schemas;
 mod metadata_policy;
 mod migration_contracts;
 mod output_schemas;
 mod policy_contracts;
 mod registry_specs;
-mod session_tools;
+mod tool_call_contracts;
+mod tool_call_test_support;
+mod typed_output_schemas;
+
+mod schema_samples;
+
+mod docx_schemas;
+
+mod argument_paths;

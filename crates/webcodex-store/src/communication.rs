@@ -1,15 +1,17 @@
 use super::agent_wake::{
     coalesce_agent_wake_for_delivery, reconcile_wakes_for_endpoint_loss, AgentWakeState,
 };
-use super::Database;
-use rusqlite::{
-    params, types::Type, Connection, OptionalExtension, Transaction, TransactionBehavior,
+use super::store_primitives::{
+    allocate_identity, digest_json, lookup_idempotent_resource, now_unix_ms,
+    record_idempotent_resource, store_error, validate_communication_principal, validate_id,
+    validate_idempotency_key, validate_nonempty_chars, CommunicationPrincipal,
+    CommunicationStoreError,
 };
+use super::Database;
+use rusqlite::{params, types::Type, Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use uuid::Uuid;
 
 pub(crate) const DURABLE_AGENT_ID_PREFIX: &str = "wc_dagent_";
 pub(crate) const AGENT_ENDPOINT_ID_PREFIX: &str = "wc_endpoint_";
@@ -19,7 +21,6 @@ pub(crate) const CONVERSATION_MESSAGE_ID_PREFIX: &str = "wc_cmsg_";
 pub(crate) const AGENT_DELIVERY_ID_PREFIX: &str = "wc_delivery_";
 const MCP_APP_RECOVERY_FINGERPRINT_HEX_LEN: usize = 64;
 const MCP_APP_CLIENT_WINDOW_KEY_HEX_LEN: usize = 64;
-pub const COMMUNICATION_PRINCIPAL_DIGEST_PREFIX: &str = "wc_commprincipal_";
 
 pub(crate) const MAX_AGENT_HANDLE_CHARS: usize = 64;
 pub(crate) const MAX_AGENT_DISPLAY_NAME_CHARS: usize = 128;
@@ -31,10 +32,8 @@ pub(crate) const MAX_ENDPOINT_ATTACHMENT_CHARS: usize = 128;
 pub(crate) const MAX_CONVERSATION_TITLE_CHARS: usize = 200;
 pub(crate) const MAX_CONVERSATION_AGENT_PARTICIPANTS: usize = 16;
 pub(crate) const MAX_CONVERSATION_MESSAGE_BYTES: usize = 4_096;
-pub(crate) const MAX_COMMUNICATION_IDEMPOTENCY_KEY_CHARS: usize = 128;
 pub const MAX_COMMUNICATION_LIST_LIMIT: usize = 100;
 pub(crate) const MAX_DELIVERY_CONSUME_ITEMS: usize = 100;
-const MAX_COMMUNICATION_PRINCIPAL_KIND_CHARS: usize = 64;
 
 pub(crate) const DEFAULT_ENDPOINT_LEASE_MS: i64 = 120_000;
 
@@ -49,67 +48,6 @@ const OP_CREATE_CONVERSATION: &str = "create_conversation";
 const OP_POST_MESSAGE: &str = "post_conversation_message";
 const OP_POST_WAKE_REPLY: &str = "post_agent_wake_reply";
 const MAX_WAKE_REPLY_OPERATION_INDEX: i64 = 31;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommunicationStoreError {
-    code: &'static str,
-    message: String,
-    current_profile_revision: Option<i64>,
-}
-
-impl CommunicationStoreError {
-    pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            current_profile_revision: None,
-        }
-    }
-
-    fn profile_changed(current_profile_revision: i64) -> Self {
-        Self {
-            code: "agent_profile_changed",
-            message: format!(
-                "Agent profile changed; current profile revision is {current_profile_revision}"
-            ),
-            current_profile_revision: Some(current_profile_revision),
-        }
-    }
-
-    pub fn code(&self) -> &'static str {
-        self.code
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-
-    pub fn current_profile_revision(&self) -> Option<i64> {
-        self.current_profile_revision
-    }
-}
-
-impl std::fmt::Display for CommunicationStoreError {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl std::error::Error for CommunicationStoreError {}
-
-pub(super) fn store_error(error: rusqlite::Error) -> CommunicationStoreError {
-    tracing::warn!(error = %error, "durable communication store operation failed");
-    CommunicationStoreError::new(
-        "communication_store_unavailable",
-        "Durable communication store is unavailable",
-    )
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CommunicationPrincipal {
-    pub kind: String,
-    pub digest: String,
-}
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -608,40 +546,24 @@ impl Database {
             );
             CREATE INDEX IF NOT EXISTS idx_wc_communication_idempotency_created
                 ON wc_communication_idempotency(created_at_unix_ms DESC);
+
+            -- Model-facing selector only. Rows are immutable: a newer Endpoint
+            -- generation inserts a new index and never rewrites an older one.
+            CREATE TABLE IF NOT EXISTS wc_agent_continuation_references (
+                principal_kind TEXT NOT NULL,
+                principal_digest TEXT NOT NULL,
+                ref_index INTEGER NOT NULL CHECK(ref_index >= 1),
+                agent_id TEXT NOT NULL,
+                endpoint_id TEXT NOT NULL,
+                controller_generation INTEGER NOT NULL CHECK(controller_generation >= 1),
+                created_at_unix_ms INTEGER NOT NULL,
+                PRIMARY KEY(principal_kind, principal_digest, ref_index),
+                UNIQUE(
+                    principal_kind, principal_digest, agent_id, endpoint_id, controller_generation
+                )
+            );
             ",
         )?;
-        let has_recovery_fingerprint: i64 = transaction.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM pragma_table_info('wc_agent_endpoints')
-                WHERE name = 'mcp_app_recovery_fingerprint'
-            )",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_recovery_fingerprint == 0 {
-            transaction.execute(
-                "ALTER TABLE wc_agent_endpoints
-                 ADD COLUMN mcp_app_recovery_fingerprint TEXT
-                 CHECK(mcp_app_recovery_fingerprint IS NULL OR length(mcp_app_recovery_fingerprint) = 64)",
-                [],
-            )?;
-        }
-        let has_client_window_key: i64 = transaction.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM pragma_table_info('wc_agent_endpoints')
-                WHERE name = 'mcp_app_client_window_key'
-            )",
-            [],
-            |row| row.get(0),
-        )?;
-        if has_client_window_key == 0 {
-            transaction.execute(
-                "ALTER TABLE wc_agent_endpoints
-                 ADD COLUMN mcp_app_client_window_key TEXT
-                 CHECK(mcp_app_client_window_key IS NULL OR length(mcp_app_client_window_key) = 64)",
-                [],
-            )?;
-        }
         transaction.commit()?;
         Ok(())
     }
@@ -657,7 +579,7 @@ impl Database {
         let description = validate_description(&input.description)?;
         let specialty_labels = canonicalize_specialty_labels(input.specialty_labels)?;
         let idempotency_key = validate_idempotency_key(&input.idempotency_key)?;
-        let request_hash = digest_json(&json!({
+        let request_hash = communication_request_hash(&json!({
             "handle": handle,
             "display_name": display_name,
             "description": description,
@@ -696,7 +618,11 @@ impl Database {
                 "Durable Agent capacity is exhausted",
             ));
         }
-        let agent_id = new_id(DURABLE_AGENT_ID_PREFIX);
+        let agent_id = allocate_identity(
+            &transaction,
+            DURABLE_AGENT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_identities WHERE agent_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_agent_identities (
@@ -833,6 +759,33 @@ impl Database {
         })
     }
 
+    /// The single attached Endpoint whose generation matches the Agent and whose
+    /// lease is still running. More than one row is a store failure, not a choice.
+    pub fn current_live_continuation_endpoint(
+        &self,
+        principal: &CommunicationPrincipal,
+        agent_id: &str,
+    ) -> Result<Option<(String, i64)>, CommunicationStoreError> {
+        validate_communication_principal(principal)?;
+        validate_id(agent_id, DURABLE_AGENT_ID_PREFIX, "invalid_agent_id")?;
+        let conn = self.lock_connection(crate::StoreDomain::Communication);
+        conn.query_row(
+            "SELECT e.endpoint_id, e.controller_generation
+             FROM wc_agent_endpoints e
+             JOIN wc_agent_identities a ON a.agent_id = e.agent_id
+             WHERE a.agent_id = ?1
+               AND a.owner_principal_kind = ?2
+               AND a.owner_principal_digest = ?3
+               AND e.lifecycle = 'attached'
+               AND e.controller_generation = a.current_controller_generation
+               AND e.lease_expires_at_unix_ms > ?4",
+            params![agent_id, principal.kind, principal.digest, now_unix_ms()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(store_error)
+    }
+
     pub fn update_agent_identity(
         &self,
         principal: &CommunicationPrincipal,
@@ -934,6 +887,29 @@ impl Database {
         principal: &CommunicationPrincipal,
         input: NewAgentEndpoint,
     ) -> Result<AgentEndpointMutation, CommunicationStoreError> {
+        self.attach_agent_endpoint_with_host_window(principal, input, None)
+    }
+
+    /// Reserve authenticated Host-window continuity during explicit Endpoint
+    /// creation, before an iframe can mount. This is NOT a live binding or a
+    /// lease renewal: wake capability remains false until a separate View bind.
+    /// It only allows the originating Window to recover a naturally expired
+    /// first mount without granting another Window controller authority.
+    pub fn attach_agent_endpoint_with_host_window(
+        &self,
+        principal: &CommunicationPrincipal,
+        input: NewAgentEndpoint,
+        host_window_key: Option<&str>,
+    ) -> Result<AgentEndpointMutation, CommunicationStoreError> {
+        if let Some(key) = host_window_key {
+            validate_mcp_app_client_window_key(key)?;
+            if input.wake_capable {
+                return Err(CommunicationStoreError::new(
+                    "host_window_requires_inert_endpoint",
+                    "Host Window reservation cannot create a wake-capable Endpoint",
+                ));
+            }
+        }
         validate_id(&input.agent_id, DURABLE_AGENT_ID_PREFIX, "invalid_agent_id")?;
         validate_communication_principal(principal)?;
         let host = validate_nonempty_chars(
@@ -949,7 +925,7 @@ impl Database {
             "client_attachment_id",
         )?;
         let idempotency_key = validate_idempotency_key(&input.idempotency_key)?;
-        let request_hash = digest_json(&json!({
+        let request_hash = communication_request_hash(&json!({
             "agent_id": input.agent_id,
             "host": host,
             "client_attachment_id": client_attachment_id,
@@ -1062,18 +1038,23 @@ impl Database {
                 ],
             )
             .map_err(store_error)?;
-        let endpoint_id = new_id(AGENT_ENDPOINT_ID_PREFIX);
+        let endpoint_id = allocate_identity(
+            &transaction,
+            AGENT_ENDPOINT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_endpoints WHERE endpoint_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_agent_endpoints (
                     endpoint_id, agent_id, attachment_principal_kind,
                     attachment_principal_digest, host, client_attachment_id,
-                    wake_capable, controller_generation, lifecycle,
+                    wake_capable, mcp_app_client_window_key,
+                    controller_generation, lifecycle,
                     attached_at_unix_ms, last_seen_at_unix_ms,
                     lease_expires_at_unix_ms, expired_at_unix_ms,
                     detached_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'attached',
-                           ?9, ?9, ?10, NULL, NULL)",
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'attached',
+                           ?10, ?10, ?11, NULL, NULL)",
                 params![
                     endpoint_id,
                     input.agent_id,
@@ -1082,6 +1063,7 @@ impl Database {
                     host,
                     client_attachment_id,
                     input.wake_capable as i64,
+                    host_window_key,
                     controller_generation,
                     now,
                     lease_expires_at_unix_ms,
@@ -1131,7 +1113,7 @@ impl Database {
             ));
         }
         validate_mcp_app_client_window_key(client_window_key)?;
-        let request_hash = digest_json(&json!({
+        let request_hash = communication_request_hash(&json!({
             "agent_id": agent_id,
             "endpoint_id": endpoint_id,
             "expected_controller_generation": expected_controller_generation,
@@ -1320,7 +1302,11 @@ impl Database {
                 "Another Endpoint generation already owns this Agent",
             ));
         }
-        let replacement_endpoint_id = new_id(AGENT_ENDPOINT_ID_PREFIX);
+        let replacement_endpoint_id = allocate_identity(
+            &transaction,
+            AGENT_ENDPOINT_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_agent_endpoints WHERE endpoint_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_agent_endpoints (
@@ -1806,7 +1792,8 @@ impl Database {
         )?;
         let agent_ids = canonicalize_agent_ids(input.agent_ids, true)?;
         let idempotency_key = validate_idempotency_key(&input.idempotency_key)?;
-        let request_hash = digest_json(&json!({"title": title, "agent_ids": agent_ids}));
+        let request_hash =
+            communication_request_hash(&json!({"title": title, "agent_ids": agent_ids}));
         let now = now_unix_ms();
         let mut conn = self.lock_connection(crate::StoreDomain::Communication);
         let transaction = conn
@@ -1848,7 +1835,11 @@ impl Database {
         for agent_id in &agent_ids {
             require_agent_owner(&transaction, principal, agent_id)?;
         }
-        let conversation_id = new_id(CONVERSATION_ID_PREFIX);
+        let conversation_id = allocate_identity(
+            &transaction,
+            CONVERSATION_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_conversations WHERE conversation_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_conversations (
@@ -1872,7 +1863,11 @@ impl Database {
                     principal_kind, principal_digest, joined_at_unix_ms
                  ) VALUES (?1, ?2, 'human', NULL, ?3, ?4, ?5)",
                 params![
-                    new_id(CONVERSATION_PARTICIPANT_ID_PREFIX),
+                    allocate_identity(
+                        &transaction,
+                        CONVERSATION_PARTICIPANT_ID_PREFIX,
+                        "SELECT EXISTS(SELECT 1 FROM wc_conversation_participants WHERE participant_id = ?1)",
+                    )?,
                     conversation_id,
                     principal.kind,
                     principal.digest,
@@ -1888,7 +1883,11 @@ impl Database {
                         principal_kind, principal_digest, joined_at_unix_ms
                      ) VALUES (?1, ?2, 'agent', ?3, NULL, NULL, ?4)",
                     params![
-                        new_id(CONVERSATION_PARTICIPANT_ID_PREFIX),
+                        allocate_identity(
+                            &transaction,
+                            CONVERSATION_PARTICIPANT_ID_PREFIX,
+                            "SELECT EXISTS(SELECT 1 FROM wc_conversation_participants WHERE participant_id = ?1)",
+                        )?,
                         conversation_id,
                         agent_id,
                         now,
@@ -2130,13 +2129,13 @@ impl Database {
         // uncertain response.
         let replay_endpoint_id = wake_reply
             .is_none()
-            .then(|| input.endpoint_id.as_deref())
+            .then_some(input.endpoint_id.as_deref())
             .flatten();
         let replay_controller_generation = wake_reply
             .is_none()
             .then_some(input.expected_controller_generation)
             .flatten();
-        let request_hash = digest_json(&json!({
+        let request_hash = communication_request_hash(&json!({
             "conversation_id": &input.conversation_id,
             "author_agent_id": input.author_agent_id.as_deref(),
             "endpoint_id": replay_endpoint_id,
@@ -2358,7 +2357,11 @@ impl Database {
             ));
         }
         let now = now_unix_ms();
-        let message_id = new_id(CONVERSATION_MESSAGE_ID_PREFIX);
+        let message_id = allocate_identity(
+            &transaction,
+            CONVERSATION_MESSAGE_ID_PREFIX,
+            "SELECT EXISTS(SELECT 1 FROM wc_conversation_messages WHERE message_id = ?1)",
+        )?;
         transaction
             .execute(
                 "INSERT INTO wc_conversation_messages (
@@ -2377,7 +2380,11 @@ impl Database {
             )
             .map_err(store_error)?;
         for recipient_agent_id in &recipient_agent_ids {
-            let delivery_id = new_id(AGENT_DELIVERY_ID_PREFIX);
+            let delivery_id = allocate_identity(
+                &transaction,
+                AGENT_DELIVERY_ID_PREFIX,
+                "SELECT EXISTS(SELECT 1 FROM wc_agent_deliveries WHERE delivery_id = ?1)",
+            )?;
             transaction
                 .execute(
                     "INSERT INTO wc_agent_deliveries (
@@ -3104,107 +3111,6 @@ fn load_message(
     }))
 }
 
-pub(super) fn lookup_idempotent_resource(
-    transaction: &Transaction<'_>,
-    principal: &CommunicationPrincipal,
-    operation: &str,
-    idempotency_key: &str,
-    request_hash: &str,
-) -> Result<Option<String>, CommunicationStoreError> {
-    let key_hash = digest_text("webcodex.communication.idempotency-key.v1", idempotency_key);
-    let existing: Option<(String, String)> = transaction
-        .query_row(
-            "SELECT request_hash, resource_id FROM wc_communication_idempotency
-             WHERE principal_digest = ?1 AND operation = ?2 AND key_hash = ?3",
-            params![principal.digest, operation, key_hash],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .optional()
-        .map_err(store_error)?;
-    match existing {
-        None => Ok(None),
-        Some((existing_request_hash, resource_id)) if existing_request_hash == request_hash => {
-            Ok(Some(resource_id))
-        }
-        Some(_) => Err(CommunicationStoreError::new(
-            "communication_idempotency_conflict",
-            "Idempotency key was already used with a different request",
-        )),
-    }
-}
-
-pub(super) fn record_idempotent_resource(
-    transaction: &Transaction<'_>,
-    principal: &CommunicationPrincipal,
-    operation: &str,
-    idempotency_key: &str,
-    request_hash: &str,
-    resource_id: &str,
-    now: i64,
-) -> Result<(), CommunicationStoreError> {
-    let key_hash = digest_text("webcodex.communication.idempotency-key.v1", idempotency_key);
-    transaction
-        .execute(
-            "INSERT INTO wc_communication_idempotency (
-                principal_digest, operation, key_hash, request_hash,
-                resource_id, created_at_unix_ms
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                principal.digest,
-                operation,
-                key_hash,
-                request_hash,
-                resource_id,
-                now,
-            ],
-        )
-        .map_err(store_error)?;
-    Ok(())
-}
-
-pub(super) fn validate_communication_principal(
-    principal: &CommunicationPrincipal,
-) -> Result<(), CommunicationStoreError> {
-    let kind = principal.kind.trim();
-    if kind.is_empty()
-        || kind.chars().count() > MAX_COMMUNICATION_PRINCIPAL_KIND_CHARS
-        || !kind.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | ':' | '.')
-        })
-    {
-        return Err(CommunicationStoreError::new(
-            "invalid_communication_principal",
-            "Communication principal kind is invalid",
-        ));
-    }
-    validate_digest_id(
-        &principal.digest,
-        COMMUNICATION_PRINCIPAL_DIGEST_PREFIX,
-        "invalid_communication_principal",
-    )
-}
-
-fn validate_digest_id(
-    value: &str,
-    prefix: &str,
-    code: &'static str,
-) -> Result<(), CommunicationStoreError> {
-    let suffix = value.strip_prefix(prefix).ok_or_else(|| {
-        CommunicationStoreError::new(code, "Communication principal digest is invalid")
-    })?;
-    if suffix.len() != 64
-        || !suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(CommunicationStoreError::new(
-            code,
-            "Communication principal digest is invalid",
-        ));
-    }
-    Ok(())
-}
-
 fn canonicalize_agent_ids(
     values: Vec<String>,
     require_nonempty: bool,
@@ -3352,31 +3258,6 @@ fn validate_message_body(value: &str) -> Result<String, CommunicationStoreError>
     Ok(value.to_string())
 }
 
-pub(super) fn validate_idempotency_key(value: &str) -> Result<String, CommunicationStoreError> {
-    validate_nonempty_chars(
-        value,
-        MAX_COMMUNICATION_IDEMPOTENCY_KEY_CHARS,
-        "invalid_communication_idempotency_key",
-        "idempotency_key",
-    )
-}
-
-fn validate_nonempty_chars(
-    value: &str,
-    max_chars: usize,
-    code: &'static str,
-    label: &str,
-) -> Result<String, CommunicationStoreError> {
-    let value = value.trim();
-    if value.is_empty() || value.chars().count() > max_chars {
-        return Err(CommunicationStoreError::new(
-            code,
-            format!("{label} must contain 1..={max_chars} characters"),
-        ));
-    }
-    Ok(value.to_string())
-}
-
 fn validate_optional_chars(
     value: Option<&str>,
     max_chars: usize,
@@ -3411,53 +3292,30 @@ fn bounded_limit(limit: usize) -> Result<usize, CommunicationStoreError> {
     Ok(limit)
 }
 
-pub(super) fn validate_id(
-    value: &str,
-    prefix: &str,
-    code: &'static str,
-) -> Result<(), CommunicationStoreError> {
-    let suffix = value.strip_prefix(prefix).ok_or_else(|| {
-        CommunicationStoreError::new(code, format!("Invalid canonical id: {value}"))
-    })?;
-    if suffix.len() != 32
-        || !suffix
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
-        return Err(CommunicationStoreError::new(
-            code,
-            format!("Invalid canonical id: {value}"),
-        ));
-    }
-    Ok(())
-}
-
-pub(super) fn new_id(prefix: &str) -> String {
-    format!("{prefix}{}", Uuid::new_v4().simple())
-}
-
-fn digest_json(value: &Value) -> String {
-    digest_text(
-        "webcodex.communication.request.v1",
-        &serde_json::to_string(value).expect("communication request serializes"),
-    )
-}
-
-pub(super) fn digest_text(domain: &str, value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(domain.as_bytes());
-    hasher.update(b"\0");
-    hasher.update(value.as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-pub(super) fn now_unix_ms() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+fn communication_request_hash(value: &Value) -> String {
+    digest_json("webcodex.communication.request.v1", value)
+        .expect("communication request serializes")
 }
 
 #[cfg(test)]
 mod lifecycle_contract_tests {
     use super::*;
+    use crate::store_primitives::digest_text;
+
+    #[test]
+    fn streaming_json_digest_matches_buffered_text_digest() {
+        let domain = "webcodex.compatibility.test.v1";
+        let value = json!({
+            "escaped": "line\n\"quoted\"\\slash",
+            "unicode": "你好 🦀 日本語",
+            "nested": [null, true, 42, {"key": "value"}]
+        });
+        let buffered = serde_json::to_string(&value).unwrap();
+        assert_eq!(
+            digest_json(domain, &value).unwrap(),
+            digest_text(domain, &buffered)
+        );
+    }
 
     #[test]
     fn durable_communication_lifecycle_encodings_are_closed_and_serde_stable() {

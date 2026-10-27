@@ -2,14 +2,14 @@ use super::*;
 use std::sync::Arc;
 
 const APP_TOOLS: [&str; 8] = [
-    "agent_continuation_bind",
-    "agent_continuation_recover_endpoint",
-    "agent_continuation_state",
-    "agent_continuation_wake_acquire",
-    "agent_continuation_wake_prepare",
-    "agent_continuation_wake_finish",
-    "agent_continuation_unbind",
-    "agent_wait_state",
+    "bind_agent_continuation",
+    "recover_agent_continuation_endpoint",
+    "get_agent_continuation_state",
+    "acquire_agent_continuation_wake",
+    "prepare_agent_continuation_wake",
+    "finish_agent_continuation_wake",
+    "unbind_agent_continuation",
+    "get_agent_wait_state",
 ];
 
 fn tool<'a>(payload: &'a Value, name: &str) -> Option<&'a Value> {
@@ -103,19 +103,15 @@ fn continuation_auth(username: &str) -> crate::auth::AuthContext {
     auth
 }
 
-fn continuation_runtime(
-    surface: ModelSurface,
-) -> (tempfile::TempDir, Arc<crate::db::Database>, ToolRuntime) {
+fn continuation_runtime() -> (tempfile::TempDir, Arc<crate::db::Database>, ToolRuntime) {
     let temp = tempfile::tempdir().unwrap();
     let db =
         Arc::new(crate::db::Database::open(&temp.path().join("agent-continuation.db")).unwrap());
-    let runtime = ToolRuntime::new_for_tests()
-        .with_model_surface(surface)
-        .with_communication_database(db.clone());
+    let runtime = workflow_runtime().with_communication_database(db.clone());
     (temp, db, runtime)
 }
 
-async fn handle_with_server_apps_enabled(
+async fn handle_with_app_policy(
     runtime: &ToolRuntime,
     request: JsonRpcRequest,
     auth: Option<&crate::auth::AuthContext>,
@@ -125,7 +121,6 @@ async fn handle_with_server_apps_enabled(
     let window = crate::client_window::stateless_mcp_window(&request.params);
     super::super::handle_mcp_request_with_lifecycle(
         runtime,
-        None,
         request,
         auth,
         protocol_era,
@@ -134,7 +129,6 @@ async fn handle_with_server_apps_enabled(
         None,
         None,
         crate::model_surface::effective_mcp_compact_schemas(
-            runtime.runtime_exposure(),
             crate::config::mcp_compact_schemas_override(),
         ),
         enabled,
@@ -152,11 +146,13 @@ fn create_agent(
 ) -> String {
     let result = runtime.create_agent_identity(
         Some(auth),
-        handle.to_string(),
-        display_name.to_string(),
-        Some("PRIVATE Agent description".to_string()),
-        vec!["PRIVATE-specialty-label".to_string()],
-        key.to_string(),
+        webcodex_tool_contracts::CreateAgentIdentityInput {
+            handle: handle.to_string(),
+            display_name: display_name.to_string(),
+            description: Some("PRIVATE Agent description".to_string()),
+            specialty_labels: vec!["PRIVATE-specialty-label".to_string()],
+            idempotency_key: key.to_string(),
+        },
     );
     assert!(result.success, "{:?}", result.output);
     result.output["agent"]["agent_id"]
@@ -173,10 +169,12 @@ fn attach(
 ) -> (String, i64) {
     let result = runtime.attach_agent_endpoint(
         Some(auth),
-        agent_id.to_string(),
-        "ChatGPT".to_string(),
-        Some(format!("attachment-{key}")),
-        key.to_string(),
+        webcodex_tool_contracts::RotateAgentContinuationEndpointInput {
+            agent_id: agent_id.to_string(),
+            host: "ChatGPT".to_string(),
+            client_attachment_id: Some(format!("attachment-{key}")),
+            idempotency_key: key.to_string(),
+        },
     );
     assert!(result.success, "{:?}", result.output);
     (
@@ -199,9 +197,11 @@ fn create_conversation(
 ) -> String {
     let result = runtime.create_conversation(
         Some(auth),
-        Some("PRIVATE conversation title".to_string()),
-        vec![a.to_string(), b.to_string()],
-        key.to_string(),
+        webcodex_tool_contracts::CreateConversationInput {
+            title: Some("PRIVATE conversation title".to_string()),
+            agent_ids: vec![a.to_string(), b.to_string()],
+            idempotency_key: key.to_string(),
+        },
     );
     assert!(result.success, "{:?}", result.output);
     result.output["conversation"]["conversation"]["conversation_id"]
@@ -224,29 +224,160 @@ fn post_message(
 ) {
     let result = runtime.post_conversation_message(
         Some(auth),
-        conversation_id.to_string(),
-        body.to_string(),
-        Some(sender.to_string()),
-        Some(sender_endpoint.to_string()),
-        Some(sender_generation),
-        Some(vec![receiver.to_string()]),
-        None,
-        Some(key.to_string()),
-        None,
-        None,
+        webcodex_tool_contracts::PostConversationMessageInput {
+            conversation_id: conversation_id.to_string(),
+            body: body.to_string(),
+            author_agent_id: Some(sender.to_string()),
+            endpoint_id: Some(sender_endpoint.to_string()),
+            expected_controller_generation: Some(sender_generation),
+            recipient_agent_ids: Some(vec![receiver.to_string()]),
+            reply_to: None,
+            idempotency_key: Some(key.to_string()),
+            wake_reply_id: None,
+            reply_operation_index: None,
+        },
     );
     assert!(result.success, "{:?}", result.output);
 }
 
 #[tokio::test]
-async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed() {
+async fn agent_continuation_direct_presentation_reauthorizes_without_binding_or_retargeting() {
+    let (_temp, _db, runtime) = continuation_runtime();
+    let auth = continuation_auth("direct-presentation");
+    let agent = create_agent(&runtime, &auth, "direct", "Direct", "direct-agent");
+    let (endpoint, generation) = attach(&runtime, &auth, &agent, "direct-endpoint");
+    let arguments = json!({
+        "agent_id": agent, "endpoint_id": endpoint,
+        "expected_controller_generation": generation,
+    });
+    let request = |arguments| {
+        rpc(
+            "tools/call",
+            Some(json!(5100)),
+            mcp_2026_ui_params(json!({
+                "name":"present_agent_continuation", "arguments":arguments,
+            })),
+        )
+    };
+    for _ in 0..2 {
+        let McpOutcome::Ok(result) =
+            handle_with_app_policy(&runtime, request(arguments.clone()), Some(&auth), true).await
+        else {
+            panic!("direct presentation");
+        };
+        let result = &result["result"]["structuredContent"];
+        assert_eq!(result["success"], true, "{result}");
+        let projection = &result["output"]["agent_continuation"];
+        assert_eq!(projection["agent_id"], agent);
+        assert_eq!(projection["endpoint_id"], endpoint);
+        assert_eq!(projection["controller_generation"], generation);
+        assert_eq!(projection["host_binding"]["bound"], false);
+        assert_eq!(
+            projection["host_binding"]["production_auto_resume_available"],
+            false
+        );
+    }
+    let mut wrong_generation = arguments.clone();
+    wrong_generation["expected_controller_generation"] = json!(generation + 1);
+    let McpOutcome::Ok(stale_generation) =
+        handle_with_app_policy(&runtime, request(wrong_generation), Some(&auth), true).await
+    else {
+        panic!("stale generation presentation");
+    };
+    assert_eq!(
+        stale_generation["result"]["structuredContent"]["success"],
+        false
+    );
+    assert_eq!(
+        stale_generation["result"]["structuredContent"]["output"]["error_kind"],
+        "endpoint_generation_stale"
+    );
+    let foreign = continuation_auth("foreign-presentation");
+    let McpOutcome::Ok(denied) =
+        handle_with_app_policy(&runtime, request(arguments.clone()), Some(&foreign), true).await
+    else {
+        panic!("foreign presentation");
+    };
+    assert_eq!(denied["result"]["structuredContent"]["success"], false);
+    assert!(denied["result"]["structuredContent"]["output"]
+        .get("agent_continuation")
+        .is_none());
+
+    let (_next_endpoint, next_generation) = attach(&runtime, &auth, &agent, "rotated-endpoint");
+    assert_eq!(next_generation, generation + 1);
+    let McpOutcome::Ok(stale) =
+        handle_with_app_policy(&runtime, request(arguments.clone()), Some(&auth), true).await
+    else {
+        panic!("stale presentation");
+    };
+    assert_eq!(stale["result"]["structuredContent"]["success"], false);
+    assert_eq!(
+        stale["result"]["structuredContent"]["output"]["error_kind"],
+        "endpoint_expired"
+    );
+
+    let mut no_communication_read = auth;
+    no_communication_read
+        .scopes
+        .retain(|scope| scope != crate::auth::SCOPE_COMMUNICATION_READ);
+    let listed = super::super::tools::mcp_tools_list_payload_with_features_for_auth(
+        false,
+        true,
+        true,
+        Some(&no_communication_read),
+    );
+    // Non-OAuth catalogs retain the canonical descriptor; invocation still
+    // rechecks scope before looking up the endpoint or exposing its state.
+    assert!(tool(&listed, "present_agent_continuation").is_some());
+    let denied = handle_with_app_policy(
+        &runtime,
+        request(arguments.clone()),
+        Some(&no_communication_read),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(denied) = denied else {
+        panic!("fixed credential scope denial must be a failed MCP result");
+    };
+    super::fixed_scope::assert_fixed_scope_failure(
+        &denied,
+        crate::auth::SCOPE_COMMUNICATION_READ,
+        false,
+        "fixed token",
+    );
+    no_communication_read.kind = crate::auth::AuthKind::OAuth2Token;
+    let oauth_listed = super::super::tools::mcp_tools_list_payload_with_features_for_auth(
+        false,
+        true,
+        true,
+        Some(&no_communication_read),
+    );
+    assert!(tool(&oauth_listed, "present_agent_continuation").is_none());
+    let denied = handle_with_app_policy(
+        &runtime,
+        request(arguments),
+        Some(&no_communication_read),
+        true,
+    )
+    .await;
+    assert!(matches!(
+        denied,
+        McpOutcome::Forbidden {
+            required_scope: Some(crate::auth::SCOPE_COMMUNICATION_READ),
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn agent_continuation_app_surface_is_sparse_app_only_without_rendering_bindings() {
     assert_eq!(
         MCP_AGENT_CONTINUATION_UI_RESOURCE_URI,
-        "ui://webcodex/agent-continuation/v17"
+        "ui://webcodex/agent-continuation/v24"
     );
-    let (_temp, _db, adaptive) = continuation_runtime(ModelSurface::AdaptiveRuntime);
+    let (_temp, _db, adaptive) = continuation_runtime();
     let auth = continuation_auth("continuation-surface");
-    let ui = handle_with_server_apps_enabled(
+    let ui = handle_with_app_policy(
         &adaptive,
         rpc(
             "tools/list",
@@ -260,20 +391,15 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
     let McpOutcome::Ok(ui) = ui else {
         panic!("expected UI tools/list")
     };
-    let present = tool(&ui["result"], "present_agent_continuation")
-        .expect("present_agent_continuation must remain a card-creating entry");
-    let wait = tool(&ui["result"], "wait_for_agent_events")
-        .expect("wait_for_agent_events must be a descriptor-time continuation card entry");
+    let present = tool(&ui["result"], "present_agent_continuation").expect("Direct Agent card");
     assert_eq!(
         present.pointer("/_meta/ui/resourceUri"),
         Some(&json!(MCP_AGENT_CONTINUATION_UI_RESOURCE_URI))
     );
+    assert_eq!(present["annotations"]["readOnlyHint"], true);
+    assert_eq!(present["annotations"]["idempotentHint"], true);
     assert!(present.pointer("/_meta/ui/visibility").is_none());
-    assert_eq!(
-        wait.pointer("/_meta/ui/resourceUri"),
-        Some(&json!(MCP_AGENT_CONTINUATION_UI_RESOURCE_URI))
-    );
-    assert!(wait.pointer("/_meta/ui/visibility").is_none());
+    assert!(tool(&ui["result"], "wait_for_agent_events").is_none());
     let bound_tools: Vec<_> = ui["result"]["tools"]
         .as_array()
         .unwrap()
@@ -285,21 +411,17 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
         })
         .map(|tool| tool["name"].as_str().unwrap())
         .collect();
-    assert_eq!(bound_tools.len(), APP_TOOLS.len() + 2);
-    assert!(bound_tools.contains(&"present_agent_continuation"));
-    assert!(bound_tools.contains(&"wait_for_agent_events"));
+    assert_eq!(bound_tools, vec!["present_agent_continuation"]);
     for name in APP_TOOLS {
         let descriptor = tool(&ui["result"], name).unwrap_or_else(|| panic!("missing {name}"));
         assert_eq!(
             descriptor.pointer("/_meta/ui/visibility"),
             Some(&json!(["app"]))
         );
-        assert_eq!(
-            descriptor.pointer("/_meta/ui/resourceUri"),
-            Some(&json!(MCP_AGENT_CONTINUATION_UI_RESOURCE_URI)),
-            "{name} must be associated with the continuation View for Host bridge calls"
+        assert!(
+            descriptor.pointer("/_meta/ui/resourceUri").is_none(),
+            "{name} is a bridge helper, not a rendering entrypoint"
         );
-        assert!(bound_tools.contains(&name));
         assert_eq!(
             descriptor.pointer("/inputSchema/properties/app_call_id/pattern"),
             Some(&json!("^wc_app_call_[0-9a-f]{16}_[1-9][0-9]{0,5}$")),
@@ -312,7 +434,7 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
             .any(|field| field == "app_call_id"));
     }
     assert_eq!(
-        tool(&ui["result"], "agent_continuation_bind").unwrap()["inputSchema"]["required"],
+        tool(&ui["result"], "bind_agent_continuation").unwrap()["inputSchema"]["required"],
         json!([
             "agent_id",
             "endpoint_id",
@@ -321,7 +443,7 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
         ])
     );
     assert_eq!(
-        tool(&ui["result"], "agent_continuation_wake_prepare").unwrap()["inputSchema"]["required"],
+        tool(&ui["result"], "prepare_agent_continuation_wake").unwrap()["inputSchema"]["required"],
         json!([
             "agent_id",
             "endpoint_id",
@@ -332,7 +454,7 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
         ])
     );
 
-    let plain = handle_with_server_apps_enabled(
+    let plain = handle_with_app_policy(
         &adaptive,
         rpc("tools/list", Some(json!(5102)), mcp_2026_params(json!({}))),
         Some(&auth),
@@ -342,21 +464,16 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
     let McpOutcome::Ok(plain) = plain else {
         panic!("expected plain tools/list")
     };
-    assert!(tool(&plain["result"], "present_agent_continuation").is_some());
     assert!(tool(&plain["result"], "present_agent_continuation")
         .unwrap()
         .pointer("/_meta/ui/resourceUri")
         .is_none());
-    assert!(tool(&plain["result"], "wait_for_agent_events").is_some());
-    assert!(tool(&plain["result"], "wait_for_agent_events")
-        .unwrap()
-        .pointer("/_meta/ui/resourceUri")
-        .is_none());
+    assert!(tool(&plain["result"], "wait_for_agent_events").is_none());
     for name in APP_TOOLS {
         assert!(tool(&plain["result"], name).is_none());
     }
 
-    let disabled = handle_with_server_apps_enabled(
+    let disabled = handle_with_app_policy(
         &adaptive,
         rpc(
             "tools/list",
@@ -371,18 +488,15 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
         panic!("expected disabled tools/list")
     };
     assert!(tool(&disabled["result"], "present_agent_continuation")
-        .expect("presentation remains ordinary bounded read")
+        .unwrap()
         .pointer("/_meta/ui/resourceUri")
         .is_none());
-    assert!(tool(&disabled["result"], "wait_for_agent_events")
-        .expect("Wait creation remains an ordinary model tool when Apps are unavailable")
-        .pointer("/_meta/ui/resourceUri")
-        .is_none());
+    assert!(tool(&disabled["result"], "wait_for_agent_events").is_none());
     for name in APP_TOOLS {
         assert!(tool(&disabled["result"], name).is_none());
     }
 
-    let legacy = handle_with_server_apps_enabled(
+    let legacy = handle_with_app_policy(
         &adaptive,
         rpc("tools/list", Some(json!(5104)), json!({})),
         Some(&auth),
@@ -396,25 +510,6 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
         assert!(tool(&legacy["result"], name).is_none());
     }
 
-    let (_local_temp, _local_db, local) = continuation_runtime(ModelSurface::LocalCoding);
-    let local_ui = handle_with_server_apps_enabled(
-        &local,
-        rpc(
-            "tools/list",
-            Some(json!(5105)),
-            mcp_2026_ui_params(json!({})),
-        ),
-        Some(&auth),
-        true,
-    )
-    .await;
-    let McpOutcome::Ok(local_ui) = local_ui else {
-        panic!("expected Local Coding tools/list")
-    };
-    for name in APP_TOOLS {
-        assert!(tool(&local_ui["result"], name).is_none());
-    }
-
     for name in APP_TOOLS {
         assert!(
             !super::super::tools::adaptive_runtime_gateway_target_admitted_for_test(name, true),
@@ -422,7 +517,7 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
         );
     }
 
-    let resources = handle_with_server_apps_enabled(
+    let resources = handle_with_app_policy(
         &adaptive,
         rpc(
             "resources/list",
@@ -443,51 +538,8 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
         .find(|resource| resource["uri"] == MCP_AGENT_CONTINUATION_UI_RESOURCE_URI)
         .expect("Agent Continuation resource");
     assert_eq!(resource["mimeType"], MCP_UI_RESOURCE_MIME_TYPE);
-    assert!(!resources["result"]["resources"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|resource| matches!(
-            resource["uri"].as_str(),
-            Some(
-                "ui://webcodex/agent-continuation/v1"
-                    | "ui://webcodex/agent-continuation/v2"
-                    | "ui://webcodex/agent-continuation/v3"
-                    | "ui://webcodex/agent-continuation/v4"
-                    | "ui://webcodex/agent-continuation/v5"
-                    | "ui://webcodex/agent-continuation/v6"
-                    | "ui://webcodex/agent-continuation/v7"
-                    | "ui://webcodex/agent-continuation/v8"
-                    | "ui://webcodex/agent-continuation/v9"
-                    | "ui://webcodex/agent-continuation/v10"
-                    | "ui://webcodex/agent-continuation/v11"
-                    | "ui://webcodex/agent-continuation/v12"
-                    | "ui://webcodex/agent-continuation/v13"
-                    | "ui://webcodex/agent-continuation/v14"
-                    | "ui://webcodex/agent-continuation/v15"
-                    | "ui://webcodex/agent-continuation/v16"
-            )
-        )));
-    for uri in [
-        MCP_AGENT_CONTINUATION_UI_RESOURCE_URI,
-        "ui://webcodex/agent-continuation/v1",
-        "ui://webcodex/agent-continuation/v2",
-        "ui://webcodex/agent-continuation/v3",
-        "ui://webcodex/agent-continuation/v4",
-        "ui://webcodex/agent-continuation/v5",
-        "ui://webcodex/agent-continuation/v6",
-        "ui://webcodex/agent-continuation/v7",
-        "ui://webcodex/agent-continuation/v8",
-        "ui://webcodex/agent-continuation/v9",
-        "ui://webcodex/agent-continuation/v10",
-        "ui://webcodex/agent-continuation/v11",
-        "ui://webcodex/agent-continuation/v12",
-        "ui://webcodex/agent-continuation/v13",
-        "ui://webcodex/agent-continuation/v14",
-        "ui://webcodex/agent-continuation/v15",
-        "ui://webcodex/agent-continuation/v16",
-    ] {
-        let read = handle_with_server_apps_enabled(
+    for uri in [MCP_AGENT_CONTINUATION_UI_RESOURCE_URI] {
+        let read = handle_with_app_policy(
             &adaptive,
             rpc(
                 "resources/read",
@@ -508,7 +560,7 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
         );
     }
     assert!(
-        MCP_AGENT_CONTINUATION_APP_HTML.contains("^wc_dagent_[0-9a-f]{32}$"),
+        MCP_AGENT_CONTINUATION_APP_HTML.contains("^wc_dagent_[A-Za-z0-9_-]{16}$"),
         "App must validate the canonical durable Agent id prefix"
     );
     assert!(
@@ -518,13 +570,13 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
     for required in [
         "ui/initialize",
         "ui/notifications/tool-input",
-        "agent_continuation_bind",
-        "agent_continuation_recover_endpoint",
-        "agent_continuation_state",
-        "agent_continuation_wake_acquire",
-        "agent_continuation_wake_prepare",
+        "bind_agent_continuation",
+        "recover_agent_continuation_endpoint",
+        "get_agent_continuation_state",
+        "acquire_agent_continuation_wake",
+        "prepare_agent_continuation_wake",
         "ui/message",
-        "agent_continuation_wake_finish",
+        "finish_agent_continuation_wake",
         "visibilitychange",
         "pagehide",
         "beforeunload",
@@ -619,9 +671,15 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
             .contains("for (let hop = 0; hop < MAX_ENDPOINT_SUCCESSOR_HOPS; hop++)"),
         "v17 successor recovery must remain explicitly bounded"
     );
+    // Bind Host cache identity and App version rather than hardcoding two versions.
+    let version = MCP_AGENT_CONTINUATION_UI_RESOURCE_URI
+        .rsplit_once("/v")
+        .expect("versioned Agent continuation resource")
+        .1;
+    assert!(version.parse::<u32>().is_ok());
     assert!(
-        MCP_AGENT_CONTINUATION_APP_HTML.contains("version: \"17.0.0\""),
-        "App protocol version must advance with the v17 resource"
+        MCP_AGENT_CONTINUATION_APP_HTML.contains(&format!("version: \"{version}.0.0\"")),
+        "App version must match its published cache identity"
     );
     assert!(
         MCP_AGENT_CONTINUATION_APP_HTML.contains("const DEBUG_DIAGNOSTICS = false;"),
@@ -636,7 +694,7 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
         "server-side App call correlation must remain available while UI diagnostics are hidden"
     );
     assert!(
-        MCP_AGENT_CONTINUATION_APP_HTML.contains("agent_wait_state"),
+        MCP_AGENT_CONTINUATION_APP_HTML.contains("get_agent_wait_state"),
         "v17 Wait presentation must poll only the exact durable Wait read surface"
     );
     assert!(
@@ -666,8 +724,122 @@ async fn agent_continuation_app_surface_is_sparse_app_only_and_resource_backed()
 }
 
 #[tokio::test]
+async fn stateless_chatgpt_rotation_reserves_first_mount_window_without_binding() {
+    let (_temp, db, runtime) = continuation_runtime();
+    let owner = continuation_auth("first-mount-route-owner");
+    let agent = create_agent(
+        &runtime,
+        &owner,
+        "first-mount-route-agent",
+        "First Mount Route Agent",
+        "first-mount-route-create",
+    );
+    let original_session = "chatgpt-first-mount-origin";
+    let rotate = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5310)),
+            mcp_2026_window_params(
+                json!({
+                    "name": "rotate_agent_continuation_endpoint",
+                    "arguments": {
+                        "agent_id": agent,
+                        "host": "ChatGPT",
+                        "client_attachment_id": "first-mount-route-view",
+                        "idempotency_key": "first-mount-route-attach"
+                    },
+                }),
+                original_session,
+            ),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(rotate) = rotate else {
+        panic!("the real MCP route did not accept exact authorized rotation");
+    };
+    assert_eq!(rotate["result"]["structuredContent"]["success"], true);
+    let initial = &rotate["result"]["structuredContent"]["output"]["endpoint"];
+    let endpoint = initial["endpoint_id"].as_str().unwrap().to_string();
+    let generation = initial["controller_generation"].as_i64().unwrap();
+    assert_eq!(initial["wake_capable"], false);
+    let expected =
+        crate::client_window::ClientWindow::from_opaque("openai-session", original_session)
+            .unwrap();
+    let persisted = endpoint_client_window_key(&db, &endpoint);
+    assert_eq!(persisted.as_deref(), Some(expected.key()));
+    assert_ne!(persisted.as_deref(), Some(original_session));
+
+    db.conn_for_tests()
+        .execute(
+            "UPDATE wc_agent_endpoints SET lease_expires_at_unix_ms = 0
+         WHERE endpoint_id = ?1",
+            [&endpoint],
+        )
+        .unwrap();
+    let recovery_args = json!({
+        "name": "recover_agent_continuation_endpoint",
+        "arguments": {
+            "agent_id": agent,
+            "endpoint_id": endpoint,
+            "expected_controller_generation": generation,
+            "binding_id": "wc_host_binding_EREREREREREREREREREREQ"
+        },
+    });
+    let foreign_window = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5311)),
+            mcp_2026_window_params(recovery_args.clone(), "different-window"),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(foreign_window) = foreign_window else {
+        panic!("wrong-window recovery should report a bounded tool error");
+    };
+    assert_eq!(
+        foreign_window["result"]["structuredContent"]["success"],
+        false
+    );
+    assert_eq!(
+        foreign_window["result"]["structuredContent"]["output"]["error_kind"],
+        "host_binding_stale",
+    );
+    let original_window = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5312)),
+            mcp_2026_window_params(recovery_args, original_session),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(original_window) = original_window else {
+        panic!("same-Window first-mount recovery should be authorized");
+    };
+    let result = &original_window["result"]["structuredContent"];
+    assert_eq!(result["success"], true);
+    assert_eq!(
+        result["output"]["endpoint_recovery"]["kind"],
+        "endpoint_replaced"
+    );
+    assert_eq!(
+        result["output"]["agent_continuation"]["host_binding"]["bound"],
+        false
+    );
+    assert_eq!(result["output"]["state_changed"], true);
+}
+
+#[tokio::test]
 async fn agent_continuation_app_uses_hashed_openai_session_as_client_window_fence() {
-    let (_temp, db, runtime) = continuation_runtime(ModelSurface::AdaptiveRuntime);
+    let (_temp, db, runtime) = continuation_runtime();
     let owner = continuation_auth("continuation-window-owner");
     let foreign = continuation_auth("continuation-window-foreign");
     let agent = create_agent(
@@ -679,15 +851,15 @@ async fn agent_continuation_app_uses_hashed_openai_session_as_client_window_fenc
     );
     let (endpoint, generation) = attach(&runtime, &owner, &agent, "continuation-window-endpoint");
     let raw_session = "production-openai-session-window-a";
-    let binding_id = format!("wc_host_binding_{}", "7".repeat(32));
-    let bind = handle_with_server_apps_enabled(
+    let binding_id = "wc_host_binding_d3d3d3d3d3d3d3d3d3d3dw".to_string();
+    let bind = handle_with_app_policy(
         &runtime,
         rpc(
             "tools/call",
             Some(json!(5151)),
             mcp_2026_window_params(
                 json!({
-                    "name": "agent_continuation_bind",
+                    "name": "bind_agent_continuation",
                     "arguments": {
                         "agent_id": agent,
                         "endpoint_id": endpoint,
@@ -717,14 +889,14 @@ async fn agent_continuation_app_uses_hashed_openai_session_as_client_window_fenc
     );
     assert_eq!(persisted.len(), 64);
 
-    let wrong_window = handle_with_server_apps_enabled(
+    let wrong_window = handle_with_app_policy(
         &runtime,
         rpc(
             "tools/call",
             Some(json!(5152)),
             mcp_2026_window_params(
                 json!({
-                    "name": "agent_continuation_state",
+                    "name": "get_agent_continuation_state",
                     "arguments": {
                         "agent_id": agent,
                         "endpoint_id": endpoint,
@@ -751,15 +923,15 @@ async fn agent_continuation_app_uses_hashed_openai_session_as_client_window_fenc
         "host_binding_stale"
     );
 
-    let foreign_binding = format!("wc_host_binding_{}", "8".repeat(32));
-    let foreign_bind = handle_with_server_apps_enabled(
+    let foreign_binding = "wc_host_binding_iIiIiIiIiIiIiIiIiIiIiA".to_string();
+    let foreign_bind = handle_with_app_policy(
         &runtime,
         rpc(
             "tools/call",
             Some(json!(5153)),
             mcp_2026_window_params(
                 json!({
-                    "name": "agent_continuation_bind",
+                    "name": "bind_agent_continuation",
                     "arguments": {
                         "agent_id": agent,
                         "endpoint_id": endpoint,
@@ -782,14 +954,14 @@ async fn agent_continuation_app_uses_hashed_openai_session_as_client_window_fenc
         false
     );
 
-    let owner_state = handle_with_server_apps_enabled(
+    let owner_state = handle_with_app_policy(
         &runtime,
         rpc(
             "tools/call",
             Some(json!(5154)),
             mcp_2026_window_params(
                 json!({
-                    "name": "agent_continuation_state",
+                    "name": "get_agent_continuation_state",
                     "arguments": {
                         "agent_id": agent,
                         "endpoint_id": endpoint,
@@ -815,14 +987,14 @@ async fn agent_continuation_app_uses_hashed_openai_session_as_client_window_fenc
             [&endpoint],
         )
         .unwrap();
-    let recovered = handle_with_server_apps_enabled(
+    let recovered = handle_with_app_policy(
         &runtime,
         rpc(
             "tools/call",
             Some(json!(5155)),
             mcp_2026_window_params(
                 json!({
-                    "name": "agent_continuation_recover_endpoint",
+                    "name": "recover_agent_continuation_endpoint",
                     "arguments": {
                         "agent_id": agent,
                         "endpoint_id": endpoint,
@@ -872,9 +1044,7 @@ fn restart_recovery_survives_published_projection_output_schema() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("agent-continuation-schema-restart.db");
     let db = Arc::new(crate::db::Database::open(&path).unwrap());
-    let runtime = ToolRuntime::new_for_tests()
-        .with_model_surface(ModelSurface::AdaptiveRuntime)
-        .with_communication_database(db.clone());
+    let runtime = workflow_runtime().with_communication_database(db.clone());
     let owner = continuation_auth("continuation-schema-restart");
     let agent = create_agent(
         &runtime,
@@ -889,7 +1059,7 @@ fn restart_recovery_survives_published_projection_output_schema() {
         &agent,
         "continuation-schema-restart-endpoint",
     );
-    let binding_id = format!("wc_host_binding_{}", "b".repeat(32));
+    let binding_id = "wc_host_binding_u7u7u7u7u7u7u7u7u7u7uw".to_string();
     let bind = runtime.agent_continuation_bind(
         Some(&owner),
         agent.clone(),
@@ -914,13 +1084,11 @@ fn restart_recovery_survives_published_projection_output_schema() {
     drop(runtime);
     drop(db);
     let reopened = Arc::new(crate::db::Database::open(&path).unwrap());
-    let ownership = crate::server_instance::ServerInstanceGuard::acquire(&reopened).unwrap();
+    let ownership = crate::ServerInstanceGuard::acquire(&reopened).unwrap();
     reopened
         .recover_agent_wakes_for_server_takeover(&ownership, chrono::Utc::now().timestamp_millis())
         .unwrap();
-    let runtime = ToolRuntime::new_for_tests()
-        .with_model_surface(ModelSurface::AdaptiveRuntime)
-        .with_communication_database(reopened);
+    let runtime = workflow_runtime().with_communication_database(reopened);
     let restart =
         runtime.agent_continuation_state(Some(&owner), agent, endpoint, generation, binding_id);
     assert!(restart.success, "{:?}", restart.output);
@@ -946,7 +1114,7 @@ fn restart_recovery_survives_published_projection_output_schema() {
 
 #[test]
 fn expired_successor_replay_survives_published_recovery_output_schema() {
-    let (_temp, db, runtime) = continuation_runtime(ModelSurface::AdaptiveRuntime);
+    let (_temp, db, runtime) = continuation_runtime();
     let owner = continuation_auth("continuation-schema-successor");
     let agent = create_agent(
         &runtime,
@@ -963,7 +1131,7 @@ fn expired_successor_replay_survives_published_recovery_output_schema() {
     );
     let window =
         crate::client_window::ClientWindow::for_test("continuation-schema-successor-window");
-    let first_binding = format!("wc_host_binding_{}", "c".repeat(32));
+    let first_binding = "wc_host_binding_zMzMzMzMzMzMzMzMzMzMzA".to_string();
     let bound = runtime.agent_continuation_bind_for_window(
         Some(&owner),
         Some(&window),
@@ -995,7 +1163,7 @@ fn expired_successor_replay_survives_published_recovery_output_schema() {
         agent.clone(),
         e1.clone(),
         g1,
-        format!("wc_host_binding_{}", "d".repeat(32)),
+        "wc_host_binding_3d3d3d3d3d3d3d3d3d3d3Q".to_string(),
     );
     assert!(first.success, "{:?}", first.output);
     let e2 = first.output["endpoint_recovery"]["replacement"]["endpoint_id"]
@@ -1023,7 +1191,7 @@ fn expired_successor_replay_survives_published_recovery_output_schema() {
         agent.clone(),
         e2.clone(),
         g2,
-        format!("wc_host_binding_{}", "e".repeat(32)),
+        "wc_host_binding_7u7u7u7u7u7u7u7u7u7u7g".to_string(),
     );
     assert!(second.success, "{:?}", second.output);
     assert_eq!(
@@ -1037,7 +1205,7 @@ fn expired_successor_replay_survives_published_recovery_output_schema() {
         agent,
         e1.clone(),
         g1,
-        format!("wc_host_binding_{}", "f".repeat(32)),
+        "wc_host_binding______________________w".to_string(),
     );
     assert!(
         old_selector_replay.success,
@@ -1065,7 +1233,7 @@ fn expired_successor_replay_survives_published_recovery_output_schema() {
     );
 
     let published =
-        webcodex_tool_contracts::output_schema_for_tool("agent_continuation_recover_endpoint");
+        webcodex_tool_contracts::output_schema_for_tool("recover_agent_continuation_endpoint");
     let output_schema = &published["properties"]["output"];
     let host_projection =
         host_project_through_output_schema(&old_selector_replay.output, output_schema);
@@ -1082,7 +1250,7 @@ fn expired_successor_replay_survives_published_recovery_output_schema() {
 #[test]
 fn task_origin_wake_survives_published_bootstrap_output_schema() {
     let wake = json!({
-        "wake_id": format!("wc_wake_{}", "a".repeat(32)),
+        "wake_id": "wc_wake_qqqqqqqqqqqqqqqq".to_string(),
         "state": "pending",
         "revision": 1,
         "trigger_kind": "agent_task_attempt",
@@ -1090,8 +1258,8 @@ fn task_origin_wake_survives_published_bootstrap_output_schema() {
         "latest_message_id": null,
         "queued_delivery_count": null,
         "inbox_high_watermark": null,
-        "task_id": format!("wc_agent_task_{}", "b".repeat(32)),
-        "task_attempt_id": format!("wc_agent_task_attempt_{}", "c".repeat(32)),
+        "task_id": "wc_agent_task_u7u7u7u7u7u7u7u7".to_string(),
+        "task_attempt_id": "wc_agent_task_attempt_zMzMzMzMzMzMzMzM".to_string(),
     });
     let published = webcodex_tool_contracts::output_schema_for_tool("bootstrap_agent_conversation");
     let wake_schema = &published["properties"]["output"]["properties"]["wake"];
@@ -1104,8 +1272,8 @@ fn task_origin_wake_survives_published_bootstrap_output_schema() {
 
 #[tokio::test]
 async fn agent_continuation_app_protocol_uses_standard_result_without_model_projection_leaks() {
-    let binding_id = format!("wc_host_binding_{}", "a".repeat(32));
-    let (_temp, _db, runtime) = continuation_runtime(ModelSurface::AdaptiveRuntime);
+    let binding_id = "wc_host_binding_qqqqqqqqqqqqqqqqqqqqqg".to_string();
+    let (_temp, _db, runtime) = continuation_runtime();
     let owner = continuation_auth("continuation-owner");
     let foreign = continuation_auth("continuation-foreign");
     let sender = create_agent(
@@ -1138,27 +1306,17 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
         "continuation-conversation",
     );
 
-    let present = handle_with_server_apps_enabled(
-        &runtime,
-        rpc(
-            "tools/call",
-            Some(json!(5201)),
-            mcp_2026_ui_params(json!({
-                "name": "present_agent_continuation",
-                "arguments": {
-                    "agent_id": receiver,
-                    "endpoint_id": receiver_endpoint,
-                    "expected_controller_generation": receiver_generation
-                }
-            })),
-        ),
+    // Exercise the retained domain projection without advertising a new model
+    // presentation entry. Existing App protocol calls below remain real MCP.
+    let present = runtime.present_agent_continuation(
         Some(&owner),
-        true,
-    )
-    .await;
-    let McpOutcome::Ok(present) = present else {
-        panic!("presentation failed")
-    };
+        receiver.clone(),
+        receiver_endpoint.clone(),
+        receiver_generation,
+    );
+    let present = json!({"result": super::super::tools::mcp_runtime_tool_result(
+        "present_agent_continuation", false, present,
+    )});
     assert_eq!(present["result"]["structuredContent"]["success"], true);
     assert_eq!(
         present["result"]["structuredContent"]["output"]["agent_continuation"]["display_name"],
@@ -1168,13 +1326,13 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
     assert!(!present_text.contains("PRIVATE Agent description"));
     assert!(!present_text.contains("PRIVATE-specialty-label"));
 
-    let foreign_bind = handle_with_server_apps_enabled(
+    let foreign_bind = handle_with_app_policy(
         &runtime,
         rpc(
             "tools/call",
             Some(json!(5202)),
             mcp_2026_params(json!({
-                "name": "agent_continuation_bind",
+                "name": "bind_agent_continuation",
                 "arguments": {
                     "agent_id": receiver,
                     "endpoint_id": receiver_endpoint,
@@ -1198,13 +1356,13 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
         .get("webcodex/agentContinuation")
         .is_none());
 
-    let bind = handle_with_server_apps_enabled(
+    let bind = handle_with_app_policy(
         &runtime,
         rpc(
             "tools/call",
             Some(json!(5203)),
             mcp_2026_params(json!({
-                "name": "agent_continuation_bind",
+                "name": "bind_agent_continuation",
                 "arguments": {
                     "agent_id": receiver,
                     "endpoint_id": receiver_endpoint,
@@ -1253,13 +1411,13 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
         private_body,
         "continuation-private-message",
     );
-    let acquire = handle_with_server_apps_enabled(
+    let acquire = handle_with_app_policy(
         &runtime,
         rpc(
             "tools/call",
             Some(json!(5204)),
             mcp_2026_params(json!({
-                "name": "agent_continuation_wake_acquire",
+                "name": "acquire_agent_continuation_wake",
                 "arguments": {
                     "agent_id": receiver,
                     "endpoint_id": receiver_endpoint,
@@ -1288,13 +1446,13 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
     assert!(!acquire_text.contains("consume_token"));
     assert!(!acquire_text.contains(private_body));
 
-    let prepare = handle_with_server_apps_enabled(
+    let prepare = handle_with_app_policy(
         &runtime,
         rpc(
             "tools/call",
             Some(json!(5205)),
             mcp_2026_params(json!({
-                "name": "agent_continuation_wake_prepare",
+                "name": "prepare_agent_continuation_wake",
                 "arguments": {
                     "agent_id": receiver,
                     "endpoint_id": receiver_endpoint,
@@ -1341,7 +1499,7 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
     assert!(!automatic_message.contains(private_body));
     assert!(!automatic_message.contains("PRIVATE Agent description"));
     assert!(!automatic_message.contains("PRIVATE-specialty-label"));
-    assert!(automatic_message.len() <= 4096);
+    assert!(automatic_message.chars().count() <= 1536);
     let prepare_content: Value = serde_json::from_str(
         prepare["result"]["content"][0]["text"]
             .as_str()
@@ -1364,7 +1522,7 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
         .scopes
         .retain(|scope| scope != crate::auth::SCOPE_COMMUNICATION_MANAGE);
     for name in APP_TOOLS {
-        if name == "agent_wait_state" {
+        if name == "get_agent_wait_state" {
             // Agent Wait state is a separate read-only App projection keyed by wait_id;
             // Store/runtime tests own exact Wait authority and existence-hiding coverage.
             continue;
@@ -1375,12 +1533,12 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
         });
         if matches!(
             name,
-            "agent_continuation_wake_prepare" | "agent_continuation_wake_finish"
+            "prepare_agent_continuation_wake" | "finish_agent_continuation_wake"
         ) {
             args["wake_id"] = json!(wake_id);
             args["attempt_id"] = json!(attempt_id);
         }
-        if name == "agent_continuation_wake_finish" {
+        if name == "finish_agent_continuation_wake" {
             args["outcome"] = json!("dispatch_accepted");
         }
         let request = || {
@@ -1390,8 +1548,7 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
                 mcp_2026_params(json!({"name": name, "arguments": args})),
             )
         };
-        let denied =
-            handle_with_server_apps_enabled(&runtime, request(), Some(&foreign), true).await;
+        let denied = handle_with_app_policy(&runtime, request(), Some(&foreign), true).await;
         let McpOutcome::Ok(denied) = denied else {
             panic!("foreign {name} must fail as a business result")
         };
@@ -1400,11 +1557,15 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
         assert!(!denied_text.contains("consume_token"));
         assert!(!denied_text.contains(&binding_id));
         let unscoped =
-            handle_with_server_apps_enabled(&runtime, request(), Some(&read_only_owner), true)
-                .await;
-        assert!(
-            matches!(unscoped, McpOutcome::Forbidden { .. }),
-            "{name} requires communication:manage even with the exact fence"
+            handle_with_app_policy(&runtime, request(), Some(&read_only_owner), true).await;
+        let McpOutcome::Ok(unscoped) = unscoped else {
+            panic!("{name} requires communication:manage even with the exact fence");
+        };
+        super::fixed_scope::assert_fixed_scope_failure(
+            &unscoped,
+            crate::auth::SCOPE_COMMUNICATION_MANAGE,
+            false,
+            "fixed token",
         );
     }
 
@@ -1434,14 +1595,492 @@ async fn agent_continuation_app_protocol_uses_standard_result_without_model_proj
 }
 
 #[tokio::test]
+async fn all_agent_wait_mcp_automatic_message_is_compact_and_guides_authoritative_rereads() {
+    use crate::tool_runtime::{AgentWaitEventSelectorCall, AgentWaitModeCall};
+
+    let binding_id = "wc_host_binding_u7u7u7u7u7u7u7u7u7u7uw".to_string();
+    let (_temp, _db, runtime) = continuation_runtime();
+    let owner = continuation_auth("continuation-all-wait-owner");
+    let watcher = create_agent(
+        &runtime,
+        &owner,
+        "continuation-all-wait-watcher",
+        "ALL Wait Watcher",
+        "continuation-all-wait-watcher-create",
+    );
+    let worker = create_agent(
+        &runtime,
+        &owner,
+        "continuation-all-wait-worker",
+        "ALL Wait Worker",
+        "continuation-all-wait-worker-create",
+    );
+    let (watcher_endpoint, watcher_generation) =
+        attach(&runtime, &owner, &watcher, "continuation-all-wait-endpoint");
+
+    let present = runtime.present_agent_continuation(
+        Some(&owner),
+        watcher.clone(),
+        watcher_endpoint.clone(),
+        watcher_generation,
+    );
+    assert!(present.success, "retained ALL Wait projection: {present:?}");
+
+    let bind = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5302)),
+            mcp_2026_params(json!({
+                "name": "bind_agent_continuation",
+                "arguments": {
+                    "agent_id": watcher,
+                    "endpoint_id": watcher_endpoint,
+                    "expected_controller_generation": watcher_generation,
+                    "binding_id": binding_id,
+                    "app_call_id": "wc_app_call_0123456789abcdef_2"
+                }
+            })),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(bind) = bind else {
+        panic!("ALL Wait continuation bind failed")
+    };
+    assert_eq!(bind["result"]["structuredContent"]["success"], true);
+
+    let mut task_ids = Vec::new();
+    for index in 0..2 {
+        let task = runtime.create_agent_task(
+            Some(&owner),
+            format!("ALL Wait source {index}"),
+            format!("PRIVATE ALL Wait instruction {index}"),
+            Some(worker.clone()),
+            None,
+            None,
+            Some(format!("agent:special:private-all-wait-{index}")),
+            format!("continuation-all-wait-task-{index}"),
+        );
+        assert!(task.success, "{:?}", task.output);
+        let task_id = task.output["task"]["summary"]["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let started = runtime.start_agent_task_attempt(
+            Some(&owner),
+            task_id.clone(),
+            worker.clone(),
+            format!("continuation-all-wait-start-{index}"),
+        );
+        assert!(started.success, "{:?}", started.output);
+        let completed = runtime.complete_agent_task_attempt(
+            Some(&owner),
+            task_id.clone(),
+            started.output["attempt"]["attempt_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            worker.clone(),
+            started.output["attempt_fence"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+            started.output["attempt"]["attempt_controller_generation"]
+                .as_i64()
+                .unwrap(),
+            "succeeded".to_string(),
+            Some(format!("PRIVATE ALL Wait terminal result {index}")),
+            Some(format!("PRIVATE ALL Wait terminal reason {index}")),
+            format!("continuation-all-wait-complete-{index}"),
+        );
+        assert!(completed.success, "{:?}", completed.output);
+        task_ids.push(task_id);
+    }
+
+    let waited = runtime.wait_for_agent_events(
+        Some(&owner),
+        watcher.clone(),
+        watcher_endpoint.clone(),
+        watcher_generation,
+        AgentWaitModeCall::All,
+        None,
+        task_ids
+            .iter()
+            .map(|task_id| AgentWaitEventSelectorCall {
+                kind: "agent_task_terminal".to_string(),
+                task_id: task_id.clone(),
+            })
+            .collect(),
+        "continuation-all-wait-create".to_string(),
+    );
+    assert!(waited.success, "{:?}", waited.output);
+    assert_eq!(waited.output["agent_wait"]["state"], "triggered");
+    assert_eq!(waited.output["agent_wait"]["mode"], "all");
+    assert_eq!(waited.output["agent_wait"]["source_count"], 2);
+    assert_eq!(waited.output["agent_wait"]["match_count"], 2);
+    let wait_id = waited.output["agent_wait"]["wait_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let acquire = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5303)),
+            mcp_2026_params(json!({
+                "name": "acquire_agent_continuation_wake",
+                "arguments": {
+                    "agent_id": watcher,
+                    "endpoint_id": watcher_endpoint,
+                    "expected_controller_generation": watcher_generation,
+                    "binding_id": binding_id
+                }
+            })),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(acquire) = acquire else {
+        panic!("ALL Wait Wake acquire failed")
+    };
+    assert_eq!(acquire["result"]["structuredContent"]["success"], true);
+    let wake_id = acquire["result"]["structuredContent"]["output"]["wake"]["wake_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let attempt_id = acquire["result"]["structuredContent"]["output"]["wake"]["attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let prepare = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5304)),
+            mcp_2026_params(json!({
+                "name": "prepare_agent_continuation_wake",
+                "arguments": {
+                    "agent_id": watcher,
+                    "endpoint_id": watcher_endpoint,
+                    "expected_controller_generation": watcher_generation,
+                    "binding_id": binding_id,
+                    "wake_id": wake_id,
+                    "attempt_id": attempt_id
+                }
+            })),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(prepare) = prepare else {
+        panic!("ALL Wait Wake prepare failed")
+    };
+    assert_eq!(prepare["result"]["structuredContent"]["success"], true);
+    let automatic_message = prepare["result"]["structuredContent"]["output"]["app_protocol"]
+        ["automatic_message"]
+        .as_str()
+        .expect("ALL Wait exact continuation envelope");
+    for required in [
+        &format!("wait_id={wait_id}"),
+        "mode=all",
+        "matched=2/2",
+        "bootstrap_agent_conversation",
+        "consume_agent_wake",
+        "read_agent_wait(wait_id)",
+        "authoritative source AgentTasks",
+    ] {
+        assert!(
+            automatic_message.contains(required),
+            "missing ALL Wait continuation detail {required}"
+        );
+    }
+    assert!(
+        automatic_message.chars().count() <= 1_000,
+        "ALL Wait automatic message too long: {}",
+        automatic_message.chars().count()
+    );
+    for forbidden in [
+        "PRIVATE ALL Wait instruction",
+        "PRIVATE ALL Wait terminal result",
+        "PRIVATE ALL Wait terminal reason",
+        "private-all-wait",
+        "grants no Task, Project, Goal",
+        "already dispatched by the Endpoint continuation carrier",
+    ] {
+        assert!(
+            !automatic_message.contains(forbidden),
+            "ALL Wait continuation leaked or re-expanded {forbidden}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn goal_scoped_agent_wait_mcp_message_names_goal_and_authoritative_rereads_compactly() {
+    use crate::tool_runtime::{AgentWaitEventSelectorCall, AgentWaitModeCall};
+
+    let binding_id = "wc_host_binding_GoGoGoGoGoGoGoGoGoGoGw".to_string();
+    let (_temp, _db, runtime) = continuation_runtime();
+    let owner = continuation_auth("continuation-goal-scoped-wait-owner");
+    let controller = create_agent(
+        &runtime,
+        &owner,
+        "continuation-goal-scoped-controller",
+        "Goal Scoped Controller",
+        "continuation-goal-scoped-controller-create",
+    );
+    let worker = create_agent(
+        &runtime,
+        &owner,
+        "continuation-goal-scoped-worker",
+        "Goal Scoped Worker",
+        "continuation-goal-scoped-worker-create",
+    );
+    let (controller_endpoint, controller_generation) = attach(
+        &runtime,
+        &owner,
+        &controller,
+        "continuation-goal-scoped-endpoint",
+    );
+
+    let present = runtime.present_agent_continuation(
+        Some(&owner),
+        controller.clone(),
+        controller_endpoint.clone(),
+        controller_generation,
+    );
+    assert!(
+        present.success,
+        "retained Goal-scoped Wait projection: {present:?}"
+    );
+
+    let bind = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5402)),
+            mcp_2026_params(json!({
+                "name": "bind_agent_continuation",
+                "arguments": {
+                    "agent_id": controller,
+                    "endpoint_id": controller_endpoint,
+                    "expected_controller_generation": controller_generation,
+                    "binding_id": binding_id,
+                    "app_call_id": "wc_app_call_0123456789abcdef_3"
+                }
+            })),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(bind) = bind else {
+        panic!("Goal-scoped Wait continuation bind failed")
+    };
+    assert_eq!(bind["result"]["structuredContent"]["success"], true);
+
+    let goal = runtime.create_goal_with_controller(
+        Some(&owner),
+        "PRIVATE GOAL TITLE MUST NOT ENTER AUTOMATIC MESSAGE".to_string(),
+        "PRIVATE GOAL OBJECTIVE MUST NOT ENTER AUTOMATIC MESSAGE".to_string(),
+        Some(controller.clone()),
+        "continuation-goal-scoped-goal".to_string(),
+    );
+    assert!(goal.success, "{:?}", goal.output);
+    let goal_id = goal.output["goal"]["summary"]["goal_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let task = runtime.create_agent_task(
+        Some(&owner),
+        "Goal-scoped ALL source".to_string(),
+        "PRIVATE GOAL SCOPED TASK INSTRUCTION".to_string(),
+        Some(worker.clone()),
+        None,
+        None,
+        Some("agent:special:PRIVATE_GOAL_SCOPED_PROJECT".to_string()),
+        "continuation-goal-scoped-task".to_string(),
+    );
+    assert!(task.success, "{:?}", task.output);
+    let task_id = task.output["task"]["summary"]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let linked = runtime.associate_goal_agent_task(
+        Some(&owner),
+        goal_id.clone(),
+        task_id.clone(),
+        "continuation-goal-scoped-link".to_string(),
+    );
+    assert!(linked.success, "{:?}", linked.output);
+
+    let started = runtime.start_agent_task_attempt(
+        Some(&owner),
+        task_id.clone(),
+        worker.clone(),
+        "continuation-goal-scoped-start".to_string(),
+    );
+    assert!(started.success, "{:?}", started.output);
+
+    let waited = runtime.wait_for_agent_events(
+        Some(&owner),
+        controller.clone(),
+        controller_endpoint.clone(),
+        controller_generation,
+        AgentWaitModeCall::All,
+        Some(goal_id.clone()),
+        vec![AgentWaitEventSelectorCall {
+            kind: "agent_task_terminal".to_string(),
+            task_id: task_id.clone(),
+        }],
+        "continuation-goal-scoped-wait".to_string(),
+    );
+    assert!(waited.success, "{:?}", waited.output);
+    assert_eq!(waited.output["agent_wait"]["goal_id"], goal_id);
+    assert_eq!(waited.output["agent_wait"]["state"], "waiting");
+    assert_eq!(waited.output["agent_wait"]["match_count"], 0);
+
+    let completed = runtime.complete_agent_task_attempt(
+        Some(&owner),
+        task_id,
+        started.output["attempt"]["attempt_id"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        worker,
+        started.output["attempt_fence"]
+            .as_str()
+            .unwrap()
+            .to_string(),
+        started.output["attempt"]["attempt_controller_generation"]
+            .as_i64()
+            .unwrap(),
+        "succeeded".to_string(),
+        Some("PRIVATE GOAL SCOPED TERMINAL RESULT".to_string()),
+        Some("PRIVATE GOAL SCOPED TERMINAL REASON".to_string()),
+        "continuation-goal-scoped-complete".to_string(),
+    );
+    assert!(completed.success, "{:?}", completed.output);
+    let wait_id = waited.output["agent_wait"]["wait_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let acquire = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5403)),
+            mcp_2026_params(json!({
+                "name": "acquire_agent_continuation_wake",
+                "arguments": {
+                    "agent_id": controller,
+                    "endpoint_id": controller_endpoint,
+                    "expected_controller_generation": controller_generation,
+                    "binding_id": binding_id
+                }
+            })),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(acquire) = acquire else {
+        panic!("Goal-scoped Wait Wake acquire failed")
+    };
+    assert_eq!(acquire["result"]["structuredContent"]["success"], true);
+    let wake_id = acquire["result"]["structuredContent"]["output"]["wake"]["wake_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let attempt_id = acquire["result"]["structuredContent"]["output"]["wake"]["attempt_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let prepare = handle_with_app_policy(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(5404)),
+            mcp_2026_params(json!({
+                "name": "prepare_agent_continuation_wake",
+                "arguments": {
+                    "agent_id": controller,
+                    "endpoint_id": controller_endpoint,
+                    "expected_controller_generation": controller_generation,
+                    "binding_id": binding_id,
+                    "wake_id": wake_id,
+                    "attempt_id": attempt_id
+                }
+            })),
+        ),
+        Some(&owner),
+        true,
+    )
+    .await;
+    let McpOutcome::Ok(prepare) = prepare else {
+        panic!("Goal-scoped Wait Wake prepare failed")
+    };
+    assert_eq!(prepare["result"]["structuredContent"]["success"], true);
+    let automatic_message = prepare["result"]["structuredContent"]["output"]["app_protocol"]
+        ["automatic_message"]
+        .as_str()
+        .expect("Goal-scoped Wait exact continuation envelope");
+    for required in [
+        &format!("wait_id={wait_id}"),
+        &format!("goal_id={goal_id}"),
+        "mode=all",
+        "matched=1/1",
+        "bootstrap_agent_conversation",
+        "consume_agent_wake",
+        "read_agent_wait(wait_id)",
+        "get_goal(goal_id)",
+        "every authoritative source AgentTask",
+        "explicitly decide and update the Goal from current durable state",
+    ] {
+        assert!(
+            automatic_message.contains(required),
+            "missing Goal-scoped Wait continuation detail {required}"
+        );
+    }
+    assert!(
+        automatic_message.chars().count() <= 1_000,
+        "Goal-scoped Wait automatic message too long: {}",
+        automatic_message.chars().count()
+    );
+    for forbidden in [
+        "PRIVATE GOAL TITLE",
+        "PRIVATE GOAL OBJECTIVE",
+        "PRIVATE GOAL SCOPED TASK INSTRUCTION",
+        "PRIVATE_GOAL_SCOPED_PROJECT",
+        "PRIVATE GOAL SCOPED TERMINAL RESULT",
+        "PRIVATE GOAL SCOPED TERMINAL REASON",
+        "goal lifecycle",
+        "controller Endpoint",
+        "grants no Task, Project, Goal",
+    ] {
+        assert!(
+            !automatic_message.contains(forbidden),
+            "Goal-scoped Wait continuation leaked or re-expanded {forbidden}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn agent_continuation_hidden_kernel_entry_is_fail_closed_without_protocol_capability() {
     use crate::tool_runtime::kernel::{
         HostFileImportTrust, ToolCallContext, ToolCallErrorStatus, ToolCallRequest,
         ToolProtocolCapabilities, ToolTransport,
     };
 
-    let runtime =
-        ToolRuntime::new_for_tests().with_model_surface(ModelSurface::FullOperatorRuntime);
+    let runtime = workflow_runtime();
     let auth = continuation_auth("continuation-kernel-gate");
     for transport in [ToolTransport::Mcp, ToolTransport::Api] {
         for name in APP_TOOLS {
@@ -1450,10 +2089,10 @@ async fn agent_continuation_hidden_kernel_entry_is_fail_closed_without_protocol_
                     ToolCallRequest {
                         tool_name: name.to_string(),
                         arguments: json!({
-                            "agent_id": format!("wc_dagent_{}", "a".repeat(32)),
-                            "endpoint_id": format!("wc_endpoint_{}", "b".repeat(32)),
+                            "agent_id": "wc_dagent_qqqqqqqqqqqqqqqq".to_string(),
+                            "endpoint_id": "wc_endpoint_u7u7u7u7u7u7u7u7".to_string(),
                             "expected_controller_generation": 1,
-                            "binding_id": format!("wc_host_binding_{}", "a".repeat(32))
+                            "binding_id": "wc_host_binding_qqqqqqqqqqqqqqqqqqqqqg".to_string()
                         }),
                     },
                     ToolCallContext {

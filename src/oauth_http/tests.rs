@@ -17,11 +17,13 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod authority;
 mod authorize;
 mod clients;
 mod managed_authorize;
 mod metadata;
 mod project_share;
+mod protocol_errors;
 mod revoke;
 mod scopes;
 mod shared_key_bridge;

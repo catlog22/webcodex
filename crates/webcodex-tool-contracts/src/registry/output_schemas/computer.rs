@@ -61,7 +61,7 @@ fn application_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "application_id": {"type": "string", "pattern": "^application_[0-9a-f]{32}$", "maxLength": 128},
+            "application_id": {"type": "string", "pattern": "^application_[A-Za-z0-9_-]{16}$", "maxLength": 128},
             "display_name": {"type": "string", "minLength": 1, "maxLength": 256}
         },
         "required": ["application_id", "display_name"]
@@ -73,7 +73,7 @@ fn display_schema() -> Value {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-            "display_id": {"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128},
+            "display_id": {"type": "string", "pattern": "^display_[A-Za-z0-9_-]{16}$", "maxLength": 128},
             "width": {"type": "integer", "minimum": 1, "maximum": 4294967295u64},
             "height": {"type": "integer", "minimum": 1, "maximum": 4294967295u64},
             "primary": {"type": "boolean"}
@@ -159,8 +159,55 @@ fn snapshot_region_schema() -> Value {
     })
 }
 
+fn merged_gateway_output_schema(names: &[&str]) -> Value {
+    let mut merged = strict_computer_output_schema(vec![]);
+    for name in names {
+        let schema = raw_output_schema_for_tool(name).expect("Computer primitive output schema");
+        let source = schema["properties"]["output"]["properties"]
+            .as_object()
+            .expect("Computer primitive output properties");
+        let target = merged["properties"]["output"]["properties"]
+            .as_object_mut()
+            .expect("Computer gateway output properties");
+        for (key, value) in source {
+            target.entry(key.clone()).or_insert_with(|| value.clone());
+        }
+    }
+    merged
+}
+
 fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "observe_computer" => Some(merged_gateway_output_schema(&[
+            "computer_list_targets",
+            "computer_list_windows",
+            "computer_list_displays",
+            "computer_list_applications",
+            "computer_accessibility_status",
+            "computer_accessibility_tree",
+            "computer_find_elements",
+            "computer_element_state",
+            "computer_snapshot",
+            "computer_snapshot_display",
+            "computer_read_clipboard",
+        ])),
+        "control_computer" => {
+            let mut schema = merged_gateway_output_schema(&[
+                "computer_launch_application",
+                "computer_activate_window",
+                "__computer_element_control",
+                "computer_scroll_to_element",
+                "computer_key_input",
+                "computer_input_text",
+                "computer_pointer_move",
+                "computer_pointer_click",
+                "computer_write_clipboard",
+            ]);
+            schema["properties"]["output"]["properties"]["post_observation"] =
+                output_schema_for_tool("computer_accessibility_tree")
+                    .expect("canonical tree output");
+            Some(schema)
+        }
         "computer_list_targets" => Some(wrapped_output_schema(vec![
             (
                 "targets",
@@ -213,7 +260,7 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "application_id",
-                json!({"type": "string", "pattern": "^application_[0-9a-f]{32}$", "maxLength": 128}),
+                json!({"type": "string", "pattern": "^application_[A-Za-z0-9_-]{16}$", "maxLength": 128}),
             ),
             ("success", json!({"type": "boolean", "const": true})),
         ])),
@@ -327,7 +374,7 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             ("success", json!({"type": "boolean", "const": true})),
         ])),
-        "computer_control" => Some(wrapped_output_schema(vec![
+        "__computer_element_control" => Some(wrapped_output_schema(vec![
             (
                 "platform",
                 json!({"type": "string", "enum": ["macos", "windows"]}),
@@ -361,25 +408,30 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             ("success", json!({"type": "boolean", "const": true})),
         ])),
-        "computer_key_input" => Some(wrapped_output_schema(vec![
-            (
-                "platform",
-                json!({"type": "string", "enum": ["macos", "windows"]}),
-            ),
-            (
-                "surface_id",
-                json!({"type": "string", "minLength": 1, "maxLength": 128}),
-            ),
-            (
-                "key",
-                json!({"type": "string", "enum": ["enter", "escape", "tab", "arrow_up", "arrow_down", "arrow_left", "arrow_right", "page_up", "page_down", "home", "end"]}),
-            ),
-            (
-                "modifiers",
-                json!({"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "enum": ["shift", "control", "option", "command"]}}),
-            ),
-            ("success", json!({"type": "boolean", "const": true})),
-        ])),
+        "computer_key_input" => {
+            Some(wrapped_output_schema(vec![
+                (
+                    "platform",
+                    json!({"type": "string", "enum": ["macos", "windows"]}),
+                ),
+                (
+                    "surface_id",
+                    json!({"type": "string", "minLength": 1, "maxLength": 128}),
+                ),
+                (
+                    "key",
+                    webcodex_core::computer_input_contract::computer_key_schema(
+                        &mut Default::default(),
+                    )
+                    .to_value(),
+                ),
+                (
+                    "modifiers",
+                    json!({"type": "array", "maxItems": 4, "uniqueItems": true, "items": {"type": "string", "enum": ["shift", "control", "option", "command"]}}),
+                ),
+                ("success", json!({"type": "boolean", "const": true})),
+            ]))
+        }
         "computer_input_text" => Some(wrapped_output_schema(vec![
             (
                 "platform",
@@ -447,7 +499,7 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             (
                 "display_id",
-                json!({"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128}),
+                json!({"type": "string", "pattern": "^display_[A-Za-z0-9_-]{16}$", "maxLength": 128}),
             ),
             (
                 "snapshot_generation",
@@ -487,7 +539,7 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
             ),
             ("content_base64", json!({"type": "string"})),
         ])),
-        "computer_save_snapshot" => Some(wrapped_output_schema(vec![
+        "save_computer_snapshot" => Some(wrapped_output_schema(vec![
             ("project", json!({"type": "string", "minLength": 1})),
             (
                 "path",
@@ -582,7 +634,7 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
                 (
                     "display_id",
-                    json!({"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128}),
+                    json!({"type": "string", "pattern": "^display_[A-Za-z0-9_-]{16}$", "maxLength": 128}),
                 ),
                 (
                     "snapshot_generation",
@@ -610,47 +662,54 @@ fn raw_output_schema_for_tool(name: &str) -> Option<Value> {
 }
 
 fn computer_suggested_recovery_schema() -> Value {
-    let client_arguments = || {
+    let client_arguments = |action: &'static str| {
         json!({
             "type": "object",
             "additionalProperties": false,
             "properties": {
+                "action": {"type": "string", "const": action},
                 "client_id": {"type": "string", "minLength": 1, "maxLength": 128}
             },
-            "required": ["client_id"]
+            "required": ["action", "client_id"]
         })
     };
     json!({
         "oneOf": [
             suggested_tool_call_schema(
-                "computer_list_windows",
-                client_arguments(),
+                webcodex_core::runtime_contract::GeneratedFollowUpKind::FallbackRecovery,
+                "observe_computer",
+                client_arguments("windows"),
                 "Parser-ready advisory window re-observation using the exact Runner already owned by the failed Computer request. It grants no authority and is not an effect retry."
             ),
             suggested_tool_call_schema(
-                "computer_list_applications",
-                client_arguments(),
+                webcodex_core::runtime_contract::GeneratedFollowUpKind::FallbackRecovery,
+                "observe_computer",
+                client_arguments("applications"),
                 "Parser-ready advisory application re-observation using the exact Runner already owned by the failed Computer request. It grants no authority and is not an effect retry."
             ),
             suggested_tool_call_schema(
-                "computer_list_displays",
-                client_arguments(),
+                webcodex_core::runtime_contract::GeneratedFollowUpKind::FallbackRecovery,
+                "observe_computer",
+                client_arguments("displays"),
                 "Parser-ready advisory display re-observation using the exact Runner already owned by the failed Computer request. It grants no authority and is not an effect retry."
             ),
             suggested_tool_call_schema(
-                "computer_snapshot_display",
+                webcodex_core::runtime_contract::GeneratedFollowUpKind::FallbackRecovery,
+                "observe_computer",
                 json!({
                     "type": "object",
                     "additionalProperties": false,
                     "properties": {
+                        "action": {"type": "string", "const": "snapshot_display"},
                         "client_id": {"type": "string", "minLength": 1, "maxLength": 128},
-                        "display_id": {"type": "string", "pattern": "^display_[0-9a-f]{32}$", "maxLength": 128}
+                        "display_id": {"type": "string", "pattern": "^display_[A-Za-z0-9_-]{16}$", "maxLength": 128}
                     },
-                    "required": ["client_id", "display_id"]
+                    "required": ["action", "client_id", "display_id"]
                 }),
                 "Parser-ready advisory display snapshot re-observation. It intentionally omits the spent snapshot_generation and grants no retry authority."
             ),
             suggested_tool_call_schema(
+                webcodex_core::runtime_contract::GeneratedFollowUpKind::FallbackRecovery,
                 "read_project_artifact_metadata",
                 json!({
                     "type": "object",
@@ -675,14 +734,7 @@ fn apply_computer_recovery_contract(schema: &mut Value) {
         "reconcile_with".to_string(),
         json!({
             "type": "string",
-            "enum": [
-                "computer_find_elements",
-                "computer_list_windows",
-                "computer_list_applications",
-                "computer_list_displays",
-                "computer_snapshot_display",
-                "read_project_artifact_metadata"
-            ],
+            "enum": ["observe_computer", "read_project_artifact_metadata"],
             "description": "Non-actionable recovery family hint used only when a complete safe invocation cannot be proven. It is not execution authority."
         }),
     );
@@ -709,10 +761,7 @@ fn apply_computer_recovery_contract(schema: &mut Value) {
         }),
         json!({
             "if": {"required": ["suggested_call"]},
-            "then": {
-                "required": ["recovery_kind"],
-                "properties": {"recovery_kind": {"enum": ["reobserve", "reconcile"]}}
-            }
+            "then": {"not": {"required": ["recovery_kind"]}}
         }),
         json!({
             "if": {"required": ["reconcile_with"]},

@@ -7,10 +7,11 @@ use super::model::{
     CompleteSessionMessageInput, CompleteSessionMessageOutcome, ListSessionMessagesFilter,
     PostSessionMessageInput, ReplaceSessionMessageInput, ReplaceSessionMessageOutcome,
     SessionAckObservation, SessionAssignmentSnapshot, SessionAttentionSnapshot,
-    SessionDiscussionSummary, SessionInboxHint, SessionMessage, SessionMessageError,
-    SessionMessageKind, SessionMessageObservationError, SessionMessageObservationOutcome,
-    SessionMessagePriority, SessionMessageStatus, WithdrawSessionMessageOutcome,
+    SessionDiscussionSummary, SessionInboxHint, SessionMessage, SessionMessageDelivery,
+    SessionMessageDeliveryOutcome, SessionMessageError, SessionMessageObservationError,
+    SessionMessageObservationOutcome, SessionMessageStatus, WithdrawSessionMessageOutcome,
     DEFAULT_MESSAGE_LIST_LIMIT, MAX_MESSAGE_LIST_LIMIT, MAX_SESSION_MESSAGE_OBSERVATION_TOKEN_LEN,
+    MAX_TOOL_CALL_ACK_REF_CHARS,
 };
 use super::query::{build_discussion_summary, build_inbox_hint};
 use super::store::SessionStore;
@@ -31,15 +32,54 @@ impl SessionStore {
         input: PostSessionMessageInput,
         requires_ack: bool,
     ) -> Result<SessionMessage, SessionMessageError> {
-        let (message, changed) = {
-            let mut inner = self.inner.lock().expect("session store mutex poisoned");
-            inner.post_message(input, requires_ack)?
+        let outcome = self.post_message_mutation(input, requires_ack, None)?;
+        if outcome.state_changed {
+            self.persist_after_mutation();
+        }
+        Ok(outcome.message)
+    }
+
+    pub async fn post_message_with_ack_and_delivery(
+        &self,
+        input: PostSessionMessageInput,
+        requires_ack: bool,
+        delivery: Option<SessionMessageDelivery>,
+    ) -> Result<SessionMessageDeliveryOutcome, SessionMessageError> {
+        let durability = if delivery.is_some() {
+            Some(self.prepare_durable_mutation().await)
+        } else {
+            None
         };
-        self.persist_after_mutation();
-        if changed {
+        let outcome = self.post_message_mutation(input, requires_ack, delivery)?;
+        if let Some(durability) = durability {
+            // Exact retries also fence durability: a failed earlier write may
+            // have left the message and replay key only in memory.
+            durability
+                .persist()
+                .await
+                .map_err(|_| SessionMessageError::DeliveryPersistenceUncertain)?;
+        } else if outcome.state_changed {
+            self.persist_after_mutation();
+        }
+        Ok(outcome)
+    }
+
+    fn post_message_mutation(
+        &self,
+        input: PostSessionMessageInput,
+        requires_ack: bool,
+        delivery: Option<SessionMessageDelivery>,
+    ) -> Result<SessionMessageDeliveryOutcome, SessionMessageError> {
+        let outcome = {
+            let mut inner = self.inner.lock().expect("session store mutex poisoned");
+            inner.post_message(input, requires_ack, delivery)?
+        };
+        if outcome.state_changed {
+            // Observation tracks the accepted in-memory mutation. Notify before
+            // a cancellable durability wait; emitted cursors fence persistence.
             self.notify_message_observation();
         }
-        Ok(message)
+        Ok(outcome)
     }
 
     pub fn list_messages(
@@ -81,19 +121,21 @@ impl SessionStore {
     /// Session-store snapshot. The durable persistence barrier is completed
     /// before the semantic snapshot fence is returned so a post-restart retry
     /// can compare against the same durable assignment state.
-    pub fn get_assignment(
+    pub async fn get_assignment(
         &self,
         session_id: &str,
         todo_id: &str,
     ) -> Result<SessionAssignmentSnapshot, SessionMessageError> {
+        let durability = self.prepare_durable_mutation().await;
         let state = self
             .with_record_for_query(session_id, |record, _| {
                 open_assignment_state(record, todo_id)
             })
             .ok_or(SessionMessageError::UnknownSession)??;
-        if self.persist_after_mutation_durable().is_err() {
-            return Err(SessionMessageError::InvalidObservationState);
-        }
+        durability
+            .persist()
+            .await
+            .map_err(|_| SessionMessageError::InvalidObservationState)?;
         Ok(snapshot_from_state(session_id, todo_id, state))
     }
 
@@ -116,7 +158,118 @@ impl SessionStore {
         outcome
     }
 
-    pub fn ack_required_guidance(
+    pub fn issue_ack_ref(&self, session_id: &str, retained_ids: &[String]) -> Option<String> {
+        if retained_ids.is_empty() {
+            return None;
+        }
+        self.with_record_for_query(session_id, |record, _| {
+            let open_ids = sorted_open_ack_message_ids(record);
+            let retained = retained_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::HashSet<_>>();
+            if retained.is_empty() {
+                return None;
+            }
+
+            let mut membership = vec![0_u8; open_ids.len().div_ceil(8)];
+            let mut matched = 0_usize;
+            for (index, message_id) in open_ids.iter().enumerate() {
+                if retained.contains(message_id.as_str()) {
+                    membership[index / 8] |= 1_u8 << (index % 8);
+                    matched += 1;
+                }
+            }
+            if matched != retained.len() {
+                return None;
+            }
+            while membership.last().is_some_and(|byte| *byte == 0) {
+                membership.pop();
+            }
+            if membership.is_empty() || membership.len() > ACK_REF_MAX_MEMBERSHIP_BYTES {
+                return None;
+            }
+
+            let tag = ack_set_digest(
+                session_id,
+                &record.owner_authority_fingerprint,
+                open_ids.iter().map(String::as_str),
+                &membership,
+            );
+            let mut payload = Vec::with_capacity(ACK_REF_TAG_BYTES + membership.len());
+            payload.extend_from_slice(&tag[..ACK_REF_TAG_BYTES]);
+            payload.extend_from_slice(&membership);
+            let token = format!(
+                "{ACK_REF_PREFIX}{}",
+                general_purpose::URL_SAFE_NO_PAD.encode(payload)
+            );
+            (token.len() <= MAX_TOOL_CALL_ACK_REF_CHARS).then_some(token)
+        })
+        .flatten()
+    }
+
+    pub fn resolve_ack_ref(&self, session_id: &str, ack_ref: &str) -> Option<Vec<String>> {
+        if ack_ref.len() > MAX_TOOL_CALL_ACK_REF_CHARS {
+            return None;
+        }
+        let encoded = ack_ref.strip_prefix(ACK_REF_PREFIX)?;
+        if encoded.is_empty() || !encoded.is_ascii() {
+            return None;
+        }
+        let payload = general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded.as_bytes())
+            .ok()?;
+        if payload.len() <= ACK_REF_TAG_BYTES
+            || payload.len() > ACK_REF_TAG_BYTES + ACK_REF_MAX_MEMBERSHIP_BYTES
+        {
+            return None;
+        }
+        let (provided_tag, membership) = payload.split_at(ACK_REF_TAG_BYTES);
+        if membership.last().is_some_and(|byte| *byte == 0) {
+            return None;
+        }
+
+        self.with_record_for_query(session_id, |record, _| {
+            let open_ids = sorted_open_ack_message_ids(record);
+            let expected_tag = ack_set_digest(
+                session_id,
+                &record.owner_authority_fingerprint,
+                open_ids.iter().map(String::as_str),
+                membership,
+            );
+            if provided_tag != &expected_tag[..ACK_REF_TAG_BYTES] {
+                return None;
+            }
+
+            let max_membership_bytes = open_ids.len().div_ceil(8);
+            if membership.len() > max_membership_bytes {
+                return None;
+            }
+            if membership.len() == max_membership_bytes && !membership.is_empty() {
+                let used_bits = open_ids.len() % 8;
+                if used_bits != 0 {
+                    let allowed_mask = ((1_u16 << used_bits) - 1) as u8;
+                    if membership[membership.len() - 1] & !allowed_mask != 0 {
+                        return None;
+                    }
+                }
+            }
+
+            let mut resolved = Vec::new();
+            for (index, message_id) in open_ids.into_iter().enumerate() {
+                let Some(byte) = membership.get(index / 8) else {
+                    break;
+                };
+                if byte & (1_u8 << (index % 8)) != 0 {
+                    resolved.push(message_id);
+                }
+            }
+            (!resolved.is_empty()).then_some(resolved)
+        })
+        .flatten()
+    }
+
+    pub fn ack_required_messages(
         &self,
         session_id: &str,
         suppressed_ids: &[String],
@@ -130,10 +283,7 @@ impl SessionStore {
                 .messages
                 .iter()
                 .filter(|message| {
-                    message.status == SessionMessageStatus::Open
-                        && message.kind == SessionMessageKind::Guidance
-                        && message.priority == SessionMessagePriority::High
-                        && message.requires_ack
+                    message.status == SessionMessageStatus::Open && message.requires_ack
                 })
                 .map(|message| message.as_ref().clone())
                 .collect::<Vec<_>>();
@@ -152,44 +302,42 @@ impl SessionStore {
         .unwrap_or_default()
     }
 
-    pub fn withdraw_message(
+    pub async fn withdraw_message(
         &self,
         session_id: &str,
         message_id: &str,
     ) -> Result<WithdrawSessionMessageOutcome, SessionMessageError> {
+        let durability = self.prepare_durable_mutation().await;
         let outcome = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
             inner.withdraw_message(session_id, message_id)?
         };
-        if self.persist_after_mutation_durable().is_err() {
-            if !outcome.replayed {
-                self.notify_message_observation();
-            }
-            return Err(SessionMessageError::PersistenceUncertain);
-        }
         if !outcome.replayed {
             self.notify_message_observation();
         }
+        durability
+            .persist()
+            .await
+            .map_err(|_| SessionMessageError::PersistenceUncertain)?;
         Ok(outcome)
     }
 
-    pub fn replace_message(
+    pub async fn replace_message(
         &self,
         input: ReplaceSessionMessageInput,
     ) -> Result<ReplaceSessionMessageOutcome, SessionMessageError> {
+        let durability = self.prepare_durable_mutation().await;
         let outcome = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
             inner.replace_message(input)?
         };
-        if self.persist_after_mutation_durable().is_err() {
-            if !outcome.replayed {
-                self.notify_message_observation();
-            }
-            return Err(SessionMessageError::PersistenceUncertain);
-        }
         if !outcome.replayed {
             self.notify_message_observation();
         }
+        durability
+            .persist()
+            .await
+            .map_err(|_| SessionMessageError::PersistenceUncertain)?;
         Ok(outcome)
     }
 
@@ -233,10 +381,11 @@ impl SessionStore {
         Ok(message)
     }
 
-    pub fn complete_message(
+    pub async fn complete_message(
         &self,
         input: CompleteSessionMessageInput,
     ) -> Result<CompleteSessionMessageOutcome, SessionMessageError> {
+        let durability = self.prepare_durable_mutation().await;
         let result = {
             let mut inner = self.inner.lock().expect("session store mutex poisoned");
             inner.complete_message(input)
@@ -247,9 +396,7 @@ impl SessionStore {
                 current,
                 fresh_assignment_fence,
             }) => {
-                if fresh_assignment_fence.is_some()
-                    && self.persist_after_mutation_durable().is_err()
-                {
+                if fresh_assignment_fence.is_some() && durability.persist().await.is_err() {
                     return Err(SessionMessageError::AssignmentStale {
                         current,
                         fresh_assignment_fence: None,
@@ -262,15 +409,13 @@ impl SessionStore {
             }
             Err(error) => return Err(error),
         };
-        if self.persist_after_mutation_durable().is_err() {
-            if !outcome.replayed {
-                self.notify_message_observation();
-            }
-            return Err(SessionMessageError::PersistenceUncertain);
-        }
         if !outcome.replayed {
             self.notify_message_observation();
         }
+        durability
+            .persist()
+            .await
+            .map_err(|_| SessionMessageError::PersistenceUncertain)?;
         Ok(outcome)
     }
 
@@ -286,7 +431,7 @@ impl SessionStore {
             .clamp(1, MAX_MESSAGE_LIST_LIMIT);
         if after_observation_token.is_none() {
             let current_revision = self.message_observation_current_revision(session_id)?;
-            self.fence_message_observation_token()?;
+            self.fence_message_observation_token().await?;
             return Ok(SessionMessageObservationOutcome {
                 messages: Vec::new(),
                 observation_token: encode_observation_token(session_id, current_revision)?,
@@ -303,7 +448,7 @@ impl SessionStore {
         let mut receiver = self.message_observation_notify.subscribe();
         let initial = self.message_observation_snapshot(session_id, after_revision, limit)?;
         if initial.2 || wait_secs.is_none() {
-            self.fence_message_observation_token()?;
+            self.fence_message_observation_token().await?;
             return observation_outcome(session_id, initial, "immediate", 0);
         }
 
@@ -316,7 +461,7 @@ impl SessionStore {
                     let snapshot =
                         self.message_observation_snapshot(session_id, after_revision, limit)?;
                     if snapshot.2 {
-                        self.fence_message_observation_token()?;
+                        self.fence_message_observation_token().await?;
                         return observation_outcome(
                             session_id,
                             snapshot,
@@ -331,7 +476,7 @@ impl SessionStore {
                     let snapshot =
                         self.message_observation_snapshot(session_id, after_revision, limit)?;
                     if snapshot.2 {
-                        self.fence_message_observation_token()?;
+                        self.fence_message_observation_token().await?;
                         return observation_outcome(
                             session_id,
                             snapshot,
@@ -339,7 +484,7 @@ impl SessionStore {
                             elapsed_millis(started),
                         );
                     }
-                    self.fence_message_observation_token()?;
+                    self.fence_message_observation_token().await?;
                     return observation_outcome(
                         session_id,
                         snapshot,
@@ -355,7 +500,8 @@ impl SessionStore {
         &self,
         session_id: &str,
     ) -> Result<u64, SessionMessageObservationError> {
-        self.with_record_for_query(session_id, |record, _| record.message_observation_revision)
+        self.retained_revisions(session_id)
+            .map(|(_, revision)| revision)
             .ok_or(SessionMessageObservationError::UnknownSession)
     }
 
@@ -408,8 +554,9 @@ impl SessionStore {
         .ok_or(SessionMessageObservationError::UnknownSession)?
     }
 
-    fn fence_message_observation_token(&self) -> Result<(), SessionMessageObservationError> {
+    async fn fence_message_observation_token(&self) -> Result<(), SessionMessageObservationError> {
         self.persist_after_mutation_durable()
+            .await
             .map_err(|_| SessionMessageObservationError::InvalidObservationState)
     }
 
@@ -460,25 +607,64 @@ fn observation_outcome(
     })
 }
 
-const MESSAGE_OBSERVATION_TOKEN_PREFIX: &str = "wsm1_";
-const MESSAGE_OBSERVATION_BINDING_BYTES: usize = 16;
+const ACK_REF_PREFIX: &str = "wc_ack1_";
+const ACK_REF_TAG_BYTES: usize = 16;
+// A wire-size budget, independent of the number of durable messages. Large
+// open sets can use explicit ACK ids when a compact selector does not fit.
+const ACK_REF_MAX_MEMBERSHIP_BYTES: usize =
+    (MAX_TOOL_CALL_ACK_REF_CHARS - ACK_REF_PREFIX.len()) * 3 / 4 - ACK_REF_TAG_BYTES;
+
+fn sorted_open_ack_message_ids(record: &super::model::SessionRecord) -> Vec<String> {
+    let mut messages = record
+        .messages
+        .iter()
+        .filter(|message| message.status == SessionMessageStatus::Open && message.requires_ack)
+        .map(|message| message.as_ref())
+        .collect::<Vec<_>>();
+    messages.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.message_id.cmp(&right.message_id))
+    });
+    messages
+        .into_iter()
+        .map(|message| message.message_id.clone())
+        .collect()
+}
+
+fn ack_set_digest<'a>(
+    session_id: &str,
+    owner_authority_fingerprint: &str,
+    message_ids: impl Iterator<Item = &'a str>,
+    membership: &[u8],
+) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"webcodex.session-message-ack-set.v1\0");
+    for value in [session_id, owner_authority_fingerprint] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    for message_id in message_ids {
+        hasher.update((message_id.len() as u64).to_be_bytes());
+        hasher.update(message_id.as_bytes());
+    }
+    hasher.update((membership.len() as u64).to_be_bytes());
+    hasher.update(membership);
+    hasher.finalize().into()
+}
+
+const MESSAGE_OBSERVATION_TOKEN_PREFIX: &str = "wsm2_";
 const MESSAGE_OBSERVATION_REVISION_BYTES: usize = 8;
 const MESSAGE_OBSERVATION_TAG_BYTES: usize = 16;
-const MESSAGE_OBSERVATION_PAYLOAD_BYTES: usize = MESSAGE_OBSERVATION_BINDING_BYTES
-    + MESSAGE_OBSERVATION_REVISION_BYTES
-    + MESSAGE_OBSERVATION_TAG_BYTES;
+const MESSAGE_OBSERVATION_PAYLOAD_BYTES: usize =
+    MESSAGE_OBSERVATION_REVISION_BYTES + MESSAGE_OBSERVATION_TAG_BYTES;
 
 pub(super) fn encode_observation_token(
     session_id: &str,
     revision: u64,
 ) -> Result<String, SessionMessageObservationError> {
-    let binding = observation_digest(
-        b"webcodex.session-message-observation.binding.v1\0",
-        session_id,
-        &[],
-    );
     let mask = observation_digest(
-        b"webcodex.session-message-observation.mask.v1\0",
+        b"webcodex.session-message-observation.mask.v2\0",
         session_id,
         &[],
     );
@@ -488,12 +674,11 @@ pub(super) fn encode_observation_token(
         masked_revision[index] = byte ^ mask[index];
     }
     let tag = observation_digest(
-        b"webcodex.session-message-observation.tag.v1\0",
+        b"webcodex.session-message-observation.tag.v2\0",
         session_id,
         &masked_revision,
     );
     let mut payload = Vec::with_capacity(MESSAGE_OBSERVATION_PAYLOAD_BYTES);
-    payload.extend_from_slice(&binding[..MESSAGE_OBSERVATION_BINDING_BYTES]);
     payload.extend_from_slice(&masked_revision);
     payload.extend_from_slice(&tag[..MESSAGE_OBSERVATION_TAG_BYTES]);
     let token = format!(
@@ -525,24 +710,14 @@ fn parse_observation_token(
     if payload.len() != MESSAGE_OBSERVATION_PAYLOAD_BYTES {
         return Err(SessionMessageObservationError::MalformedToken);
     }
-    let expected_binding = observation_digest(
-        b"webcodex.session-message-observation.binding.v1\0",
-        session_id,
-        &[],
-    );
-    if payload[..MESSAGE_OBSERVATION_BINDING_BYTES]
-        != expected_binding[..MESSAGE_OBSERVATION_BINDING_BYTES]
-    {
-        return Err(SessionMessageObservationError::WrongSession);
-    }
-    let masked_start = MESSAGE_OBSERVATION_BINDING_BYTES;
+    let masked_start = 0;
     let masked_end = masked_start + MESSAGE_OBSERVATION_REVISION_BYTES;
     let masked_revision: [u8; MESSAGE_OBSERVATION_REVISION_BYTES] = payload
         [masked_start..masked_end]
         .try_into()
         .map_err(|_| SessionMessageObservationError::MalformedToken)?;
     let expected_tag = observation_digest(
-        b"webcodex.session-message-observation.tag.v1\0",
+        b"webcodex.session-message-observation.tag.v2\0",
         session_id,
         &masked_revision,
     );
@@ -550,7 +725,7 @@ fn parse_observation_token(
         return Err(SessionMessageObservationError::MalformedToken);
     }
     let mask = observation_digest(
-        b"webcodex.session-message-observation.mask.v1\0",
+        b"webcodex.session-message-observation.mask.v2\0",
         session_id,
         &[],
     );

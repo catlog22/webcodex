@@ -1,4 +1,3 @@
-use crate::capabilities::RunnerFeatureInference;
 use crate::projects::RunnerLookupError;
 use crate::protocol::AcceptedRunnerProtocol;
 use crate::registry::{MAX_SHARED_KEY_RUNNERS_PER_GROUP, SHARED_KEY_OFFLINE_TTL_SECS};
@@ -69,6 +68,7 @@ fn runner_registration(
     _projects: Vec<RunnerProjectSummary>,
 ) -> RunnerRegisterRequest {
     RunnerRegisterRequest {
+        computer_session_availability: None,
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,
@@ -87,13 +87,31 @@ fn runner_registration(
     }
 }
 
-fn v2_baseline_capabilities() -> RunnerCapabilities {
-    let mut value = serde_json::Map::new();
-    value.insert("shell".to_string(), serde_json::Value::Bool(false));
-    for capability in RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES {
-        value.insert((*capability).to_string(), serde_json::Value::Bool(true));
+fn shell_job_start_request(
+    client_id: &str,
+    command: &str,
+    timeout_secs: Option<u64>,
+) -> JobStartRequest {
+    JobStartRequest {
+        timeout_secs: timeout_secs.unwrap_or(120),
+        ..JobStartRequest::shell(client_id, command)
     }
-    serde_json::from_value(serde_json::Value::Object(value)).unwrap()
+}
+
+fn all_enabled_capabilities() -> RunnerCapabilities {
+    let mut capabilities = RunnerCapabilities::default();
+    for feature in RunnerFeature::all() {
+        capabilities.set(*feature, true);
+    }
+    capabilities
+}
+
+fn v2_baseline_capabilities() -> RunnerCapabilities {
+    let mut capabilities = RunnerCapabilities::default();
+    for feature in RunnerFeature::all() {
+        capabilities.set(*feature, feature.is_v2_baseline());
+    }
+    capabilities
 }
 
 fn current_runner_registration(registration: RunnerRegisterRequest) -> RunnerRegisterRequest {
@@ -118,8 +136,8 @@ fn file_request(op: &str) -> ShellFileOpRequest {
         pattern: None,
         expected_sha256: None,
         expected_prefix: None,
-        start_line: None,
-        end_line: None,
+        start_line: (op == "read").then_some(1),
+        end_line: (op == "read").then_some(1),
         line: None,
         create_dirs: false,
         wait_timeout_secs: 0,
@@ -137,19 +155,7 @@ async fn register_computer_test_runner(
 ) {
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: client_id.to_string(),
-            runner_instance_id: "computer-inst".to_string(),
-            runner_protocol_generation: RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some(owner.to_string()),
-            hostname: None,
-            host_context: None,
             capabilities: RunnerCapabilities {
                 shell: true,
                 file_read: true,
@@ -160,7 +166,7 @@ async fn register_computer_test_runner(
                 computer_text_input: text_input_capable,
                 ..Default::default()
             },
-            policy: None,
+            ..runner_registration(client_id, "computer-inst", Vec::new())
         }))
         .await
         .unwrap();
@@ -169,21 +175,8 @@ async fn register_computer_test_runner(
 async fn register_quic_v1_runner(registry: &RunnerRegistry, client_id: &str) {
     registry
         .register(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: client_id.to_string(),
-            runner_instance_id: "inst".to_string(),
-            runner_protocol_generation: RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
-            capabilities: async_job_capabilities(),
-            policy: None,
+            ..runner_registration(client_id, "inst", Vec::new())
         })
         .await
         .unwrap();
@@ -201,21 +194,9 @@ async fn register_instance_with_capabilities(
 ) -> Result<RunnerView, String> {
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: client_id.to_string(),
-            runner_instance_id: instance.to_string(),
-            runner_protocol_generation: RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
             capabilities,
-            policy: None,
+            ..runner_registration(client_id, instance, Vec::new())
         }))
         .await
 }
@@ -239,21 +220,8 @@ async fn register_with_instance(
 ) -> RunnerView {
     registry
         .register(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: client_id.to_string(),
-            runner_instance_id: instance.to_string(),
-            runner_protocol_generation: RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
-            capabilities: async_job_capabilities(),
-            policy: None,
+            ..runner_registration(client_id, instance, Vec::new())
         })
         .await
         .unwrap()
@@ -297,10 +265,14 @@ mod abandoned_sync;
 mod apply_patch;
 #[path = "tests/apply_text_edit_line_scope.rs"]
 mod apply_text_edit_line_scope;
+#[path = "tests/apply_text_edit_local_guard.rs"]
+mod apply_text_edit_local_guard;
 #[path = "tests/apply_text_edit_occurrence.rs"]
 mod apply_text_edit_occurrence;
 #[path = "tests/artifact_export.rs"]
 mod artifact_export;
+#[path = "tests/browser.rs"]
+mod browser;
 #[path = "tests/capabilities.rs"]
 mod capabilities;
 #[path = "tests/computer_accessibility.rs"]
@@ -309,6 +281,7 @@ mod computer_accessibility;
 mod computer_control;
 #[path = "tests/computer_observe.rs"]
 mod computer_observe;
+mod computer_post_observation;
 #[path = "tests/computer_snapshot_artifact.rs"]
 mod computer_snapshot_artifact;
 #[path = "tests/computer_text_input.rs"]
@@ -317,24 +290,40 @@ mod computer_text_input;
 mod connection_lease;
 #[path = "tests/disconnect_reconciliation.rs"]
 mod disconnect_reconciliation;
+#[path = "tests/execution_admission.rs"]
+mod execution_admission;
 #[path = "tests/file_validation.rs"]
 mod file_validation;
 #[path = "tests/instance_lease.rs"]
 mod instance_lease;
 #[path = "tests/internal_posix.rs"]
 mod internal_posix;
+#[path = "tests/job_handoff.rs"]
+mod job_handoff;
+#[path = "tests/job_index.rs"]
+mod job_index;
 #[path = "tests/job_lifecycle.rs"]
 mod job_lifecycle;
 #[path = "tests/job_log_wait.rs"]
 mod job_log_wait;
 #[path = "tests/lsp.rs"]
 mod lsp;
+#[path = "tests/maintenance.rs"]
+mod maintenance;
 #[path = "tests/mcp_gateway.rs"]
 mod mcp_gateway;
 #[path = "tests/plugin_gateway.rs"]
 mod plugin_gateway;
 #[path = "tests/polling.rs"]
 mod polling;
+#[path = "tests/project_build.rs"]
+mod project_build;
+#[path = "tests/project_dependency_policy.rs"]
+mod project_dependency_policy;
+#[path = "tests/project_file_read.rs"]
+mod project_file_read;
+#[path = "tests/project_format.rs"]
+mod project_format;
 #[path = "tests/project_inventory.rs"]
 mod project_inventory;
 #[path = "tests/project_projection.rs"]
@@ -351,6 +340,8 @@ mod quic_queueing;
 mod raw_shell;
 #[path = "tests/registration_projection.rs"]
 mod registration_projection;
+#[path = "tests/request_cleanup.rs"]
+mod request_cleanup;
 #[path = "tests/run_enqueue.rs"]
 mod run_enqueue;
 #[path = "tests/runner_config.rs"]
@@ -367,3 +358,5 @@ mod skills;
 mod ssh_resource;
 #[path = "tests/structured_file_delete.rs"]
 mod structured_file_delete;
+#[path = "tests/throughput_telemetry.rs"]
+mod throughput_telemetry;

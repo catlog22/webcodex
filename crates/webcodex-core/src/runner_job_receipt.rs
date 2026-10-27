@@ -41,13 +41,17 @@ impl RetainedJobReceipt {
             || !text(&snapshot.job_id, 128)
             || !text(&snapshot.request_id, 128)
             || !text(&self.kind, 128)
-            || !matches!(self.kind.as_str(), "shell" | "run_process" | "run_script")
+            || !matches!(
+                self.kind.as_str(),
+                "shell" | "project_build" | "project_format" | "run_process" | "run_script"
+            )
             || self.terminal_observed_at <= 0
             || self.terminal_observed_at > now
-            || self.expires_at
-                != self
-                    .terminal_observed_at
-                    .saturating_add(JOB_TERMINAL_RETENTION_SECS)
+            // Accept the exact pre-24h retention contract without extending
+            // its persisted deadline. Other durations remain invalid.
+            || ![15 * 60, JOB_TERMINAL_RETENTION_SECS].into_iter().any(|ttl| {
+                self.expires_at == self.terminal_observed_at.saturating_add(ttl)
+            })
             || self.expires_at <= now
         {
             return Err("invalid receipt identity or deadline");
@@ -78,10 +82,36 @@ impl RetainedJobReceipt {
             // Validation identity may contain exact argv. Receipts deliberately
             // retain only step names/progress, never executable validation plans.
             || snapshot.context.validation.is_some()
+            // Test-count evidence is meaningful only when bound to the exact
+            // structured Cargo validation identity, which receipts intentionally
+            // do not retain. Reject injected/drifted receipt payloads rather than
+            // hydrating provenance-free correctness evidence.
+            || snapshot.test_count_evidence.is_some()
             || snapshot.context.structured_execution.as_ref().is_some_and(|metadata| !metadata.is_valid() || metadata.execution_source == "run_detached_process")
         {
             return Err("invalid receipt terminal snapshot");
         }
+        if self.kind == "project_format"
+            && snapshot.context.structured_execution.as_ref()
+                != Some(&crate::project_format::structured_metadata())
+        {
+            return Err("invalid format receipt context");
+        }
+        crate::project_build::validate_build_artifact_report(
+            &self.kind,
+            &snapshot.status,
+            snapshot.exit_code,
+            snapshot.command_execution_state,
+            snapshot.build_artifacts.as_deref(),
+        )?;
+        crate::project_format::validate_mutation_report(
+            &self.kind,
+            &snapshot.status,
+            snapshot.exit_code,
+            snapshot.command_execution_state,
+            snapshot.format_mutation,
+            snapshot.error.as_deref(),
+        )?;
         let context = &snapshot.context;
         if context.runtime_project_id.as_ref().is_some_and(|project| {
             project
@@ -121,7 +151,7 @@ impl RetainedJobReceipt {
             || context
                 .validation_steps
                 .iter()
-                .any(|step| !matches!(step.as_str(), "format" | "check" | "test"))
+                .any(|step| !matches!(step.as_str(), "format" | "check" | "lint" | "test"))
             || snapshot
                 .validation_progress
                 .as_ref()

@@ -23,6 +23,7 @@ async fn post_session_message(
             reply_to: None,
             priority,
             requires_ack: false,
+            delivery_key: None,
         })
         .await;
     assert!(result.success, "{:?}", result.error);
@@ -42,13 +43,14 @@ async fn read_agent_file_for_session(
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
-                        session_id: session_id,
+                        session_id,
                         with_line_numbers: None,
                         max_result_bytes: None,
                     },
@@ -96,11 +98,12 @@ async fn read_files_with_session_id_records_event_without_content() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
                         session_id: Some(session_id),
                         with_line_numbers: Some(true),
@@ -168,11 +171,12 @@ async fn read_files_without_session_id_omits_session_telemetry() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::ReadFiles {
-                        project: project,
+                        project,
                         items: vec![crate::tool_runtime::ReadFilesItem {
                             path: "README.md".to_string(),
                             start_line: None,
                             limit: None,
+                            expected_read_revision: None,
                         }],
                         session_id: None,
                         with_line_numbers: None,
@@ -246,7 +250,10 @@ async fn session_inbox_hint_reports_open_guidance_without_text() {
     assert_eq!(hint["open_counts"]["todo"], 0);
     assert_eq!(hint["open_counts"]["risk"], 0);
     assert_eq!(hint["highest_priority"], "high");
-    assert_eq!(hint["suggested_next_tool"], "session_discussion_summary");
+    assert_eq!(
+        hint["suggested_next_tool"],
+        "read_session_discussion_summary"
+    );
     assert!(hint.get("attention_required").is_none());
     assert!(hint.get("attention_reason").is_none());
     assert!(hint.get("attention_instruction").is_none());
@@ -294,13 +301,10 @@ async fn high_ack_guidance_hint_is_actionable_and_inner_recorder_projects_attent
     let raw_hint =
         serde_json::to_value(runtime.sessions.inbox_hint(&session.session_id).unwrap()).unwrap();
     assert_eq!(raw_hint["attention_required"], true);
-    assert_eq!(
-        raw_hint["attention_reason"],
-        "high_priority_guidance_requires_ack"
-    );
+    assert_eq!(raw_hint["attention_reason"], "session_message_requires_ack");
     assert_eq!(
         raw_hint["attention_instruction"],
-        "High-priority Session guidance is pending. Read session_discussion_summary before continuing."
+        "A Session message requiring acknowledgement is pending. Read read_session_discussion_summary before continuing."
     );
 
     // No outer recording_session_id is supplied here. The existing authorized
@@ -315,7 +319,10 @@ async fn high_ack_guidance_hint_is_actionable_and_inner_recorder_projects_attent
 
     assert!(result.success, "{:?}", result.error);
     let hint = &result.output["session_hint"];
-    assert_eq!(hint["suggested_next_tool"], "session_discussion_summary");
+    assert_eq!(
+        hint["suggested_next_tool"],
+        "read_session_discussion_summary"
+    );
     assert!(hint.get("attention_required").is_none());
     assert!(hint.get("attention_reason").is_none());
     assert!(hint.get("attention_instruction").is_none());
@@ -429,7 +436,10 @@ async fn session_inbox_hint_counts_question_todo_and_risk() {
     assert_eq!(hint["open_counts"]["todo"], 1);
     assert_eq!(hint["open_counts"]["risk"], 1);
     assert_eq!(hint["highest_priority"], "normal");
-    assert_eq!(hint["suggested_next_tool"], "session_discussion_summary");
+    assert_eq!(
+        hint["suggested_next_tool"],
+        "read_session_discussion_summary"
+    );
     assert!(hint.get("attention_required").is_none());
     assert!(hint.get("attention_reason").is_none());
     assert!(hint.get("attention_instruction").is_none());
@@ -733,7 +743,7 @@ async fn closed_session_blocks_write_tools_and_message_post() {
             content: "blocked".to_string(),
             session_id: Some(session.session_id.clone()),
             overwrite: None,
-            expected_sha256: None,
+            expected_read_revision: None,
         })
         .await;
     assert!(!write.success);
@@ -750,6 +760,7 @@ async fn closed_session_blocks_write_tools_and_message_post() {
             reply_to: None,
             priority: SessionMessagePriority::Normal,
             requires_ack: false,
+            delivery_key: None,
         })
         .await;
     assert!(!post.success);
@@ -786,6 +797,7 @@ async fn finish_coding_task_does_not_auto_close_session() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::FinishCodingTask {
+                        outputs: Vec::new(),
                         project,
                         session_id,
                         summary_only: true,

@@ -3,22 +3,32 @@ use super::*;
 #[test]
 fn tool_specs_git_log_schema() {
     let specs = registered_tool_specs();
-    let spec = spec_named(&specs, "git_log");
+    let spec = spec_named(&specs, "read_git_log");
     let required = required_fields(spec);
     assert_eq!(required, vec!["project".to_string()]);
     let props = spec.input_schema["properties"].as_object().unwrap();
     assert_schema_fields!(
         props,
-        "git_log input schema",
-        present: ["project", "limit", "skip", "session_id"]
+        "read_git_log input schema",
+        present: ["project", "head_commit", "limit", "skip", "session_id"]
     );
     let output_props = spec.output_schema["properties"]["output"]["properties"]
         .as_object()
         .unwrap();
     assert_schema_fields!(
         output_props,
-        "git_log output schema",
-        present: ["project", "limit", "skip", "count", "truncated", "commits"]
+        "read_git_log output schema",
+        present: [
+            "project",
+            "head_commit",
+            "limit",
+            "skip",
+            "count",
+            "truncated",
+            "next_skip",
+            "commits",
+            "suggested_call"
+        ]
     );
     assert!(
         spec.description.chars().count() <= crate::tool_runtime::MODEL_TOOL_DESCRIPTION_MAX_CHARS
@@ -28,13 +38,13 @@ fn tool_specs_git_log_schema() {
 #[test]
 fn tool_specs_show_changes_schema() {
     let specs = registered_tool_specs();
-    let spec = spec_named(&specs, "show_changes");
+    let spec = spec_named(&specs, "read_workspace_changes");
     let required = required_fields(spec);
     assert_eq!(required, vec!["project".to_string()]);
     let props = spec.input_schema["properties"].as_object().unwrap();
     assert_schema_fields!(
         props,
-        "show_changes input schema",
+        "read_workspace_changes input schema",
         present: [
             "project",
             "session_id",
@@ -49,7 +59,7 @@ fn tool_specs_show_changes_schema() {
         .unwrap();
     assert_schema_fields!(
         output_props,
-        "show_changes output schema",
+        "read_workspace_changes output schema",
         present: [
             "project",
             "branch",
@@ -103,25 +113,31 @@ fn tool_specs_structured_validation_schema_and_output() {
         cargo_test_input["min_tests"]["maximum"],
         crate::runner_protocol::CARGO_TEST_MIN_TESTS_MAX
     );
+    // Cross-field execution-proof policy is canonical Runtime validation rather
+    // than Host-sensitive JSON-Schema conditionals. The structural schema admits
+    // these parseable shapes; pre-execution validation still rejects no_run with
+    // a positive test-count requirement before any Job is created.
     for valid in [
         serde_json::json!({"project": "agent:demo:repo"}),
         serde_json::json!({"project": "agent:demo:repo", "no_run": true}),
         serde_json::json!({"project": "agent:demo:repo", "require_tests": true}),
         serde_json::json!({"project": "agent:demo:repo", "require_tests": false, "min_tests": 6}),
+        serde_json::json!({"project": "agent:demo:repo", "no_run": true, "require_tests": true}),
+        serde_json::json!({"project": "agent:demo:repo", "no_run": true, "min_tests": 1}),
     ] {
         crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
             &valid,
             &cargo_test.input_schema,
         )
-        .unwrap_or_else(|error| panic!("valid cargo_test input rejected: {valid}: {error}"));
+        .unwrap_or_else(|error| {
+            panic!("valid structural cargo_test input rejected: {valid}: {error}")
+        });
     }
     for invalid in [
         serde_json::json!({"project": "agent:demo:repo", "min_tests": 0}),
         serde_json::json!({"project": "agent:demo:repo", "min_tests": -1}),
         serde_json::json!({"project": "agent:demo:repo", "min_tests": 1.5}),
         serde_json::json!({"project": "agent:demo:repo", "min_tests": crate::runner_protocol::CARGO_TEST_MIN_TESTS_MAX + 1}),
-        serde_json::json!({"project": "agent:demo:repo", "no_run": true, "require_tests": true}),
-        serde_json::json!({"project": "agent:demo:repo", "no_run": true, "min_tests": 1}),
     ] {
         assert!(
             crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
@@ -129,7 +145,7 @@ fn tool_specs_structured_validation_schema_and_output() {
                 &cargo_test.input_schema
             )
             .is_err(),
-            "invalid cargo_test input passed schema: {invalid}"
+            "structurally invalid cargo_test input passed schema: {invalid}"
         );
     }
     let cargo_test_output = cargo_test.output_schema["properties"]["output"]["properties"]
@@ -150,19 +166,11 @@ fn tool_specs_structured_validation_schema_and_output() {
             "complete_summary",
             "output_truncated",
             "partial_harness_summary",
-            "no_complete_summary"
+            "no_complete_summary",
+            "incomplete_stream"
         ])
     );
-    let openapi = crate::openapi::build_openapi_spec();
-    let action_properties = &openapi["paths"]["/api/actions/cargo_test"]["post"]["requestBody"]
-        ["content"]["application/json"]["schema"]["properties"];
-    assert_eq!(action_properties["require_tests"]["type"], "boolean");
-    assert_eq!(action_properties["min_tests"]["type"], "integer");
-    assert_eq!(action_properties["min_tests"]["minimum"], 1);
-    assert_eq!(
-        action_properties["min_tests"]["maximum"],
-        crate::runner_protocol::CARGO_TEST_MIN_TESTS_MAX
-    );
+
     let go_props = spec_named(&specs, "go_test").input_schema["properties"]
         .as_object()
         .unwrap();
@@ -202,33 +210,23 @@ fn schema_tree_requires_field(schema: &serde_json::Value, field: &str) -> bool {
 }
 
 #[test]
-fn job_activity_is_required_nullable_on_stable_model_surfaces() {
+fn job_inventory_activity_is_sparse_but_observation_activity_is_required() {
     let specs = registered_tool_specs();
-    for name in [
-        "run_process",
-        "run_script",
-        "run_shell",
-        "cargo_fmt",
-        "cargo_check",
-        "cargo_test",
-        "go_test",
-        "list_jobs",
-        "observe_jobs",
-    ] {
-        let spec = spec_named(&specs, name);
-        assert!(
-            schema_tree_requires_field(&spec.output_schema, "activity"),
-            "{name} must require activity on its stable Job projection"
-        );
-    }
-
     let list = spec_named(&specs, "list_jobs");
     let summary = &list.output_schema["properties"]["output"]["properties"]["jobs"]["items"];
-    assert!(summary["required"]
+    assert!(!summary["required"]
         .as_array()
         .unwrap()
         .iter()
         .any(|field| field == "activity"));
+    assert!(summary["properties"]["activity"].is_object());
+    assert_eq!(summary["properties"]["command_summary"]["type"], "string");
+
+    let observe = spec_named(&specs, "observe_jobs");
+    assert!(
+        schema_tree_requires_field(&observe.output_schema, "activity"),
+        "detailed Job observation must retain required activity"
+    );
 
     let observe = spec_named(&specs, "observe_jobs");
     let observation = &observe.output_schema["properties"]["output"]["anyOf"][0]["properties"]
@@ -243,21 +241,11 @@ fn job_activity_is_required_nullable_on_stable_model_surfaces() {
 #[test]
 fn tool_specs_schema_spot_checks() {
     let cases: Vec<(&str, Vec<&str>, Vec<&str>)> = vec![
-        (
-            "apply_patch",
-            vec!["project", "patch"],
-            vec!["dry_run", "matching_mode", "session_id"],
-        ),
-        (
-            "apply_unified_diff",
-            vec!["project", "diff"],
-            vec!["deny_sensitive_paths", "session_id"],
-        ),
         ("delete_project_files", vec!["project", "paths"], vec![]),
-        ("git_restore_paths", vec!["project", "paths"], vec![]),
+        ("restore_git_paths", vec!["project", "paths"], vec![]),
         ("discard_untracked", vec!["project", "paths"], vec![]),
         (
-            "project_overview",
+            "read_project_overview",
             vec!["project"],
             vec!["path", "max_depth", "limit"],
         ),
@@ -300,6 +288,38 @@ fn tool_specs_schema_spot_checks() {
                 <= crate::tool_runtime::MODEL_TOOL_DESCRIPTION_MAX_CHARS,
             "{name}: description too long"
         );
+    }
+
+    let specialists = crate::tool_runtime::registry::exact_manifest_specialist_tool_specs();
+    for (name, expected_required, expected_optional) in [
+        (
+            "apply_patch",
+            vec!["project", "patch"],
+            vec!["dry_run", "matching_mode", "session_id"],
+        ),
+        (
+            "apply_unified_diff",
+            vec!["project", "diff"],
+            vec!["deny_sensitive_paths", "session_id"],
+        ),
+    ] {
+        let spec = spec_named(&specialists, name);
+        let required = required_fields(spec);
+        assert_eq!(
+            required
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected_required
+                .into_iter()
+                .map(str::to_string)
+                .collect::<std::collections::BTreeSet<_>>()
+        );
+        for field in expected_optional {
+            assert!(
+                spec.input_schema["properties"].get(field).is_some(),
+                "{name}.{field}"
+            );
+        }
     }
 
     let spec = spec_named(&specs, "search_project_texts");

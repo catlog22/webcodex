@@ -9,8 +9,68 @@ use crate::db::{
 use serde::Serialize;
 use serde_json::{json, to_value};
 use sha2::{Digest, Sha256};
+use webcodex_tool_contracts::tool_call::{
+    ConsumeAgentDeliveriesInput, CreateAgentIdentityInput, CreateConversationInput,
+    DetachAgentEndpointInput, ListAgentIdentitiesInput, ListAgentInboxInput,
+    ListConversationsInput, PostConversationMessageInput, ReadConversationInput,
+    RotateAgentContinuationEndpointInput, UpdateAgentIdentityInput,
+};
 
 const DEFAULT_COMMUNICATION_LIST_LIMIT: usize = 50;
+
+#[derive(Serialize)]
+struct AgentIdentityReadinessProjection {
+    #[serde(flatten)]
+    agent: crate::db::DurableAgentIdentity,
+    production_auto_resume_available: bool,
+    agent_continuation_ref: Option<String>,
+}
+
+#[derive(Serialize)]
+struct EndpointMutationProjection {
+    #[serde(flatten)]
+    mutation: crate::db::AgentEndpointMutation,
+    agent_continuation_ref: Option<String>,
+}
+
+const AGENT_CONTINUATION_REF_PREFIX: &str = "~ac";
+
+fn format_agent_continuation_ref(index: u64) -> String {
+    format!("{AGENT_CONTINUATION_REF_PREFIX}{index}")
+}
+
+fn parse_agent_continuation_ref(raw: &str) -> Option<u64> {
+    let digits = raw.strip_prefix(AGENT_CONTINUATION_REF_PREFIX)?;
+    if digits.is_empty()
+        || digits.len() > 19
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+        || (digits.len() > 1 && digits.starts_with('0'))
+    {
+        return None;
+    }
+    let index = digits.parse::<u64>().ok()?;
+    (index > 0).then_some(index)
+}
+
+fn selector_input_error(error_kind: &str, message: &str) -> ToolResult {
+    ToolResult::err_with_output(
+        message,
+        json!({
+            "error_kind": error_kind,
+            "state_changed": false,
+        }),
+    )
+    .with_recovery(RecoveryKind::FixInput)
+}
+
+#[derive(Serialize)]
+struct AgentIdentityReadinessPage {
+    total_count: i64,
+    offset: usize,
+    next_offset: Option<usize>,
+    truncated: bool,
+    agents: Vec<AgentIdentityReadinessProjection>,
+}
 
 fn communication_list_limit(limit: Option<usize>) -> usize {
     limit
@@ -235,11 +295,7 @@ impl ToolRuntime {
     pub(crate) fn create_agent_identity(
         &self,
         auth: Option<&AuthContext>,
-        handle: String,
-        display_name: String,
-        description: Option<String>,
-        specialty_labels: Vec<String>,
-        idempotency_key: String,
+        input: CreateAgentIdentityInput,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
@@ -251,11 +307,11 @@ impl ToolRuntime {
         match db.create_agent_identity(
             &principal,
             NewAgentIdentity {
-                handle,
-                display_name,
-                description: description.unwrap_or_default(),
-                specialty_labels,
-                idempotency_key,
+                handle: input.handle,
+                display_name: input.display_name,
+                description: input.description.unwrap_or_default(),
+                specialty_labels: input.specialty_labels,
+                idempotency_key: input.idempotency_key,
             },
         ) {
             Ok(result) => serialized_success(result),
@@ -266,9 +322,7 @@ impl ToolRuntime {
     pub(crate) fn list_agent_identities(
         &self,
         auth: Option<&AuthContext>,
-        agent_id: Option<String>,
-        offset: Option<usize>,
-        limit: Option<usize>,
+        input: ListAgentIdentitiesInput,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
@@ -279,25 +333,48 @@ impl ToolRuntime {
         };
         match db.list_agent_identities(
             &principal,
-            agent_id.as_deref(),
-            offset.unwrap_or(0),
-            communication_list_limit(limit),
+            input.agent_id.as_deref(),
+            input.offset.unwrap_or(0),
+            communication_list_limit(input.limit),
         ) {
-            Ok(result) => serialized_success(result),
+            Ok(result) => {
+                let agents = result
+                    .agents
+                    .into_iter()
+                    .map(|agent| {
+                        let production_auto_resume_available = agent.active_endpoint_count > 0
+                            && self.agent_continuations.as_ref().is_some_and(|controller| {
+                                controller.production_auto_resume_available(
+                                    &principal,
+                                    &agent.agent_id,
+                                    agent.current_controller_generation,
+                                )
+                            });
+                        let agent_continuation_ref =
+                            self.listed_agent_continuation_ref(&principal, &agent);
+                        AgentIdentityReadinessProjection {
+                            agent,
+                            production_auto_resume_available,
+                            agent_continuation_ref,
+                        }
+                    })
+                    .collect();
+                serialized_success(AgentIdentityReadinessPage {
+                    total_count: result.total_count,
+                    offset: result.offset,
+                    next_offset: result.next_offset,
+                    truncated: result.truncated,
+                    agents,
+                })
+            }
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn update_agent_identity(
         &self,
         auth: Option<&AuthContext>,
-        agent_id: String,
-        expected_profile_revision: i64,
-        handle: Option<String>,
-        display_name: Option<String>,
-        description: Option<String>,
-        specialty_labels: Option<Vec<String>>,
+        input: UpdateAgentIdentityInput,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
@@ -308,13 +385,13 @@ impl ToolRuntime {
         };
         match db.update_agent_identity(
             &principal,
-            &agent_id,
-            expected_profile_revision,
+            &input.agent_id,
+            input.expected_profile_revision,
             AgentProfilePatch {
-                handle,
-                display_name,
-                description,
-                specialty_labels,
+                handle: input.handle,
+                display_name: input.display_name,
+                description: input.description,
+                specialty_labels: input.specialty_labels,
             },
         ) {
             Ok(result) => serialized_success(result),
@@ -322,14 +399,19 @@ impl ToolRuntime {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attach_agent_endpoint(
         &self,
         auth: Option<&AuthContext>,
-        agent_id: String,
-        host: String,
-        client_attachment_id: Option<String>,
-        idempotency_key: String,
+        input: RotateAgentContinuationEndpointInput,
+    ) -> ToolResult {
+        self.attach_agent_endpoint_for_window(auth, None, input)
+    }
+
+    pub(crate) fn attach_agent_endpoint_for_window(
+        &self,
+        auth: Option<&AuthContext>,
+        window: Option<&crate::client_window::ClientWindow>,
+        input: RotateAgentContinuationEndpointInput,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
@@ -338,18 +420,26 @@ impl ToolRuntime {
         let Some(db) = self.communication_db.as_ref() else {
             return communication_store_unavailable();
         };
-        match db.attach_agent_endpoint(
+        // Only authenticated request-scoped ChatGPT ClientWindow evidence can
+        // reserve first-mount recovery. A bare principal, a caller-supplied
+        // attachment label, or an unrelated MCP session is never a substitute.
+        // This does not wake a model or mark the newly attached Endpoint live.
+        let origin_window_key = window
+            .filter(|window| window.source() == "openai-session")
+            .map(crate::client_window::ClientWindow::key);
+        match db.attach_agent_endpoint_with_host_window(
             &principal,
             NewAgentEndpoint {
-                agent_id,
-                host,
-                client_attachment_id,
+                agent_id: input.agent_id,
+                host: input.host,
+                client_attachment_id: input.client_attachment_id,
                 // Public/model/Console attachment cannot self-assert Host
                 // continuation capability. Only process-local adapter
                 // registration may transition this field to true.
                 wake_capable: false,
-                idempotency_key,
+                idempotency_key: input.idempotency_key,
             },
+            origin_window_key,
         ) {
             Ok(result) => {
                 if result.state_changed {
@@ -361,7 +451,16 @@ impl ToolRuntime {
                         );
                     }
                 }
-                serialized_success(result)
+                let agent_continuation_ref = self.issue_agent_continuation_ref(
+                    &principal,
+                    &result.endpoint.agent_id,
+                    &result.endpoint.endpoint_id,
+                    result.endpoint.controller_generation,
+                );
+                serialized_success(EndpointMutationProjection {
+                    mutation: result,
+                    agent_continuation_ref,
+                })
             }
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
         }
@@ -451,6 +550,137 @@ impl ToolRuntime {
             })),
             Err(error) => communication_error(error, RecoveryKind::Reconcile),
         }
+    }
+
+    fn issue_agent_continuation_ref(
+        &self,
+        principal: &crate::db::CommunicationPrincipal,
+        agent_id: &str,
+        endpoint_id: &str,
+        controller_generation: i64,
+    ) -> Option<String> {
+        let db = self.communication_db.as_ref()?;
+        match db.get_or_create_agent_continuation_reference(
+            principal,
+            agent_id,
+            endpoint_id,
+            controller_generation,
+            chrono::Utc::now().timestamp_millis(),
+        ) {
+            Ok(record) => Some(format_agent_continuation_ref(record.ref_index)),
+            Err(error) => {
+                tracing::warn!(
+                    error_kind = error.code(),
+                    "agent continuation ref was not issued"
+                );
+                None
+            }
+        }
+    }
+
+    fn listed_agent_continuation_ref(
+        &self,
+        principal: &crate::db::CommunicationPrincipal,
+        agent: &crate::db::DurableAgentIdentity,
+    ) -> Option<String> {
+        if agent.active_endpoint_count != 1 || agent.current_controller_generation < 1 {
+            return None;
+        }
+        let db = self.communication_db.as_ref()?;
+        let live = match db.current_live_continuation_endpoint(principal, &agent.agent_id) {
+            Ok(live) => live,
+            Err(error) => {
+                tracing::warn!(
+                    error_kind = error.code(),
+                    "agent continuation ref was not issued for the listed Agent"
+                );
+                return None;
+            }
+        };
+        let (endpoint_id, generation) = live?;
+        if generation != agent.current_controller_generation {
+            return None;
+        }
+        self.issue_agent_continuation_ref(principal, &agent.agent_id, &endpoint_id, generation)
+    }
+
+    fn resolve_agent_continuation_selector(
+        &self,
+        auth: Option<&AuthContext>,
+        agent_continuation_ref: Option<String>,
+        agent_id: Option<String>,
+        endpoint_id: Option<String>,
+        expected_controller_generation: Option<i64>,
+    ) -> Result<(String, String, i64), ToolResult> {
+        let tuple_supplied =
+            agent_id.is_some() || endpoint_id.is_some() || expected_controller_generation.is_some();
+        if let Some(agent_continuation_ref) = agent_continuation_ref {
+            if tuple_supplied {
+                return Err(selector_input_error(
+                    "ambiguous_agent_continuation_selector",
+                    "Pass agent_continuation_ref or the exact agent_id, endpoint_id, and expected_controller_generation, not both.",
+                ));
+            }
+            let ref_index = parse_agent_continuation_ref(&agent_continuation_ref)
+                .ok_or_else(|| {
+                    selector_input_error(
+                        "invalid_agent_continuation_ref",
+                        "agent_continuation_ref must be a server-issued ~ac selector from rotate_agent_continuation_endpoint or list_agent_identities.",
+                    )
+                })?;
+            let principal = communication_principal(auth)?;
+            let Some(db) = self.communication_db.as_ref() else {
+                return Err(communication_store_unavailable());
+            };
+            let record = match db.lookup_agent_continuation_reference(&principal, ref_index) {
+                Ok(record) => record,
+                Err(error) => {
+                    return Err(communication_error(error, RecoveryKind::UserAction));
+                }
+            };
+            let Some(record) = record else {
+                return Err(selector_input_error(
+                    "unknown_agent_continuation_ref",
+                    "agent_continuation_ref does not name a continuation for this caller. Read list_agent_identities or rotate_agent_continuation_endpoint again.",
+                ));
+            };
+            return Ok((
+                record.agent_id,
+                record.endpoint_id,
+                record.controller_generation,
+            ));
+        }
+        match (agent_id, endpoint_id, expected_controller_generation) {
+            (Some(agent_id), Some(endpoint_id), Some(expected_controller_generation)) => {
+                Ok((agent_id, endpoint_id, expected_controller_generation))
+            }
+            _ => Err(selector_input_error(
+                "incomplete_agent_continuation_selector",
+                "Pass agent_continuation_ref or all of agent_id, endpoint_id, and expected_controller_generation.",
+            )),
+        }
+    }
+
+    pub(crate) fn present_agent_continuation_with_selector(
+        &self,
+        auth: Option<&AuthContext>,
+        agent_continuation_ref: Option<String>,
+        agent_id: Option<String>,
+        endpoint_id: Option<String>,
+        expected_controller_generation: Option<i64>,
+    ) -> ToolResult {
+        let (agent_id, endpoint_id, expected_controller_generation) = match self
+            .resolve_agent_continuation_selector(
+                auth,
+                agent_continuation_ref,
+                agent_id,
+                endpoint_id,
+                expected_controller_generation,
+            ) {
+            Ok(tuple) => tuple,
+            Err(result) => return result,
+        };
+        self.present_agent_continuation(auth, agent_id, endpoint_id, expected_controller_generation)
     }
 
     pub(crate) fn present_agent_continuation(
@@ -1057,7 +1287,7 @@ impl ToolRuntime {
     pub(crate) fn detach_agent_endpoint(
         &self,
         auth: Option<&AuthContext>,
-        endpoint_id: String,
+        input: DetachAgentEndpointInput,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
@@ -1066,7 +1296,7 @@ impl ToolRuntime {
         let Some(db) = self.communication_db.as_ref() else {
             return communication_store_unavailable();
         };
-        match db.detach_agent_endpoint(&principal, &endpoint_id) {
+        match db.detach_agent_endpoint(&principal, &input.endpoint_id) {
             Ok(result) => {
                 if let Some(controller) = self.agent_continuations.as_ref() {
                     controller.endpoint_detached(
@@ -1075,7 +1305,10 @@ impl ToolRuntime {
                         result.endpoint.controller_generation,
                     );
                 }
-                serialized_success(result)
+                serialized_success(EndpointMutationProjection {
+                    mutation: result,
+                    agent_continuation_ref: None,
+                })
             }
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
         }
@@ -1084,9 +1317,7 @@ impl ToolRuntime {
     pub(crate) fn create_conversation(
         &self,
         auth: Option<&AuthContext>,
-        title: Option<String>,
-        agent_ids: Vec<String>,
-        idempotency_key: String,
+        input: CreateConversationInput,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
@@ -1098,9 +1329,9 @@ impl ToolRuntime {
         match db.create_conversation(
             &principal,
             NewConversation {
-                title,
-                agent_ids,
-                idempotency_key,
+                title: input.title,
+                agent_ids: input.agent_ids,
+                idempotency_key: input.idempotency_key,
             },
         ) {
             Ok(result) => serialized_success(result),
@@ -1108,88 +1339,73 @@ impl ToolRuntime {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn list_conversations(
         &self,
         auth: Option<&AuthContext>,
-        agent_id: Option<String>,
-        endpoint_id: Option<String>,
-        expected_controller_generation: Option<i64>,
-        offset: Option<usize>,
-        limit: Option<usize>,
+        input: ListConversationsInput,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
             Err(result) => return result,
         };
-        let access =
-            match access_from_endpoint(agent_id, endpoint_id, expected_controller_generation) {
-                Ok(access) => access,
-                Err(result) => return result,
-            };
+        let access = match access_from_endpoint(
+            input.agent_id,
+            input.endpoint_id,
+            input.expected_controller_generation,
+        ) {
+            Ok(access) => access,
+            Err(result) => return result,
+        };
         let Some(db) = self.communication_db.as_ref() else {
             return communication_store_unavailable();
         };
         match db.list_conversations(
             &principal,
             &access,
-            offset.unwrap_or(0),
-            communication_list_limit(limit),
+            input.offset.unwrap_or(0),
+            communication_list_limit(input.limit),
         ) {
             Ok(result) => serialized_success(result),
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn read_conversation(
         &self,
         auth: Option<&AuthContext>,
-        conversation_id: String,
-        agent_id: Option<String>,
-        endpoint_id: Option<String>,
-        expected_controller_generation: Option<i64>,
-        after_seq: Option<i64>,
-        limit: Option<usize>,
+        input: ReadConversationInput,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
             Err(result) => return result,
         };
-        let access =
-            match access_from_endpoint(agent_id, endpoint_id, expected_controller_generation) {
-                Ok(access) => access,
-                Err(result) => return result,
-            };
+        let access = match access_from_endpoint(
+            input.agent_id,
+            input.endpoint_id,
+            input.expected_controller_generation,
+        ) {
+            Ok(access) => access,
+            Err(result) => return result,
+        };
         let Some(db) = self.communication_db.as_ref() else {
             return communication_store_unavailable();
         };
         match db.read_conversation(
             &principal,
             &access,
-            &conversation_id,
-            after_seq.unwrap_or(0),
-            communication_list_limit(limit),
+            &input.conversation_id,
+            input.after_seq.unwrap_or(0),
+            communication_list_limit(input.limit),
         ) {
             Ok(result) => serialized_success(result),
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn post_conversation_message(
         &self,
         auth: Option<&AuthContext>,
-        conversation_id: String,
-        body: String,
-        author_agent_id: Option<String>,
-        endpoint_id: Option<String>,
-        expected_controller_generation: Option<i64>,
-        recipient_agent_ids: Option<Vec<String>>,
-        reply_to: Option<String>,
-        idempotency_key: Option<String>,
-        wake_reply_id: Option<String>,
-        reply_operation_index: Option<i64>,
+        input: PostConversationMessageInput,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
@@ -1201,16 +1417,16 @@ impl ToolRuntime {
         match db.post_conversation_message(
             &principal,
             NewConversationMessage {
-                conversation_id,
-                body,
-                author_agent_id,
-                endpoint_id,
-                expected_controller_generation,
-                recipient_agent_ids,
-                reply_to,
-                idempotency_key,
-                wake_reply_id,
-                reply_operation_index,
+                conversation_id: input.conversation_id,
+                body: input.body,
+                author_agent_id: input.author_agent_id,
+                endpoint_id: input.endpoint_id,
+                expected_controller_generation: input.expected_controller_generation,
+                recipient_agent_ids: input.recipient_agent_ids,
+                reply_to: input.reply_to,
+                idempotency_key: input.idempotency_key,
+                wake_reply_id: input.wake_reply_id,
+                reply_operation_index: input.reply_operation_index,
             },
         ) {
             Ok(result) => {
@@ -1238,11 +1454,7 @@ impl ToolRuntime {
     pub(crate) fn list_agent_inbox(
         &self,
         auth: Option<&AuthContext>,
-        agent_id: String,
-        endpoint_id: String,
-        expected_controller_generation: i64,
-        after_delivery_order: Option<i64>,
-        limit: Option<usize>,
+        input: ListAgentInboxInput,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
@@ -1253,11 +1465,11 @@ impl ToolRuntime {
         };
         match db.list_agent_inbox(
             &principal,
-            &agent_id,
-            &endpoint_id,
-            expected_controller_generation,
-            after_delivery_order.unwrap_or(0),
-            communication_list_limit(limit),
+            &input.agent_id,
+            &input.endpoint_id,
+            input.expected_controller_generation,
+            input.after_delivery_order.unwrap_or(0),
+            communication_list_limit(input.limit),
         ) {
             Ok(result) => serialized_success(result),
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
@@ -1267,10 +1479,7 @@ impl ToolRuntime {
     pub(crate) fn consume_agent_deliveries(
         &self,
         auth: Option<&AuthContext>,
-        agent_id: String,
-        endpoint_id: String,
-        expected_controller_generation: i64,
-        delivery_ids: Vec<String>,
+        input: ConsumeAgentDeliveriesInput,
     ) -> ToolResult {
         let principal = match communication_principal(auth) {
             Ok(principal) => principal,
@@ -1281,10 +1490,10 @@ impl ToolRuntime {
         };
         match db.consume_agent_deliveries(
             &principal,
-            &agent_id,
-            &endpoint_id,
-            expected_controller_generation,
-            delivery_ids,
+            &input.agent_id,
+            &input.endpoint_id,
+            input.expected_controller_generation,
+            input.delivery_ids,
         ) {
             Ok(result) => serialized_success(result),
             Err(error) => communication_error(error, RecoveryKind::RetrySame),
@@ -1536,44 +1745,52 @@ mod tests {
 
         let created_agent = runtime.create_agent_identity(
             Some(&bob),
-            "bob-agent".to_string(),
-            "Bob Agent".to_string(),
-            Some("private profile".to_string()),
-            vec!["privacy".to_string()],
-            "bob-agent-create".to_string(),
+            CreateAgentIdentityInput {
+                handle: "bob-agent".to_string(),
+                display_name: "Bob Agent".to_string(),
+                description: Some("private profile".to_string()),
+                specialty_labels: vec!["privacy".to_string()],
+                idempotency_key: "bob-agent-create".to_string(),
+            },
         );
         assert!(created_agent.success, "{:?}", created_agent.error);
         let bob_agent_id = created_agent.output["agent"]["agent_id"]
             .as_str()
             .unwrap()
             .to_string();
-        let missing_agent = format!("wc_dagent_{}", "9".repeat(32));
+        let missing_agent = "wc_dagent_mZmZmZmZmZmZmZmZ".to_string();
 
         let foreign_agent = runtime.update_agent_identity(
             Some(&alice),
-            bob_agent_id.clone(),
-            1,
-            None,
-            None,
-            Some("probe".to_string()),
-            None,
+            UpdateAgentIdentityInput {
+                agent_id: bob_agent_id.clone(),
+                expected_profile_revision: 1,
+                handle: None,
+                display_name: None,
+                description: Some("probe".to_string()),
+                specialty_labels: None,
+            },
         );
         let missing_agent_result = runtime.update_agent_identity(
             Some(&alice),
-            missing_agent,
-            1,
-            None,
-            None,
-            Some("probe".to_string()),
-            None,
+            UpdateAgentIdentityInput {
+                agent_id: missing_agent,
+                expected_profile_revision: 1,
+                handle: None,
+                display_name: None,
+                description: Some("probe".to_string()),
+                specialty_labels: None,
+            },
         );
         assert_same_public_failure(foreign_agent, missing_agent_result, "agent_not_found");
 
         let created_conversation = runtime.create_conversation(
             Some(&bob),
-            Some("Bob private room".to_string()),
-            vec![bob_agent_id],
-            "bob-room-create".to_string(),
+            CreateConversationInput {
+                title: Some("Bob private room".to_string()),
+                agent_ids: vec![bob_agent_id],
+                idempotency_key: "bob-room-create".to_string(),
+            },
         );
         assert!(
             created_conversation.success,
@@ -1585,24 +1802,28 @@ mod tests {
             .as_str()
             .unwrap()
             .to_string();
-        let missing_conversation = format!("wc_conv_{}", "8".repeat(32));
+        let missing_conversation = "wc_conv_iIiIiIiIiIiIiIiI".to_string();
         let foreign_conversation = runtime.read_conversation(
             Some(&alice),
-            bob_conversation_id,
-            None,
-            None,
-            None,
-            Some(0),
-            Some(10),
+            ReadConversationInput {
+                conversation_id: bob_conversation_id,
+                agent_id: None,
+                endpoint_id: None,
+                expected_controller_generation: None,
+                after_seq: Some(0),
+                limit: Some(10),
+            },
         );
         let missing_conversation_result = runtime.read_conversation(
             Some(&alice),
-            missing_conversation,
-            None,
-            None,
-            None,
-            Some(0),
-            Some(10),
+            ReadConversationInput {
+                conversation_id: missing_conversation,
+                agent_id: None,
+                endpoint_id: None,
+                expected_controller_generation: None,
+                after_seq: Some(0),
+                limit: Some(10),
+            },
         );
         assert_same_public_failure(
             foreign_conversation,

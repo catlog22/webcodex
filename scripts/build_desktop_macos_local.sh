@@ -14,7 +14,8 @@ usage() {
     cat <<'EOF'
 Usage: scripts/build_desktop_macos_local.sh
 
-Build an installable, ad-hoc signed macOS WebCodex Desktop DMG for local testing.
+Build a macOS Desktop DMG using an existing persistent self-signed identity.
+Set WEBCODEX_MACOS_SIGNING_MODE=adhoc only for disposable local verification.
 The bundled WebCodex runtime uses the dogfood Cargo profile; this is not a
 formal release or publication workflow.
 
@@ -40,6 +41,12 @@ for command in git node npm cargo python3; do
 done
 [ -x /usr/bin/lipo ] || fail "required command not found: /usr/bin/lipo"
 
+NODE_VERSION="$(node --version)"
+case "$NODE_VERSION" in
+    v22.*) ;;
+    *) fail "Node.js 22 is required; got $NODE_VERSION" ;;
+esac
+
 cd "$ROOT"
 if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
     fail "worktree must be clean so bundled runtime identity is exact; commit or stash local changes first"
@@ -50,6 +57,8 @@ SHORT_SOURCE="$(git rev-parse --short=12 HEAD)"
 VERSION="$(node -p "require('./npm/webcodex/package.json').version")"
 BUILT_AT="$(git show -s --format=%ct HEAD)"
 export WEBCODEX_BUILT_AT="$BUILT_AT"
+export WEBCODEX_GIT_COMMIT="$SOURCE_SHA"
+export WEBCODEX_GIT_DIRTY=false
 
 case "$(uname -m)" in
     arm64)
@@ -68,12 +77,25 @@ printf '  source:   %s\n' "$SOURCE_SHA"
 printf '  version:  %s\n' "$VERSION"
 printf '  platform: %s\n' "$PLATFORM"
 
+npm ci --prefix frontend
 npm ci --prefix apps/desktop
 
 cargo build --locked --profile dogfood \
     -p webcodex \
     -p webcodex-cli \
     -p webcodex-runner
+
+signing_mode="${WEBCODEX_MACOS_SIGNING_MODE:-self-signed}"
+case "$signing_mode" in
+    self-signed)
+        identity="${WEBCODEX_MACOS_LOCAL_SIGNING_IDENTITY:-WebCodex Local Development}"
+        matches="$(security find-identity -v -p codesigning | awk -v name="\"$identity\"" 'index($0, name) {print $2}')"
+        [ "$(printf '%s\n' "$matches" | awk 'NF {n++} END {print n+0}')" -eq 1 ] || fail "one existing persistent signing identity is required"
+        export WEBCODEX_MACOS_CERTIFICATE_SHA1="$matches" ;;
+    adhoc) identity=- ;;
+    *) fail "local mode must be self-signed or adhoc" ;;
+esac
+bash scripts/macos_sign_runner.sh target/dogfood/webcodex-runner "$identity" "$signing_mode"
 
 mkdir -p "$ROOT/target" "$OUTPUT_DIR" "$TAURI_TARGET"
 WORK_DIR="$(mktemp -d "$ROOT/target/desktop-local-stage.XXXXXX")"
@@ -87,13 +109,16 @@ python3 scripts/prepare_desktop_bundle_macos.py \
     --source-sha "$SOURCE_SHA" \
     --built-at "$BUILT_AT" \
     --platform "$PLATFORM" \
-    --signing-mode adhoc \
+    --signing-mode "$signing_mode" \
     --output-dir "$STAGE_DIR"
 
 # Keep Cargo/Tauri compilation caches between local builds, but remove stale
 # bundle output so the candidate selection below is unambiguous.
 rm -rf "$TAURI_TARGET/release/bundle/dmg"
 export APPLE_SIGNING_IDENTITY="-"
+# Match CI/release create-dmg behavior: skip Finder AppleScript decoration in
+# non-interactive local packaging as well.
+export CI="true"
 export CARGO_TARGET_DIR="$TAURI_TARGET"
 
 (
@@ -113,6 +138,7 @@ if [ "${#candidates[@]}" -ne 1 ]; then
 fi
 
 OUTPUT_DMG="$OUTPUT_DIR/webcodex-desktop-local-$SHORT_SOURCE-v$VERSION-$PLATFORM.dmg"
+bash scripts/macos_finalize_dmg.sh "${candidates[0]}" "$signing_mode" "$identity"
 cp "${candidates[0]}" "$OUTPUT_DMG"
 
 bash scripts/desktop_install_macos_smoke.sh \
@@ -122,7 +148,7 @@ bash scripts/desktop_install_macos_smoke.sh \
     --built-at "$BUILT_AT" \
     --platform "$PLATFORM" \
     --stage-metadata "$STAGE_DIR/desktop-bundle.json" \
-    --signing-mode adhoc
+    --signing-mode "$signing_mode"
 
 DIGEST="$(shasum -a 256 "$OUTPUT_DMG" | awk '{print $1}')"
 printf '\nLocal Desktop DMG ready:\n  %s\n' "$OUTPUT_DMG"

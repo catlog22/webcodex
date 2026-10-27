@@ -4,11 +4,13 @@ use crate::lsp_bridge::{
     CallHierarchyEdgeDirection, CallHierarchyResult, DocumentDiagnosticsResult,
     DocumentDiagnosticsStatus, DocumentSymbolsResult, HoverResult, LocationsResult,
     LspAvailabilityStatus, LspStatusResult, PublicCallHierarchyEdge, PublicCallHierarchySymbol,
-    PublicDiagnostic, PublicHover, PublicLocation, PublicPosition, PublicRange, PublicSymbol,
-    PublicWorkspaceSymbol, RunnerLspPayload, RunnerLspRequest, RunnerLspResultEnvelope,
-    WorkspaceSymbolsResult, AGENT_LSP_REQUEST_KIND,
+    PublicDiagnostic, PublicDiagnosticSeverity, PublicDiagnosticTag, PublicHover, PublicHoverKind,
+    PublicLocation, PublicPosition, PublicRange, PublicSymbol, PublicWorkspaceSymbol,
+    RunnerLspPayload, RunnerLspRequest, RunnerLspResultEnvelope, WorkspaceSymbolsResult,
+    AGENT_LSP_REQUEST_KIND,
 };
-use crate::runner_protocol::{RunnerCapabilities, RunnerRegisterRequest};
+use crate::runner_protocol::RunnerCapabilities;
+use crate::tool_runtime::tool_audit::ToolCallAuditProjection;
 use crate::tool_runtime::tool_definition::{
     lookup_tool_definition, model_visible_tool_definitions, RunnerCapabilityRequirement,
     TOOL_CATEGORY_LSP,
@@ -19,12 +21,12 @@ use serde_json::{json, Value};
 #[test]
 fn lsp_tools_are_registered_read_only_and_not_shell_like() {
     for name in [
-        "lsp_status",
-        "document_symbols",
-        "document_diagnostics",
-        "hover",
-        "workspace_symbols",
-        "goto_definition",
+        "get_lsp_status",
+        "list_document_symbols",
+        "read_document_diagnostics",
+        "read_symbol_hover",
+        "list_workspace_symbols",
+        "find_definition",
         "find_references",
     ] {
         let def = lookup_tool_definition(name).expect(name);
@@ -49,7 +51,7 @@ fn lsp_tools_are_registered_read_only_and_not_shell_like() {
             "{name}"
         );
     }
-    let hierarchy = lookup_tool_definition("call_hierarchy").expect("call_hierarchy");
+    let hierarchy = lookup_tool_definition("read_call_hierarchy").expect("read_call_hierarchy");
     assert_eq!(hierarchy.category, TOOL_CATEGORY_LSP);
     assert_eq!(
         hierarchy.metadata.effect,
@@ -67,14 +69,14 @@ fn lsp_tools_are_registered_read_only_and_not_shell_like() {
     );
     let names: Vec<_> = model_visible_tool_definitions().map(|d| d.name).collect();
     for name in [
-        "lsp_status",
-        "document_symbols",
-        "document_diagnostics",
-        "hover",
-        "workspace_symbols",
-        "goto_definition",
+        "get_lsp_status",
+        "list_document_symbols",
+        "read_document_diagnostics",
+        "read_symbol_hover",
+        "list_workspace_symbols",
+        "find_definition",
         "find_references",
-        "call_hierarchy",
+        "read_call_hierarchy",
     ] {
         assert!(names.contains(&name), "missing {name} in known tools");
     }
@@ -116,22 +118,22 @@ fn lsp_input_schemas_have_required_bounds() {
     let by_name: std::collections::HashMap<_, _> =
         specs.into_iter().map(|s| (s.name.clone(), s)).collect();
 
-    let status = &by_name["lsp_status"].input_schema;
+    let status = &by_name["get_lsp_status"].input_schema;
     assert_eq!(status["required"], json!(["project"]));
     assert_eq!(status["additionalProperties"], false);
 
-    let symbols = &by_name["document_symbols"].input_schema;
+    let symbols = &by_name["list_document_symbols"].input_schema;
     assert_eq!(symbols["required"], json!(["project", "path"]));
     assert!(symbols["properties"]["limit"].get("maximum").is_none());
     assert_eq!(symbols["additionalProperties"], false);
 
-    let diagnostics = &by_name["document_diagnostics"].input_schema;
+    let diagnostics = &by_name["read_document_diagnostics"].input_schema;
     assert_eq!(diagnostics["required"], json!(["project", "path"]));
     assert_eq!(diagnostics["properties"]["limit"]["minimum"], 1);
     assert!(diagnostics["properties"]["limit"].get("maximum").is_none());
     assert_eq!(diagnostics["properties"]["limit"]["default"], 100);
     assert_eq!(diagnostics["additionalProperties"], false);
-    let hierarchy = &by_name["call_hierarchy"].input_schema;
+    let hierarchy = &by_name["read_call_hierarchy"].input_schema;
     assert_eq!(
         hierarchy["required"],
         json!(["project", "path", "line", "column"])
@@ -144,7 +146,7 @@ fn lsp_input_schemas_have_required_bounds() {
     assert_eq!(hierarchy["properties"]["limit"]["minimum"], 1);
     assert!(hierarchy["properties"]["limit"].get("maximum").is_none());
     assert_eq!(hierarchy["additionalProperties"], false);
-    let diagnostics_output = &by_name["document_diagnostics"].output_schema;
+    let diagnostics_output = &by_name["read_document_diagnostics"].output_schema;
     let output_properties = &diagnostics_output["properties"]["output"]["properties"];
     for field in [
         "project",
@@ -175,7 +177,7 @@ fn lsp_input_schemas_have_required_bounds() {
         .get("relatedInformation")
         .is_none());
 
-    let hover = &by_name["hover"].input_schema;
+    let hover = &by_name["read_symbol_hover"].input_schema;
     assert_eq!(
         hover["required"],
         json!(["project", "path", "line", "column"])
@@ -183,26 +185,27 @@ fn lsp_input_schemas_have_required_bounds() {
     assert_eq!(hover["properties"]["line"]["minimum"], 1);
     assert_eq!(hover["properties"]["column"]["minimum"], 1);
     assert_eq!(hover["additionalProperties"], false);
-    let hover_output = &by_name["hover"].output_schema["properties"]["output"]["properties"];
+    let hover_output =
+        &by_name["read_symbol_hover"].output_schema["properties"]["output"]["properties"];
     assert_eq!(
         hover_output["hover"]["anyOf"][0]["properties"]["value"]["maxLength"],
         16384
     );
 
-    let workspace = &by_name["workspace_symbols"].input_schema;
+    let workspace = &by_name["list_workspace_symbols"].input_schema;
     assert_eq!(workspace["required"], json!(["project", "query"]));
     assert_eq!(workspace["properties"]["query"]["minLength"], 1);
     assert_eq!(workspace["properties"]["query"]["maxLength"], 200);
     assert_eq!(workspace["properties"]["limit"]["default"], 50);
     assert!(workspace["properties"]["limit"].get("maximum").is_none());
     assert_eq!(workspace["additionalProperties"], false);
-    let workspace_item = &by_name["workspace_symbols"].output_schema["properties"]["output"]
+    let workspace_item = &by_name["list_workspace_symbols"].output_schema["properties"]["output"]
         ["properties"]["symbols"]["items"];
     assert_eq!(workspace_item["additionalProperties"], false);
     assert!(workspace_item["properties"].get("uri").is_none());
     assert!(workspace_item["properties"].get("data").is_none());
 
-    let goto = &by_name["goto_definition"].input_schema;
+    let goto = &by_name["find_definition"].input_schema;
     assert_eq!(
         goto["required"],
         json!(["project", "path", "line", "column"])
@@ -231,9 +234,9 @@ fn call_hierarchy_parser_rejects_explicit_null_optional_fields() {
             "column": 1
         });
         arguments[field] = Value::Null;
-        let error = ToolCall::from_tool_name("call_hierarchy", arguments).unwrap_err();
+        let error = ToolCall::from_tool_name("read_call_hierarchy", arguments).unwrap_err();
         assert!(
-            error.contains("invalid arguments for tool 'call_hierarchy'"),
+            error.contains("invalid arguments for tool 'read_call_hierarchy'"),
             "{field}: {error}"
         );
     }
@@ -242,7 +245,7 @@ fn call_hierarchy_parser_rejects_explicit_null_optional_fields() {
 #[test]
 fn document_diagnostics_tool_call_parser_produces_only_typed_fields() {
     let call = ToolCall::from_tool_name(
-        "document_diagnostics",
+        "read_document_diagnostics",
         json!({
             "project": "agent:oe:demo",
             "path": "src/main.rs",
@@ -262,19 +265,17 @@ fn document_diagnostics_tool_call_parser_produces_only_typed_fields() {
             && path == "src/main.rs"
             && session_id == "wc_sess_demo"
     ));
-    let call_with_ignored_internal_extra = ToolCall::from_tool_name(
-        "document_diagnostics",
+    let error = ToolCall::from_tool_name(
+        "read_document_diagnostics",
         json!({"project": "agent:oe:demo", "path": "src/main.rs", "timeout": 30}),
     )
-    .unwrap();
-    assert!(matches!(
-        call_with_ignored_internal_extra,
-        ToolCall::DocumentDiagnostics {
-            limit: None,
-            session_id: None,
-            ..
-        }
-    ));
+    .unwrap_err();
+    assert!(error.contains("[field]: unknown field"), "{error}");
+    assert!(
+        error.contains("accepted top-level fields include"),
+        "{error}"
+    );
+    assert!(!error.contains("`timeout`"), "{error}");
 }
 
 async fn register_lsp_agent(
@@ -306,30 +307,16 @@ async fn register_lsp_agent_capabilities(
     let project_path = root.to_string_lossy().to_string();
     runtime
         .runner_registry
-        .register(crate::test_support::current_runner_registration(
-            RunnerRegisterRequest {
-                process_started_at: None,
-                build: None,
-                job_concurrency_limit: None,
-                job_inventory: None,
-                coding_agent_providers: None,
-                coding_agent_inventory: None,
-                client_id: client_id.to_string(),
-                runner_instance_id: "inst".to_string(),
-                runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-                display_name: None,
-                owner: None,
-                hostname: None,
-                host_context: None,
-                capabilities: RunnerCapabilities {
-                    shell: true,
-                    file_read: true,
-                    file_write: true,
-                    lsp_read_only_navigation: lsp_capable,
-                    lsp_call_hierarchy: call_hierarchy_capable,
-                    ..Default::default()
-                },
-                policy: None,
+        .register(crate::test_support::runner_registration(
+            client_id,
+            "inst",
+            RunnerCapabilities {
+                shell: true,
+                file_read: true,
+                file_write: true,
+                lsp_read_only_navigation: lsp_capable,
+                lsp_call_hierarchy: call_hierarchy_capable,
+                ..Default::default()
             },
         ))
         .await
@@ -389,12 +376,12 @@ fn document_diagnostics_result(path: &str) -> DocumentDiagnosticsResult {
                 start: PublicPosition { line: 1, column: 1 },
                 end: PublicPosition { line: 1, column: 2 },
             },
-            severity: "warning".into(),
+            severity: PublicDiagnosticSeverity::Warning,
             severity_code: Some(2),
             code: Some("unused".into()),
             source: Some("rust-analyzer".into()),
             message: "unused item".into(),
-            tags: vec!["unnecessary".into()],
+            tags: vec![PublicDiagnosticTag::Unnecessary],
         }],
         total_count: 1,
         returned_count: 1,
@@ -413,7 +400,7 @@ fn hover_result(path: &str) -> HoverResult {
         path: path.into(),
         position: PublicPosition { line: 1, column: 1 },
         hover: Some(PublicHover {
-            kind: "markdown".into(),
+            kind: PublicHoverKind::Markdown,
             value: "`main`".into(),
             range: None,
         }),
@@ -555,7 +542,7 @@ async fn dispatch_call_hierarchy_with_limit(
     if let Some(limit) = requested_limit {
         arguments["limit"] = json!(limit);
     }
-    let call = ToolCall::from_tool_name("call_hierarchy", arguments).unwrap();
+    let call = ToolCall::from_tool_name("read_call_hierarchy", arguments).unwrap();
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -568,7 +555,7 @@ async fn dispatch_call_hierarchy_with_limit(
     let sent = request
         .lsp
         .as_ref()
-        .expect("call_hierarchy Runner request")
+        .expect("read_call_hierarchy Runner request")
         .request
         .clone();
     let envelope = RunnerLspResultEnvelope::ok(result);
@@ -662,7 +649,7 @@ async fn call_hierarchy_does_not_require_legacy_navigation_capability() {
     let result = task.await.unwrap();
     assert!(
         result.success,
-        "call_hierarchy must depend only on its distinct capability: {result:?}"
+        "read_call_hierarchy must depend only on its distinct capability: {result:?}"
     );
 }
 
@@ -1042,6 +1029,7 @@ async fn lsp_status_unavailable_still_succeeds() {
                 available: false,
                 running: false,
                 status: LspAvailabilityStatus::Unavailable,
+                index_readiness: Default::default(),
                 source: None,
                 position_encoding: None,
             }],
@@ -1248,7 +1236,8 @@ async fn document_diagnostics_result_boundary_rejects_embedded_absolute_paths() 
 async fn hover_dispatches_typed_normalized_result() {
     let runtime = test_runtime();
     let tmp = tempfile::tempdir().unwrap();
-    let project = register_lsp_agent(&runtime, "lsp-hover", "demo", tmp.path(), true).await;
+    let project =
+        register_lsp_agent(&runtime, "lsp-read_symbol_hover", "demo", tmp.path(), true).await;
     let task = tokio::spawn({
         let runtime = runtime.clone();
         async move {
@@ -1266,7 +1255,12 @@ async fn hover_dispatches_typed_normalized_result() {
                 .await
         }
     });
-    complete_lsp_agent_request(&runtime, "lsp-hover", hover_result("src/main.rs")).await;
+    complete_lsp_agent_request(
+        &runtime,
+        "lsp-read_symbol_hover",
+        hover_result("src/main.rs"),
+    )
+    .await;
     let result = task.await.unwrap();
     assert!(result.success, "{result:?}");
     assert_eq!(result.output["hover"]["kind"], "markdown");

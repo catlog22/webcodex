@@ -1,48 +1,33 @@
-//! REST-only pairing/enrollment endpoints.
-//!
-//! `POST /api/pairing/create` is an admin/bootstrap endpoint that creates a
-//! short-lived one-time pairing code. `POST /api/pairing/enroll` is intentionally
-//! not behind Bearer auth; the pairing code is the temporary credential and is
-//! consumed exactly once. These endpoints are not included in GPT Actions
-//! OpenAPI and are not exposed as MCP tools.
+//! Single-use pairing-code lifecycle for Runner enrollment. Operational
+//! authorization is independent of MCP tool discovery.
+
+#[cfg(test)]
+mod http_tests;
+mod runner_capabilities;
+pub(crate) use runner_capabilities::{grant_runner_capabilities, runner_capability_authorization};
 
 use crate::auth::{
     clean_token_name, generate_agent_token, generate_api_token, hash_token, scopes_to_string,
     token_prefix, validate_allowed_client_id, validate_username, AuthContext,
-    SCOPE_AGENT_JOB_UPDATE, SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT,
-    SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNTIME_READ,
-    SCOPE_SESSION_COLLABORATE,
 };
 use crate::db::PairingConsumeResult;
 use crate::json_error;
+use crate::management_http::{auth_context, database, parse_json, JsonApiError, JsonApiResult};
 use crate::models::{
     ApiKeyRecord, PairingCodeRecord, UserRecord, TOKEN_KIND_AGENT, TOKEN_KIND_USER,
 };
 use salvo::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use webcodex_core::authority::SCOPE_RUNNER_MANAGE;
+use webcodex_core::authority::{SCOPE_CODING_AGENT_RUN, SCOPE_SSH_LOCAL};
 
 const DEFAULT_TTL_SECS: i64 = 600;
 const MIN_TTL_SECS: i64 = 60;
 const MAX_TTL_SECS: i64 = 3600;
 
-const ENROLL_USER_SCOPES: &[&str] = &[
-    SCOPE_RUNTIME_READ,
-    SCOPE_RUNNER_MANAGE,
-    SCOPE_SESSION_COLLABORATE,
-    SCOPE_PROJECT_READ,
-    SCOPE_PROJECT_WRITE,
-    SCOPE_JOB_RUN,
-];
-
-const ENROLL_AGENT_SCOPES: &[&str] = &[
-    SCOPE_AGENT_REGISTER,
-    SCOPE_AGENT_POLL,
-    SCOPE_AGENT_RESULT,
-    SCOPE_AGENT_JOB_UPDATE,
-];
-
+use webcodex_core::authority::{
+    profiles::LOCAL_USER as ENROLL_USER_SCOPES, AGENT_SCOPES as ENROLL_AGENT_SCOPES,
+};
 #[derive(Debug, Deserialize)]
 pub(crate) struct PairingCreateRequest {
     pub username: String,
@@ -59,6 +44,9 @@ pub(crate) struct PairingCreateRequest {
     pub agent_token_name: Option<String>,
     #[serde(default)]
     pub overwrite_existing_user: bool,
+    /// Admin-controlled issuance, never accepted as an enrollment-time upgrade.
+    #[serde(default)]
+    pub runner_capabilities: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -69,6 +57,20 @@ pub(crate) struct PairingEnrollRequest {
     pub display_name: Option<String>,
     #[serde(default)]
     pub transport: Option<String>,
+}
+
+fn enrollment_user_scopes(runner_capabilities: bool) -> Vec<String> {
+    let mut scopes: Vec<_> = ENROLL_USER_SCOPES
+        .iter()
+        .map(|scope| scope.to_string())
+        .collect();
+    if runner_capabilities {
+        scopes.extend([
+            SCOPE_SSH_LOCAL.to_owned(),
+            SCOPE_CODING_AGENT_RUN.to_owned(),
+        ]);
+    }
+    scopes
 }
 
 fn clean_display_name(value: Option<String>) -> Result<Option<String>, String> {
@@ -115,118 +117,54 @@ fn user_summary(user: &UserRecord) -> Value {
 }
 
 #[handler]
-pub(crate) async fn pairing_create(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let body: PairingCreateRequest = match req.parse_json().await {
-        Ok(b) => b,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("invalid request body: {}", e),
-            ));
-            return;
-        }
-    };
+pub(crate) async fn pairing_create(req: &mut Request, depot: &mut Depot) -> JsonApiResult {
+    let body: PairingCreateRequest = parse_json(req).await?;
 
-    let Some(auth) = depot.obtain::<AuthContext>().ok() else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "no auth context",
-        ));
-        return;
-    };
+    let auth = auth_context(depot)?;
     if auth.is_agent_token() || !auth.is_admin_caller() {
-        res.status_code(StatusCode::FORBIDDEN);
-        res.render(json_error(
+        return Err(JsonApiError::new(
             StatusCode::FORBIDDEN,
             "admin or bootstrap auth required",
         ));
-        return;
     }
 
-    let username = match validate_username(&body.username) {
-        Ok(v) => v,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(StatusCode::BAD_REQUEST, e));
-            return;
-        }
-    };
+    let username = validate_username(&body.username).map_err(JsonApiError::bad_request)?;
     // An empty client_id issues an unbound code: the device names itself when
     // it redeems, so the same name does not have to be agreed on both sides
     // before anyone can log in.
     let client_id = if body.client_id.trim().is_empty() {
         String::new()
     } else {
-        match validate_allowed_client_id(&body.client_id) {
-            Ok(v) => v,
-            Err(e) => {
-                res.status_code(StatusCode::BAD_REQUEST);
-                res.render(json_error(StatusCode::BAD_REQUEST, e));
-                return;
-            }
-        }
+        validate_allowed_client_id(&body.client_id).map_err(JsonApiError::bad_request)?
     };
-    let display_name = match clean_display_name(body.display_name) {
-        Ok(v) => v,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(StatusCode::BAD_REQUEST, e));
-            return;
-        }
-    };
+    let display_name = clean_display_name(body.display_name).map_err(JsonApiError::bad_request)?;
     let ttl_secs = body.ttl_secs.unwrap_or(DEFAULT_TTL_SECS);
     if !(MIN_TTL_SECS..=MAX_TTL_SECS).contains(&ttl_secs) {
-        res.status_code(StatusCode::BAD_REQUEST);
-        res.render(json_error(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "ttl_secs must be between {} and {}",
-                MIN_TTL_SECS, MAX_TTL_SECS
-            ),
-        ));
-        return;
+        return Err(JsonApiError::bad_request(format!(
+            "ttl_secs must be between {} and {}",
+            MIN_TTL_SECS, MAX_TTL_SECS
+        )));
     }
-    let user_token_name = match clean_token_name(body.user_token_name, "chatgpt-action") {
-        Ok(v) => v,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(StatusCode::BAD_REQUEST, e));
-            return;
-        }
-    };
-    let agent_token_name = match resolve_pairing_agent_token_name(body.agent_token_name, &client_id)
-    {
-        Ok(v) => v,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(StatusCode::BAD_REQUEST, e));
-            return;
-        }
-    };
+    let user_token_name = clean_token_name(body.user_token_name, "chatgpt-action")
+        .map_err(JsonApiError::bad_request)?;
+    let agent_token_name = resolve_pairing_agent_token_name(body.agent_token_name, &client_id)
+        .map_err(JsonApiError::bad_request)?;
 
-    let Some(db) = crate::get_db(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB not available",
-        ));
-        return;
-    };
+    let db = database(depot)?;
 
     let now = chrono::Utc::now().timestamp();
-    let user = match db.get_user_by_username(&username) {
-        Ok(Some(user)) => {
+    let user = match db
+        .get_user_by_username(&username)
+        .map_err(JsonApiError::internal)?
+    {
+        Some(user) => {
             if user.is_disabled() {
-                res.status_code(StatusCode::FORBIDDEN);
-                res.render(json_error(StatusCode::FORBIDDEN, "user is disabled"));
-                return;
+                return Err(JsonApiError::new(StatusCode::FORBIDDEN, "user is disabled"));
             }
             let _ = body.overwrite_existing_user;
             user
         }
-        Ok(None) => {
+        None => {
             let user = UserRecord {
                 id: uuid::Uuid::new_v4().to_string(),
                 username: username.clone(),
@@ -237,17 +175,8 @@ pub(crate) async fn pairing_create(req: &mut Request, depot: &mut Depot, res: &m
                 disabled_at: None,
                 updated_at: Some(now),
             };
-            if let Err(e) = db.create_user(&user) {
-                res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-                res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-                return;
-            }
+            db.create_user(&user).map_err(JsonApiError::internal)?;
             user
-        }
-        Err(e) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-            return;
         }
     };
 
@@ -264,127 +193,83 @@ pub(crate) async fn pairing_create(req: &mut Request, depot: &mut Depot, res: &m
         used_at: None,
         user_token_name: Some(user_token_name),
         agent_token_name,
+        runner_capabilities: body.runner_capabilities,
     };
-    if let Err(e) = db.insert_pairing_code(&record) {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-        return;
-    }
+    db.insert_pairing_code(&record)
+        .map_err(JsonApiError::internal)?;
 
-    res.render(Json(json!({
+    Ok(Json(json!({
         "success": true,
         "pairing_code": pairing_code,
         "expires_at": expires_at,
         "username": user.username,
         "client_id": client_id,
         "user": user_summary(&user),
-    })));
+        "runner_capabilities": record.runner_capabilities,
+    })))
 }
 
 #[handler]
-pub(crate) async fn pairing_enroll(req: &mut Request, depot: &mut Depot, res: &mut Response) {
-    let body: PairingEnrollRequest = match req.parse_json().await {
-        Ok(b) => b,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
-                StatusCode::BAD_REQUEST,
-                format!("invalid request body: {}", e),
-            ));
-            return;
-        }
-    };
+pub(crate) async fn pairing_enroll(req: &mut Request, depot: &mut Depot) -> JsonApiResult {
+    let body: PairingEnrollRequest = parse_json(req).await?;
     let pairing_code = body.pairing_code.trim();
     if pairing_code.is_empty() {
-        res.status_code(StatusCode::BAD_REQUEST);
-        res.render(json_error(
+        return Err(JsonApiError::new(
             StatusCode::BAD_REQUEST,
             "pairing_code is required",
         ));
-        return;
     }
-    let client_id = match validate_allowed_client_id(&body.client_id) {
-        Ok(v) => v,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(StatusCode::BAD_REQUEST, e));
-            return;
-        }
-    };
+    let client_id =
+        validate_allowed_client_id(&body.client_id).map_err(JsonApiError::bad_request)?;
     if let Some(transport) = body.transport.as_deref() {
         if !matches!(transport, "websocket" | "polling" | "quic" | "auto") {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(
+            return Err(JsonApiError::new(
                 StatusCode::BAD_REQUEST,
                 "transport must be websocket, polling, quic, or auto",
             ));
-            return;
         }
     }
-    let _display_name = match clean_display_name(body.display_name) {
-        Ok(v) => v,
-        Err(e) => {
-            res.status_code(StatusCode::BAD_REQUEST);
-            res.render(json_error(StatusCode::BAD_REQUEST, e));
-            return;
-        }
-    };
-    let Some(db) = crate::get_db(depot) else {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "DB not available",
-        ));
-        return;
-    };
+    let _display_name = clean_display_name(body.display_name).map_err(JsonApiError::bad_request)?;
+    let db = database(depot)?;
     let now = chrono::Utc::now().timestamp();
     let code_hash = hash_token(pairing_code);
-    let record = match db.consume_pairing_code(&code_hash, &client_id, now) {
-        Ok(PairingConsumeResult::Consumed(record)) => record,
-        Ok(PairingConsumeResult::ClientMismatch(_)) => {
-            res.status_code(StatusCode::FORBIDDEN);
-            res.render(json_error(
+    let record = match db
+        .consume_pairing_code(&code_hash, &client_id, now)
+        .map_err(JsonApiError::internal)?
+    {
+        PairingConsumeResult::Consumed(record) => record,
+        PairingConsumeResult::ClientMismatch(_) => {
+            return Err(JsonApiError::new(
                 StatusCode::FORBIDDEN,
                 "client_id does not match",
             ));
-            return;
         }
-        Ok(PairingConsumeResult::NotFound)
-        | Ok(PairingConsumeResult::AlreadyUsed(_))
-        | Ok(PairingConsumeResult::Expired(_)) => {
-            res.status_code(StatusCode::UNAUTHORIZED);
-            res.render(json_error(
+        PairingConsumeResult::NotFound
+        | PairingConsumeResult::AlreadyUsed(_)
+        | PairingConsumeResult::Expired(_) => {
+            return Err(JsonApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "invalid or expired pairing code",
             ));
-            return;
-        }
-        Err(e) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-            return;
         }
     };
 
-    let user = match db.get_user_by_id(&record.user_id) {
-        Ok(Some(user)) if !user.is_disabled() => user,
-        Ok(_) => {
-            res.status_code(StatusCode::UNAUTHORIZED);
-            res.render(json_error(
+    let user = match db
+        .get_user_by_id(&record.user_id)
+        .map_err(JsonApiError::internal)?
+    {
+        Some(user) if !user.is_disabled() => user,
+        _ => {
+            return Err(JsonApiError::new(
                 StatusCode::UNAUTHORIZED,
                 "invalid or expired pairing code",
             ));
-            return;
-        }
-        Err(e) => {
-            res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-            res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-            return;
         }
     };
 
     let user_token = generate_api_token();
     let agent_token = generate_agent_token();
+    let user_scopes = enrollment_user_scopes(record.runner_capabilities);
     let user_key = ApiKeyRecord {
         id: uuid::Uuid::new_v4().to_string(),
         user_id: user.id.clone(),
@@ -396,12 +281,7 @@ pub(crate) async fn pairing_enroll(req: &mut Request, depot: &mut Depot, res: &m
         created_at: now,
         last_used_at: None,
         revoked_at: None,
-        scopes: scopes_to_string(
-            &ENROLL_USER_SCOPES
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<Vec<_>>(),
-        ),
+        scopes: scopes_to_string(&user_scopes),
         expires_at: None,
         kind: TOKEN_KIND_USER.to_string(),
         allowed_client_id: None,
@@ -427,18 +307,12 @@ pub(crate) async fn pairing_enroll(req: &mut Request, depot: &mut Depot, res: &m
         kind: TOKEN_KIND_AGENT.to_string(),
         allowed_client_id: Some(client_id.clone()),
     };
-    if let Err(e) = db.insert_api_key(&user_key, &hash_token(&user_token)) {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-        return;
-    }
-    if let Err(e) = db.insert_api_key(&agent_key, &hash_token(&agent_token)) {
-        res.status_code(StatusCode::INTERNAL_SERVER_ERROR);
-        res.render(json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()));
-        return;
-    }
+    db.insert_api_key(&user_key, &hash_token(&user_token))
+        .map_err(JsonApiError::internal)?;
+    db.insert_api_key(&agent_key, &hash_token(&agent_token))
+        .map_err(JsonApiError::internal)?;
 
-    res.render(Json(json!({
+    Ok(Json(json!({
         "success": true,
         "username": user.username,
         "client_id": client_id,
@@ -448,20 +322,25 @@ pub(crate) async fn pairing_enroll(req: &mut Request, depot: &mut Depot, res: &m
         "agent_token_prefix": agent_key.key_prefix,
         "user_token_id": user_key.id,
         "agent_token_id": agent_key.id,
-        "user_token_scopes": ENROLL_USER_SCOPES,
+        "user_token_scopes": user_scopes,
         "agent_token_scopes": ENROLL_AGENT_SCOPES,
-    })));
+    })))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::openapi::build_openapi_spec;
+
     use crate::Database;
     use salvo::prelude::affix_state;
     use salvo::test::{ResponseExt, TestClient};
     use salvo::{Router, Service};
     use std::sync::Arc;
+    use webcodex_core::authority::{
+        SCOPE_AGENT_JOB_UPDATE, SCOPE_AGENT_POLL, SCOPE_AGENT_REGISTER, SCOPE_AGENT_RESULT,
+        SCOPE_JOB_RUN, SCOPE_PROJECT_READ, SCOPE_PROJECT_WRITE, SCOPE_RUNNER_MANAGE,
+        SCOPE_RUNTIME_READ, SCOPE_SESSION_COLLABORATE,
+    };
 
     fn test_db() -> Database {
         let tmp = tempfile::tempdir().unwrap();
@@ -487,6 +366,7 @@ mod tests {
         db.create_user(&user).unwrap();
         let code = "wc_pair_test_secret";
         db.insert_pairing_code(&PairingCodeRecord {
+            runner_capabilities: false,
             id: "p-1".to_string(),
             code_hash: hash_token(code),
             user_id: user.id,
@@ -528,6 +408,7 @@ mod tests {
         .unwrap();
         let code_hash = hash_token("wc_pair_once");
         db.insert_pairing_code(&PairingCodeRecord {
+            runner_capabilities: false,
             id: "p-1".to_string(),
             code_hash: code_hash.clone(),
             user_id: "u-1".to_string(),
@@ -576,6 +457,7 @@ mod tests {
             ("p-wrong", "wc_pair_wrong", now + 600),
         ] {
             db.insert_pairing_code(&PairingCodeRecord {
+                runner_capabilities: false,
                 id: id.to_string(),
                 code_hash: hash_token(code),
                 user_id: "u-1".to_string(),
@@ -618,6 +500,7 @@ mod tests {
         })
         .unwrap();
         db.insert_pairing_code(&PairingCodeRecord {
+            runner_capabilities: false,
             id: "p-open".to_string(),
             code_hash: hash_token("wc_pair_open"),
             user_id: "u-1".to_string(),
@@ -665,6 +548,7 @@ mod tests {
         })
         .unwrap();
         db.insert_pairing_code(&PairingCodeRecord {
+            runner_capabilities: false,
             id: "p-bound".to_string(),
             code_hash: hash_token("wc_pair_bound"),
             user_id: "u-1".to_string(),
@@ -708,6 +592,7 @@ mod tests {
         .unwrap();
         let code = "wc_pair_endpoint_test";
         db.insert_pairing_code(&PairingCodeRecord {
+            runner_capabilities: false,
             id: "p-1".to_string(),
             code_hash: hash_token(code),
             user_id: "u-1".to_string(),
@@ -787,13 +672,5 @@ mod tests {
             resolve_pairing_agent_token_name(None, "alice-laptop").unwrap(),
             Some("alice-laptop agent".to_string())
         );
-    }
-
-    #[test]
-    fn pairing_endpoints_are_absent_from_openapi() {
-        let spec = build_openapi_spec();
-        let paths = spec["paths"].as_object().unwrap();
-        assert!(!paths.contains_key("/api/pairing/create"));
-        assert!(!paths.contains_key("/api/pairing/enroll"));
     }
 }

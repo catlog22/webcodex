@@ -1,5 +1,6 @@
 use crate::auth::AuthContext;
 use crate::db::AdminProjectAudit;
+use crate::json_digest::update_sha256_with_json;
 use crate::runner_http::{RunnerFeature, RunnerRegistry};
 use crate::runner_protocol::RunnerProjectSummary;
 use crate::tool_runtime::{ToolResult, ToolRuntime};
@@ -220,25 +221,6 @@ impl AdminProjectLifecycleService {
         .await
     }
 
-    /// Narrow project-authorized unregister entry used by ordinary runtime
-    /// callers such as the hosted `webcodex disconnect` flow. Authorization is
-    /// still resolved through the caller-visible Runner/project inventory; this
-    /// does not grant access to any other admin lifecycle operation.
-    pub(crate) async fn unregister_authorized(
-        &self,
-        auth: &AuthContext,
-        project: &str,
-        expected_revision: &str,
-    ) -> ServiceResponse {
-        unregister_project_runtime(
-            self.runtime.as_ref(),
-            Some(auth),
-            project,
-            expected_revision,
-        )
-        .await
-    }
-
     async fn mutate_authorized_core(
         runtime: &ToolRuntime,
         auth: Option<&AuthContext>,
@@ -430,7 +412,7 @@ impl AdminProjectLifecycleService {
         }
         let subject = subject_id(auth);
         let key_hash = digest(key.as_bytes());
-        let request_hash = digest(&serde_json::to_vec(request).unwrap_or_default());
+        let request_hash = digest_json_or_empty(request);
         let lock_scope = format!("{subject}\u{1f}{action}\u{1f}{target}\u{1f}{key_hash}");
         let operation_lock = {
             let mut locks = idempotency_locks().lock().await;
@@ -541,8 +523,8 @@ impl AdminProjectLifecycleService {
     }
 }
 
-/// Shared ordinary-runtime unregister path used by both the dedicated HTTP
-/// endpoint and the model-facing runtime tool. The lifecycle core owns exact
+/// Shared ordinary-runtime unregister path used by the canonical runtime tool.
+/// The lifecycle core owns exact
 /// revision validation, owner filtering, active-Job fencing, Runner capability
 /// checks, uncertain delivery semantics, and Server inventory removal.
 pub(crate) async fn unregister_project_runtime(
@@ -756,7 +738,7 @@ fn validate_common(
     Ok(())
 }
 
-fn validate_revision(value: &str) -> Result<(), ServiceResponse> {
+pub(crate) fn validate_revision(value: &str) -> Result<(), ServiceResponse> {
     if value.len() != 71
         || !value.starts_with("sha256:")
         || !value[7..].chars().all(|c| c.is_ascii_hexdigit())
@@ -766,7 +748,7 @@ fn validate_revision(value: &str) -> Result<(), ServiceResponse> {
     Ok(())
 }
 
-fn parse_runtime_project(value: &str) -> Result<(String, String), ServiceResponse> {
+pub(crate) fn parse_runtime_project(value: &str) -> Result<(String, String), ServiceResponse> {
     let rest = value
         .strip_prefix("agent:")
         .ok_or_else(|| api_error(400, "invalid_request"))?;
@@ -798,6 +780,14 @@ fn subject_id(auth: &AuthContext) -> String {
 }
 fn digest(bytes: &[u8]) -> String {
     format!("sha256:{:x}", Sha256::digest(bytes))
+}
+fn digest_json_or_empty<T: Serialize + ?Sized>(value: &T) -> String {
+    let mut hasher = Sha256::new();
+    if update_sha256_with_json(&mut hasher, value).is_err() {
+        // Match the historical `to_vec(...).unwrap_or_default()` fallback.
+        hasher = Sha256::new();
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 fn project_projection_reconcile_response(
     project: &str,
@@ -852,8 +842,23 @@ fn map_agent_error(error: &str) -> ServiceResponse {
 mod tests {
     use super::*;
     use crate::auth::AuthKind;
-    use crate::runner_http::ShellJobStartMetadata;
-    use crate::runner_protocol::{RunnerCapabilities, RunnerRegisterRequest, ShellJobOpRequest};
+    use webcodex_runner_registry::{JobStartContext, JobStartRequest};
+
+    use crate::runner_protocol::{RunnerCapabilities, RunnerRegisterRequest};
+
+    #[test]
+    fn idempotency_json_digest_matches_buffered_hash() {
+        let value = json!({
+            "project": "agent:test:demo",
+            "escaped": "line\n\"quoted\"\\slash",
+            "unicode": "你好 🦀",
+            "nested": [1, true, null, {"key": "value"}]
+        });
+        assert_eq!(
+            digest_json_or_empty(&value),
+            digest(&serde_json::to_vec(&value).unwrap())
+        );
+    }
 
     fn user_auth(username: &str) -> AuthContext {
         AuthContext {
@@ -871,19 +876,10 @@ mod tests {
         }
     }
 
-    fn active_job_request(client_id: &str, command: &str) -> ShellJobOpRequest {
-        ShellJobOpRequest {
-            op: "start".to_string(),
-            client_id: Some(client_id.to_string()),
-            cwd: None,
-            command: Some(command.to_string()),
-            timeout_secs: Some(60),
-            job_id: None,
-            since_stdout_line: None,
-            since_stderr_line: None,
-            tail_lines: None,
-            limit: None,
-            codex: None,
+    fn active_job_request(client_id: &str, command: &str) -> JobStartRequest {
+        JobStartRequest {
+            timeout_secs: 60,
+            ..JobStartRequest::shell(client_id, command)
         }
     }
 
@@ -895,6 +891,7 @@ mod tests {
         registry
             .register(crate::test_support::current_runner_registration(
                 RunnerRegisterRequest {
+                    computer_session_availability: None,
                     client_id: "owned-runner".to_string(),
                     runner_instance_id: "instance-owned".to_string(),
                     runner_protocol_generation:
@@ -927,13 +924,15 @@ mod tests {
         let alice_access = crate::test_support::runner_access(&alice);
         let bob_access = crate::test_support::runner_access(&bob);
         registry
-            .start_job_with_metadata_for_access(
-                active_job_request("owned-runner", "sleep 60"),
-                "alice".to_string(),
-                ShellJobStartMetadata {
-                    project_id: Some(target.to_string()),
-                    ..Default::default()
+            .start_job(
+                JobStartRequest {
+                    context: JobStartContext {
+                        project_id: Some(target.to_string()),
+                        ..Default::default()
+                    },
+                    ..active_job_request("owned-runner", "sleep 60")
                 },
+                "alice".to_string(),
                 Some(&alice_access),
                 None,
             )
@@ -954,11 +953,9 @@ mod tests {
         let runtime = Arc::new(ToolRuntime::new_for_tests_with_runner_registry(
             registry.clone(),
         ));
-        let (_tmp, db) = crate::test_support::test_db();
-        let service = AdminProjectLifecycleService::new(runtime, db);
         let response = tokio::time::timeout(
             Duration::from_millis(250),
-            service.unregister_authorized(&bob, target, &revision),
+            unregister_project_runtime(runtime.as_ref(), Some(&bob), target, &revision),
         )
         .await
         .expect(
@@ -968,13 +965,15 @@ mod tests {
         assert_eq!(response.body["error"]["code"], "agent_unavailable");
 
         registry
-            .start_job_with_metadata_for_access(
-                active_job_request("owned-runner", "echo still-allowed"),
-                "alice".to_string(),
-                ShellJobStartMetadata {
-                    project_id: Some(target.to_string()),
-                    ..Default::default()
+            .start_job(
+                JobStartRequest {
+                    context: JobStartContext {
+                        project_id: Some(target.to_string()),
+                        ..Default::default()
+                    },
+                    ..active_job_request("owned-runner", "echo still-allowed")
                 },
+                "alice".to_string(),
                 Some(&alice_access),
                 None,
             )

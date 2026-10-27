@@ -5,17 +5,21 @@
 //! and Runner capability requirements. Non-runtime route metadata fallbacks remain in `metadata.rs`
 //! while the registry migration proceeds in small steps.
 
-mod action_tools;
 mod agent_tasks;
 mod agent_waits;
 mod artifacts;
+mod browser;
 #[cfg(feature = "workspace-checkpoints")]
 mod checkpoints;
+#[cfg(feature = "experimental-code-mode")]
+mod code_mode;
 mod coding_agents;
 mod communication;
 mod computer;
 mod diagnostics;
 mod discovery;
+mod documents;
+mod docx;
 mod edits;
 mod files;
 mod git;
@@ -26,8 +30,8 @@ mod lsp;
 mod memory;
 mod patches;
 mod plugins;
+mod resource_references;
 mod runner_config;
-mod session_tools;
 mod sessions;
 mod skills;
 mod ssh_resources;
@@ -35,43 +39,34 @@ mod testing;
 
 use super::metadata::{
     metadata as make_tool_metadata, ToolApprovalPolicy, ToolAuthorityPolicy, ToolEffect,
-    ToolIdempotency, ToolMetadata, ToolPathHint, ToolRisk, ToolSemanticContract, RUNTIME_READ,
-    TOOL_PROVIDER_CONTROL,
+    ToolIdempotency, ToolMetadata, ToolPathHint, ToolRisk, ToolSemanticContract, PROJECT_READ,
+    RUNTIME_READ, TOOL_PROVIDER_CONTROL, TOOL_PROVIDER_RUNNER,
 };
-use super::registry::input_schemas::list_tools_input_schema;
 #[cfg(any(test, feature = "root-test-support"))]
 pub use super::tool_catalog::TOOL_MANIFEST_INTENTS;
 pub use super::tool_catalog::{
-    available_tool_manifest_intent_names, resolve_tool_manifest_intent, CODING_INTENT_TOOL_NAMES,
-    LOCAL_CODING_TOOL_NAMES, TOOL_DISCOVERY_GROUPS, TOOL_RECOMMENDED_FLOWS,
-};
-#[cfg(any(test, feature = "root-test-support"))]
-pub use super::tool_catalog::{
-    TOOL_DISCOVERY_GROUP_CHECKPOINT, TOOL_DISCOVERY_GROUP_CLEANUP, TOOL_DISCOVERY_GROUP_EDIT,
-    TOOL_DISCOVERY_GROUP_GIT, TOOL_DISCOVERY_GROUP_INSPECT, TOOL_DISCOVERY_GROUP_JOBS,
-    TOOL_DISCOVERY_GROUP_PATCH, TOOL_DISCOVERY_GROUP_PROJECTS, TOOL_DISCOVERY_GROUP_REVIEW,
-    TOOL_DISCOVERY_GROUP_RUNTIME, TOOL_DISCOVERY_GROUP_SHELL, TOOL_DISCOVERY_GROUP_VALIDATION,
+    available_tool_manifest_intent_names, model_visible_recommended_flows,
+    resolve_tool_manifest_intent, CODING_INTENT_TOOL_NAMES, TOOL_RECOMMENDED_FLOWS,
 };
 #[cfg(any(test, feature = "root-test-support"))]
 pub use super::tool_policy::is_known_tool_name;
 pub use super::tool_policy::{
     adaptive_runtime_direct_tool_definitions, exploration_tool_names,
     is_adaptive_runtime_direct_tool, is_model_visible_tool_name, lookup_tool_definition,
-    model_visible_tool_definitions, model_visible_tool_names_csv, runtime_tool_accepts_context_ack,
+    model_visible_tool_definitions, model_visible_tool_names_csv,
     runtime_tool_activity_interaction, runtime_tool_activity_semantics,
-    runtime_tool_advances_context_checkpoint, runtime_tool_approval_policy,
-    runtime_tool_captures_validation_output, runtime_tool_category,
+    runtime_tool_approval_policy, runtime_tool_captures_validation_output, runtime_tool_category,
     runtime_tool_effect_annotations, runtime_tool_execution_contract,
-    runtime_tool_is_change_summary_like, runtime_tool_is_git_like, runtime_tool_is_read_like,
-    runtime_tool_is_shell_like, runtime_tool_is_write_like, runtime_tool_metadata,
-    runtime_tool_operator_extension_family, runtime_tool_permission_risk,
-    runtime_tool_requires_permission, runtime_tool_runner_capability,
+    runtime_tool_host_orchestration_hint, runtime_tool_is_change_summary_like,
+    runtime_tool_is_git_like, runtime_tool_is_read_like, runtime_tool_is_shell_like,
+    runtime_tool_is_write_like, runtime_tool_metadata, runtime_tool_operator_extension_family,
+    runtime_tool_permission_risk, runtime_tool_requires_permission, runtime_tool_runner_capability,
     runtime_tool_session_evidence_policy, runtime_tool_session_risk_class,
 };
 #[cfg(any(test, feature = "root-test-support"))]
 pub use super::tool_policy::{
     is_model_hidden_tool_name, known_tool_names, model_hidden_tool_names,
-    runtime_tool_context_continuity_policy, runtime_tool_requires_explicit_business_session,
+    runtime_tool_requires_explicit_business_session,
 };
 use webcodex_core::runner_protocol::{
     RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA, RUNNER_CAPABILITY_ASYNC_JOBS,
@@ -85,10 +80,12 @@ use webcodex_core::runner_protocol::{
     RUNNER_CAPABILITY_COMPUTER_POINTER_CONTROL, RUNNER_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT,
     RUNNER_CAPABILITY_COMPUTER_TEXT_INPUT, RUNNER_CAPABILITY_COMPUTER_WINDOW_ACTIVATE,
     RUNNER_CAPABILITY_DETACHED_PROCESS_JOBS, RUNNER_CAPABILITY_FILE_READ,
-    RUNNER_CAPABILITY_FILE_WRITE, RUNNER_CAPABILITY_GIT, RUNNER_CAPABILITY_LSP_CALL_HIERARCHY,
-    RUNNER_CAPABILITY_LSP_READ_ONLY_NAVIGATION, RUNNER_CAPABILITY_PERSISTENT_SHELL,
-    RUNNER_CAPABILITY_RUNNER_CONFIG_CONTROL, RUNNER_CAPABILITY_SHELL,
-    RUNNER_CAPABILITY_SKILL_MANAGEMENT, RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV,
+    RUNNER_CAPABILITY_FILE_WRITE, RUNNER_CAPABILITY_GIT, RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT,
+    RUNNER_CAPABILITY_LSP_CALL_HIERARCHY, RUNNER_CAPABILITY_LSP_READ_ONLY_NAVIGATION,
+    RUNNER_CAPABILITY_PERSISTENT_SHELL, RUNNER_CAPABILITY_PROJECT_BUILD,
+    RUNNER_CAPABILITY_PROJECT_FORMAT, RUNNER_CAPABILITY_RUNNER_CONFIG_CONTROL,
+    RUNNER_CAPABILITY_SHELL, RUNNER_CAPABILITY_SKILL_MANAGEMENT,
+    RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION, RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV,
     RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
 };
 
@@ -104,12 +101,23 @@ pub enum RunnerCapabilityRequirement {
     /// General native process + argv execution. This must never be inferred
     /// from shell or structured-validation support.
     StructuredProcess,
+    /// Runner-owned portable Rust/Go/Python project build planning + typed StartBuild.
+    /// Never inferred from generic process or validation support.
+    ProjectBuild,
+    ProjectFormat,
+    /// Runner-owned trusted Skill resource execution with package identity.
+    /// Never infer this from generic structured process or Skill read support.
+    SkillResourceExecution,
     /// Durable detached native process Jobs. This explicit authority is never
     /// inferred from ordinary structured process execution.
     DetachedProcess,
     /// Bounded typed script payload execution. Never inferred from raw shell
     /// or either structured argv capability.
     StructuredScript,
+    /// Dedicated Server-generated POSIX script runtime. Never infer this from
+    /// shell/git support: older mixed-version Runners may advertise those while
+    /// lacking the typed internal request kind.
+    InternalPosixScript,
     /// `read_file` (Runner path uses the file_read request kind).
     FileRead,
     /// Native file mutation requests handled by the Runner.
@@ -117,7 +125,7 @@ pub enum RunnerCapabilityRequirement {
     /// Runner-authoritative Codex Patch parsing plus transactional file mutation.
     /// This additive request kind is never inferred from generic file-write support.
     ApplyPatch,
-    /// `git_status` / `git_diff` (Runner path runs git via shell; accept either
+    /// `get_git_status` / `git_diff` (Runner path runs git via shell; accept either
     /// an explicit `git` capability or `shell`).
     GitOrShell,
     /// `run_job` (Runner path starts an async job).
@@ -172,8 +180,12 @@ impl RunnerCapabilityRequirement {
             Self::OwnerOnly => "owner boundary",
             Self::Shell => RUNNER_CAPABILITY_SHELL,
             Self::StructuredProcess => RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV,
+            Self::ProjectBuild => RUNNER_CAPABILITY_PROJECT_BUILD,
+            Self::ProjectFormat => RUNNER_CAPABILITY_PROJECT_FORMAT,
+            Self::SkillResourceExecution => RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION,
             Self::DetachedProcess => RUNNER_CAPABILITY_DETACHED_PROCESS_JOBS,
             Self::StructuredScript => RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD,
+            Self::InternalPosixScript => RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT,
             Self::FileRead => RUNNER_CAPABILITY_FILE_READ,
             Self::FileWrite => RUNNER_CAPABILITY_FILE_WRITE,
             Self::ApplyPatch => RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA,
@@ -207,8 +219,12 @@ impl RunnerCapabilityRequirement {
             Self::OwnerOnly => &[],
             Self::Shell => &[RUNNER_CAPABILITY_SHELL],
             Self::StructuredProcess => &[RUNNER_CAPABILITY_STRUCTURED_PROCESS_ARGV],
+            Self::ProjectBuild => &[RUNNER_CAPABILITY_PROJECT_BUILD],
+            Self::ProjectFormat => &[RUNNER_CAPABILITY_PROJECT_FORMAT],
+            Self::SkillResourceExecution => &[RUNNER_CAPABILITY_SKILL_RESOURCE_EXECUTION],
             Self::DetachedProcess => &[RUNNER_CAPABILITY_DETACHED_PROCESS_JOBS],
             Self::StructuredScript => &[RUNNER_CAPABILITY_STRUCTURED_SCRIPT_PAYLOAD],
+            Self::InternalPosixScript => &[RUNNER_CAPABILITY_INTERNAL_POSIX_SCRIPT],
             Self::FileRead => &[RUNNER_CAPABILITY_FILE_READ],
             Self::FileWrite => &[RUNNER_CAPABILITY_FILE_WRITE],
             Self::ApplyPatch => &[RUNNER_CAPABILITY_APPLY_PATCH_MATCH_METADATA],
@@ -271,43 +287,11 @@ impl ToolVisibility {
     }
 }
 
-pub type ToolInputSchemaFactory = fn() -> serde_json::Value;
-
 #[derive(Debug, Clone, Copy)]
 pub struct ToolModelSpecDeclaration {
     pub description: &'static str,
-    pub input_schema: ToolInputSchemaFactory,
-    /// Optional GPT Actions presentation copy. Canonical/MCP descriptions stay
-    /// unchanged; this exists only when the Action importer's 300-character
-    /// operation-description ceiling needs a deliberately shorter rendering.
-    pub gpt_action_description: Option<&'static str>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolGptActionExposure {
-    /// Follow the canonical Adaptive Runtime surface automatically.
-    Inherit,
-    /// This tool depends on MCP-only protocol semantics and must not be exposed
-    /// directly or through the GPT Actions gateway.
-    Unsupported,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolModelSurfaceDeclaration {
-    /// Stable ordering for tools exposed directly by the adaptive runtime
-    /// surface. `None` is the default and means a model-visible runtime tool
-    /// belongs to the adaptive long tail behind `call_runtime_tool`.
-    pub adaptive_runtime_direct_rank: Option<u16>,
-    /// GPT Actions inherits Adaptive Runtime unless a concrete protocol
-    /// incompatibility is declared on the canonical ToolDefinition.
-    pub gpt_action_exposure: ToolGptActionExposure,
-}
-
-impl ToolModelSurfaceDeclaration {
-    const DEFAULT: Self = Self {
-        adaptive_runtime_direct_rank: None,
-        gpt_action_exposure: ToolGptActionExposure::Inherit,
-    };
+    /// Internal task vocabulary for discovery, never a tool alias or authority.
+    pub discovery_keywords: &'static [&'static str],
 }
 
 /// Declarative privacy contract for the bounded Tool Audit / Session-ledger
@@ -337,6 +321,9 @@ pub enum ToolAuditSessionInputPolicy {
     OmitTopLevel(&'static [&'static str]),
     /// Remove nested search patterns while retaining bounded query metadata.
     SearchProjectTexts,
+    /// Preserve the historical single-query omission while redacting nested
+    /// patterns from batched compound search queries.
+    SearchAndRead,
     /// Remove opaque Job observation tokens from nested items.
     ObserveJobs,
 }
@@ -350,6 +337,9 @@ pub enum ToolAuditContextPolicy {
     Fields(&'static [ToolAuditResultField]),
     /// Preserve the historical bounded porcelain-derived working-tree summary.
     WorkingTreeStatus,
+    /// Closed observed task-output metadata; preserves full bounded paths and
+    /// hashes without retaining arbitrary result bodies or log text.
+    TaskOutputs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,6 +382,10 @@ impl ToolAuditExecutionPolicy {
     pub const TEST_ASSERTIONS: Self = Self {
         detail: ToolAuditExecutionDetail::TestAssertions,
         shell: ToolAuditExecutionShell::Output,
+    };
+    pub const DIRECT_ARGV_TEXT: Self = Self {
+        detail: ToolAuditExecutionDetail::Text,
+        shell: ToolAuditExecutionShell::DirectArgv,
     };
     pub const DIRECT_ARGV_TEST_COUNTS: Self = Self {
         detail: ToolAuditExecutionDetail::TestCounts,
@@ -507,6 +501,14 @@ impl ToolAuditResultField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolAuditSemanticResultPolicy {
+    /// Project heterogeneous Computer observation results into the same sparse,
+    /// privacy-preserving metadata retained by the pre-gateway read tools.
+    BrowserObservation,
+    BrowserControl,
+    ComputerObservation,
+    /// Project heterogeneous Computer control results into the sparse lifecycle
+    /// metadata retained by the pre-gateway effect tools.
+    ComputerControl,
     /// Summarize coding-agent event kinds and body byte counts without retaining
     /// any event body or provider message content.
     CodingAgentObservation,
@@ -586,6 +588,8 @@ pub enum ToolExplorationEvidence {
     ReadBatch,
     Search,
     SearchBatch,
+    /// Successful search records nested under `search` in compound inspection.
+    SearchCompound,
     Navigation(ToolNavigationEvidenceKind),
 }
 
@@ -725,6 +729,8 @@ pub enum ToolExecutionForm {
     NativeArgv,
     TypedScript,
     ShellCommand,
+    ProjectBuild,
+    ProjectFormat,
     StructuredValidation,
     PersistentShellCommand,
 }
@@ -735,6 +741,8 @@ impl ToolExecutionForm {
             Self::NativeArgv => "native_argv",
             Self::TypedScript => "typed_script",
             Self::ShellCommand => "shell_command",
+            Self::ProjectBuild => "project_build",
+            Self::ProjectFormat => "project_format",
             Self::StructuredValidation => "structured_validation",
             Self::PersistentShellCommand => "persistent_shell_command",
         }
@@ -915,15 +923,117 @@ pub struct ToolActivitySemantics {
     pub kind: ToolActivityKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCompositionPolicy {
+    Denied,
+    Sequential,
+    Parallel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolHostConcurrencyHint {
+    Unspecified,
+    IndependentParallelRead,
+    Sequential,
+}
+
+impl ToolHostConcurrencyHint {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unspecified => "unspecified",
+            Self::IndependentParallelRead => "independent_parallel_read",
+            Self::Sequential => "sequential",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolHostOrchestrationHint {
+    pub concurrency: ToolHostConcurrencyHint,
+    pub native_batch_field: Option<&'static str>,
+    pub compound_preferred: bool,
+}
+
+impl ToolHostOrchestrationHint {
+    pub const UNSPECIFIED: Self = Self {
+        concurrency: ToolHostConcurrencyHint::Unspecified,
+        native_batch_field: None,
+        compound_preferred: false,
+    };
+
+    pub const fn independent_parallel_read() -> Self {
+        Self {
+            concurrency: ToolHostConcurrencyHint::IndependentParallelRead,
+            ..Self::UNSPECIFIED
+        }
+    }
+
+    pub const fn sequential() -> Self {
+        Self {
+            concurrency: ToolHostConcurrencyHint::Sequential,
+            ..Self::UNSPECIFIED
+        }
+    }
+
+    pub const fn with_native_batch_field(mut self, field: &'static str) -> Self {
+        self.native_batch_field = Some(field);
+        self
+    }
+
+    pub const fn with_compound_preferred(mut self) -> Self {
+        self.compound_preferred = true;
+        self
+    }
+
+    pub const fn is_unspecified(self) -> bool {
+        matches!(self.concurrency, ToolHostConcurrencyHint::Unspecified)
+            && self.native_batch_field.is_none()
+            && !self.compound_preferred
+    }
+}
+
+/// Why a dedicated Adaptive Runtime descriptor is needed. This is static
+/// exposure policy, not a category, authority, effect, or model-facing field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolDirectReason {
+    CoreWorkflow,
+    HostIntegration,
+    /// Present a Host App resource; adapters retain their explicit fallback policy.
+    Presentation,
+    /// Present a Host App for an already selected continuation workflow.
+    Continuation,
+    /// The Host must receive this operation's own schema/effect descriptor.
+    /// Generic execution is not an alternative when it is unloaded or refused.
+    HostReview,
+}
+
+/// One canonical Direct policy: ordering and its reason cannot drift apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolAdaptiveDirectPolicy {
+    pub rank: u16,
+    pub reason: ToolDirectReason,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ToolDefinition {
     pub name: &'static str,
     pub audit: ToolAuditPolicy,
     pub model_spec: Option<ToolModelSpecDeclaration>,
-    pub model_surface: ToolModelSurfaceDeclaration,
+    /// Static dedicated-descriptor policy for Adaptive Runtime. `None` grants
+    /// no admission: ordinary model-visible tools use the gateway, while hidden
+    /// tools and operator extensions retain their independent admission rules.
+    pub adaptive_runtime_direct: Option<ToolAdaptiveDirectPolicy>,
+
     pub operator_extension_family: Option<ToolOperatorExtensionFamily>,
     /// Optional canonical selection semantics for ordinary execution tools.
     pub execution: Option<ToolExecutionContract>,
+    /// Canonical scheduling policy for nested orchestration. This grants no
+    /// authority; orchestration frontends retain their own explicit admission.
+    pub composition: ToolCompositionPolicy,
+    /// Static guidance for Host-native orchestration. This never changes
+    /// admission, authority, effects, permission, retry, idempotency, or the
+    /// nested WebCodex composition scheduler.
+    pub host_orchestration: ToolHostOrchestrationHint,
     pub visibility: ToolVisibility,
     pub category: &'static str,
     pub metadata: ToolMetadata,
@@ -937,6 +1047,19 @@ pub struct ToolDefinition {
 }
 
 impl ToolDefinition {
+    pub(crate) const fn with_individual_host_review(self, rank: u16) -> Self {
+        adaptive_runtime_direct(self, rank, ToolDirectReason::HostReview)
+    }
+
+    pub const fn with_discovery_keywords(mut self, keywords: &'static [&'static str]) -> Self {
+        let Some(mut spec) = self.model_spec else {
+            panic!("discovery keywords require a canonical model spec");
+        };
+        spec.discovery_keywords = keywords;
+        self.model_spec = Some(spec);
+        self
+    }
+
     pub const fn with_operator_extension_family(
         mut self,
         family: ToolOperatorExtensionFamily,
@@ -950,20 +1073,13 @@ impl ToolDefinition {
         self
     }
 
-    /// Override only GPT Actions presentation text. This never changes the
-    /// canonical ToolSpec schema, semantic contract, authority, or MCP copy.
-    pub const fn with_gpt_action_description(mut self, description: &'static str) -> Self {
-        if let Some(mut model_spec) = self.model_spec {
-            model_spec.gpt_action_description = Some(description);
-            self.model_spec = Some(model_spec);
-        }
+    pub const fn with_composition_policy(mut self, policy: ToolCompositionPolicy) -> Self {
+        self.composition = policy;
         self
     }
 
-    /// Mark a canonical model-visible tool as incompatible with GPT Actions
-    /// transport while leaving every other model/runtime surface unchanged.
-    pub const fn with_gpt_action_unsupported(mut self) -> Self {
-        self.model_surface.gpt_action_exposure = ToolGptActionExposure::Unsupported;
+    pub const fn with_host_orchestration_hint(mut self, hint: ToolHostOrchestrationHint) -> Self {
+        self.host_orchestration = hint;
         self
     }
 
@@ -988,22 +1104,28 @@ pub const TOOL_CATEGORY_AGENT_WAIT: &str = "agent_wait";
 pub const TOOL_CATEGORY_ARTIFACT: &str = "artifact";
 pub const TOOL_CATEGORY_CHECKPOINT: &str = "checkpoint";
 pub const TOOL_CATEGORY_CODING_AGENT: &str = "coding_agent";
+pub const TOOL_CATEGORY_BROWSER: &str = "browser";
 pub const TOOL_CATEGORY_COMPUTER: &str = "computer";
 pub const TOOL_CATEGORY_COMMUNICATION: &str = "communication";
 pub const TOOL_CATEGORY_CLEANUP: &str = "cleanup";
 pub const TOOL_CATEGORY_EDIT: &str = "edit";
+pub const TOOL_CATEGORY_EXECUTION: &str = "execution";
 pub const TOOL_CATEGORY_FILE: &str = "file";
 pub const TOOL_CATEGORY_GIT: &str = "git";
 pub const TOOL_CATEGORY_GOAL: &str = "goal";
 pub const TOOL_CATEGORY_JOB: &str = "job";
 pub const TOOL_CATEGORY_LSP: &str = "lsp";
+pub const TOOL_CATEGORY_MEMORY: &str = "memory";
+pub const TOOL_CATEGORY_PLUGIN: &str = "plugin";
 pub const TOOL_CATEGORY_PATCH: &str = "patch";
 pub const TOOL_CATEGORY_PROJECT: &str = "project";
 pub const TOOL_CATEGORY_RUNTIME: &str = "runtime";
 pub const TOOL_CATEGORY_SESSION: &str = "session";
+pub const TOOL_CATEGORY_SKILL: &str = "skill";
 pub const TOOL_CATEGORY_VALIDATION: &str = "validation";
 
 pub const PERMISSION_RISK_ARTIFACT_WRITE: &str = "artifact_write";
+pub const PERMISSION_RISK_BROWSER_CONTROL: &str = "browser_control";
 pub const PERMISSION_RISK_DESTRUCTIVE: &str = "destructive";
 pub const PERMISSION_RISK_JOB: &str = "job";
 pub const PERMISSION_RISK_PATCH: &str = "patch";
@@ -1020,71 +1142,24 @@ pub struct ToolEffectAnnotations {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContextCheckpointPolicy {
-    Never,
-    OnModelFacingResult,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolContextContinuityPolicy {
-    pub accepts_context_ack: bool,
-    pub checkpoint: ContextCheckpointPolicy,
-}
-
-impl ToolContextContinuityPolicy {
-    pub const CONSERVATIVE: Self = Self {
-        accepts_context_ack: true,
-        checkpoint: ContextCheckpointPolicy::OnModelFacingResult,
-    };
-
-    /// Ordinary observations can be repeated without checkpoint recovery.
-    pub const REOBSERVABLE: Self = Self {
-        accepts_context_ack: false,
-        checkpoint: ContextCheckpointPolicy::Never,
-    };
-
-    pub const RECOVERY_ONLY: Self = Self {
-        accepts_context_ack: true,
-        checkpoint: ContextCheckpointPolicy::Never,
-    };
-
-    pub const fn advances_context_checkpoint(self) -> bool {
-        matches!(
-            self.checkpoint,
-            ContextCheckpointPolicy::OnModelFacingResult
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolDefinitionPolicy {
-    pub context_continuity: ToolContextContinuityPolicy,
     pub change_summary_like: bool,
     pub captures_validation_output: bool,
     pub git_like: bool,
     pub permission_risk: Option<&'static str>,
     pub requires_artifact_upload_path_binding: bool,
     pub requires_explicit_business_session: bool,
-    pub unit_arguments: bool,
 }
 
 impl ToolDefinitionPolicy {
     const DEFAULT: Self = Self {
-        context_continuity: ToolContextContinuityPolicy::CONSERVATIVE,
         change_summary_like: false,
         captures_validation_output: false,
         git_like: false,
         permission_risk: None,
         requires_artifact_upload_path_binding: false,
         requires_explicit_business_session: false,
-        unit_arguments: false,
     };
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ToolDiscoveryGroup {
-    pub name: &'static str,
-    pub tools: &'static [&'static str],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1095,7 +1170,7 @@ pub struct ToolRecommendedFlow {
     pub tools: &'static [&'static str],
 }
 
-/// Model-facing task intent for compact `tool_manifest` discovery views.
+/// Model-facing task intent for compact `read_tool_manifest` discovery views.
 /// Distinct from `category` (taxonomy) and recommended flows (short loop hints).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ToolManifestIntent {
@@ -1123,9 +1198,12 @@ const fn def(
         name,
         audit,
         model_spec: None,
-        model_surface: ToolModelSurfaceDeclaration::DEFAULT,
+        adaptive_runtime_direct: None,
+
         operator_extension_family: None,
         execution: None,
+        composition: ToolCompositionPolicy::Denied,
+        host_orchestration: ToolHostOrchestrationHint::UNSPECIFIED,
         visibility,
         category,
         metadata: make_tool_metadata(
@@ -1145,27 +1223,89 @@ const fn def(
     }
 }
 
-const fn model_spec(
-    definition: ToolDefinition,
-    description: &'static str,
-    input_schema: ToolInputSchemaFactory,
+// Runner-backed Project reads share this authority/effect contract. Audit
+// redaction, capability, path selection, and Session evidence stay explicit
+// at each declaration; mutation and execution tools continue to use `def`.
+const fn runner_project_read_def(
+    name: &'static str,
+    audit: ToolAuditPolicy,
+    category: &'static str,
+    runner_capability: RunnerCapabilityRequirement,
+    path_hint: ToolPathHint,
+    session_evidence: ToolSessionEvidencePolicy,
 ) -> ToolDefinition {
+    def(
+        name,
+        audit,
+        ToolVisibility::ModelVisible,
+        category,
+        Some(runner_capability),
+        TOOL_PROVIDER_RUNNER,
+        ToolSemanticContract {
+            effect: ToolEffect::Observe,
+            risk: ToolRisk::Read,
+            approval: ToolApprovalPolicy::None,
+            idempotency: ToolIdempotency::PureRead,
+        },
+        Some(PROJECT_READ),
+        true,
+        path_hint,
+        false,
+        false,
+        session_evidence,
+    )
+}
+
+// Server-owned Control operations without a Project, path, Runner dispatch, or
+// Session evidence. Authority, effect, idempotency, and destructive intent stay
+// explicit at each declaration.
+const fn control_def(
+    name: &'static str,
+    audit: ToolAuditPolicy,
+    visibility: ToolVisibility,
+    category: &'static str,
+    semantic: ToolSemanticContract,
+    required_scope: Option<&'static str>,
+    destructive: bool,
+) -> ToolDefinition {
+    def(
+        name,
+        audit,
+        visibility,
+        category,
+        None,
+        TOOL_PROVIDER_CONTROL,
+        semantic,
+        required_scope,
+        false,
+        NoPath,
+        destructive,
+        false,
+        ToolSessionEvidencePolicy::NONE,
+    )
+}
+
+const fn model_spec(definition: ToolDefinition, description: &'static str) -> ToolDefinition {
     ToolDefinition {
         model_spec: Some(ToolModelSpecDeclaration {
             description,
-            input_schema,
-            gpt_action_description: None,
+            discovery_keywords: &[],
         }),
         ..definition
     }
 }
 
-const fn adaptive_runtime_direct(definition: ToolDefinition, rank: u16) -> ToolDefinition {
+const fn adaptive_runtime_direct(
+    definition: ToolDefinition,
+    rank: u16,
+    reason: ToolDirectReason,
+) -> ToolDefinition {
+    assert!(matches!(
+        definition.visibility,
+        ToolVisibility::ModelVisible
+    ));
     ToolDefinition {
-        model_surface: ToolModelSurfaceDeclaration {
-            adaptive_runtime_direct_rank: Some(rank),
-            ..definition.model_surface
-        },
+        adaptive_runtime_direct: Some(ToolAdaptiveDirectPolicy { rank, reason }),
         ..definition
     }
 }
@@ -1216,27 +1356,6 @@ bool_policy_modifier!(change_summary_like, change_summary_like);
 
 bool_policy_modifier!(git_like, git_like);
 
-const fn context_continuity(
-    definition: ToolDefinition,
-    context_continuity: ToolContextContinuityPolicy,
-) -> ToolDefinition {
-    ToolDefinition {
-        policy: ToolDefinitionPolicy {
-            context_continuity,
-            ..definition.policy
-        },
-        ..definition
-    }
-}
-
-const fn context_reobservable(definition: ToolDefinition) -> ToolDefinition {
-    context_continuity(definition, ToolContextContinuityPolicy::REOBSERVABLE)
-}
-
-const fn context_recovery_only(definition: ToolDefinition) -> ToolDefinition {
-    context_continuity(definition, ToolContextContinuityPolicy::RECOVERY_ONLY)
-}
-
 const fn permission_risk(
     definition: ToolDefinition,
     permission_risk: &'static str,
@@ -1254,8 +1373,6 @@ bool_policy_modifier!(
     requires_artifact_upload_path_binding,
     requires_artifact_upload_path_binding
 );
-
-bool_policy_modifier!(unit_arguments, unit_arguments);
 
 bool_policy_modifier!(
     requires_explicit_business_session,
@@ -1275,6 +1392,7 @@ pub fn tool_definitions() -> impl Iterator<Item = &'static ToolDefinition> {
 const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     TOOL_DEFINITION_HEAD,
     sessions::DEFINITIONS,
+    documents::DEFINITIONS,
     communication::DEFINITIONS,
     goals::DEFINITIONS,
     agent_tasks::DEFINITIONS,
@@ -1285,14 +1403,14 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     #[cfg(feature = "workspace-checkpoints")]
     checkpoints::DEFINITIONS,
     coding_agents::DEFINITIONS,
+    #[cfg(feature = "experimental-code-mode")]
+    code_mode::DEFINITIONS,
+    browser::DEFINITIONS,
     computer::DEFINITIONS,
     diagnostics::DEFINITIONS,
     discovery::DEFINITIONS,
+    resource_references::DEFINITIONS,
     runner_config::DEFINITIONS,
-    action_tools::DEFINITIONS,
-    session_tools::DEFINITIONS,
-    #[cfg(feature = "workspace-checkpoints")]
-    session_tools::CHECKPOINT_DEFINITIONS,
     ssh_resources::DEFINITIONS,
     plugins::DEFINITIONS,
     jobs::EXECUTION_DEFINITIONS,
@@ -1306,17 +1424,16 @@ const TOOL_DEFINITION_GROUPS: &[&[ToolDefinition]] = &[
     patches::DEFINITIONS,
     hygiene::CLEANUP_DEFINITIONS,
     artifacts::DEFINITIONS,
+    docx::DEFINITIONS,
     edits::DEFINITIONS,
 ];
 
-const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[context_reobservable(model_spec(
-    def(
+const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[model_spec(
+    control_def(
         "list_tools",
         ToolAuditPolicy::TYPED_CANONICAL,
         ModelVisible,
         TOOL_CATEGORY_RUNTIME,
-        None,
-        TOOL_PROVIDER_CONTROL,
         ToolSemanticContract {
             effect: ToolEffect::Observe,
             risk: Read,
@@ -1325,15 +1442,10 @@ const TOOL_DEFINITION_HEAD: &[ToolDefinition] = &[context_reobservable(model_spe
         },
         Some(RUNTIME_READ),
         false,
-        NoPath,
-        false,
-        false,
-        ToolSessionEvidencePolicy::NONE,
     )
     .with_activity(
         ToolActivityPresentation::Support,
         ToolActivityInteraction::NonMeaningful,
     ),
-    "List runtime tools. Full output includes schemas and may be large; use summary_only with category, features, or limit for bounded GPT Action discovery.",
-    list_tools_input_schema,
-))];
+    "List tool summaries by category/features; keyword or exact contract lookup uses read_tool_manifest. Use summary_only=true to avoid full schema expansion; limit bounds the returned tools.",
+)];

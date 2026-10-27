@@ -1,7 +1,11 @@
 use super::*;
 use crate::runner_http::{RunnerTransport, TRANSPORT_WEBSOCKET};
-use crate::runner_protocol::{RunnerCapabilities, ShellJobOpRequest};
+use crate::runner_protocol::RunnerCapabilities;
 use tokio::time::Instant;
+use webcodex_runner_registry::JobStartRequest;
+
+#[path = "runner_session_tests/computer_cancellation.rs"]
+mod computer_cancellation;
 
 const SESSION_TEST_TIMEOUT: Duration = Duration::from_millis(250);
 
@@ -22,6 +26,7 @@ fn streaming_registration(client_id: &str, runner_instance_id: &str) -> RunnerRe
     capabilities.async_jobs = true;
     capabilities.async_shell_jobs = true;
     crate::test_support::current_runner_registration(RunnerRegisterRequest {
+        computer_session_availability: None,
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,
@@ -35,24 +40,15 @@ fn streaming_registration(client_id: &str, runner_instance_id: &str) -> RunnerRe
         owner: None,
         hostname: None,
         host_context: None,
-        capabilities: capabilities,
+        capabilities,
         policy: None,
     })
 }
 
-fn start_job_request(client_id: &str) -> ShellJobOpRequest {
-    ShellJobOpRequest {
-        op: "start".to_string(),
-        client_id: Some(client_id.to_string()),
-        cwd: None,
-        command: Some("sleep 1".to_string()),
-        timeout_secs: Some(1),
-        job_id: None,
-        since_stdout_line: None,
-        since_stderr_line: None,
-        tail_lines: None,
-        limit: None,
-        codex: None,
+fn start_job_request(client_id: &str) -> JobStartRequest {
+    JobStartRequest {
+        timeout_secs: 1,
+        ..JobStartRequest::shell(client_id, "sleep 1")
     }
 }
 
@@ -90,7 +86,12 @@ async fn writer_failure_terminates_session_and_reconciles_active_job() {
     let registry = Arc::new(RunnerRegistry::default());
     let (notify, cancel) = register_streaming(&registry, "writer-fail", "inst-a", "conn-a").await;
     let job = registry
-        .start_job(start_job_request("writer-fail"), "test".to_string())
+        .start_job(
+            start_job_request("writer-fail"),
+            "test".to_string(),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let (out_tx, _out_rx) = mpsc::channel(OUTGOING_CHANNEL_CAPACITY);
@@ -106,7 +107,7 @@ async fn writer_failure_terminates_session_and_reconciles_active_job() {
                 connection_id: "conn-a",
                 notify,
                 cancel,
-                transport_label: "websocket",
+                transport: RunnerTransport::WebSocket,
             },
             out_tx,
             PendingReader,
@@ -138,7 +139,7 @@ async fn writer_task_panic_terminates_session() {
                 connection_id: "conn-a",
                 notify,
                 cancel,
-                transport_label: "websocket",
+                transport: RunnerTransport::WebSocket,
             },
             out_tx,
             PendingReader,
@@ -178,7 +179,7 @@ async fn pump_exit_terminates_pending_reader_and_reconciles_exact_connection() {
                     connection_id: "conn-a",
                     notify,
                     cancel,
-                    transport_label: "websocket",
+                    transport: RunnerTransport::WebSocket,
                 },
                 out_tx,
                 PendingReader,
@@ -214,7 +215,7 @@ async fn pump_task_panic_terminates_session() {
                 connection_id: "conn-a",
                 notify,
                 cancel,
-                transport_label: "websocket",
+                transport: RunnerTransport::WebSocket,
             },
             out_tx,
             PendingReader,
@@ -240,7 +241,12 @@ async fn same_instance_replacement_actively_terminates_old_session_without_losin
     let (notify_a, cancel_a) =
         register_streaming(&registry, "replace-active", "inst-a", "conn-a").await;
     let active_job = registry
-        .start_job(start_job_request("replace-active"), "test".to_string())
+        .start_job(
+            start_job_request("replace-active"),
+            "test".to_string(),
+            None,
+            None,
+        )
         .await
         .unwrap();
     let (out_tx, writer_task) = alive_writer();
@@ -254,7 +260,7 @@ async fn same_instance_replacement_actively_terminates_old_session_without_losin
                 connection_id: "conn-a",
                 notify: notify_a,
                 cancel: cancel_a,
-                transport_label: "websocket",
+                transport: RunnerTransport::WebSocket,
             },
             out_tx,
             PendingReader,
@@ -326,7 +332,7 @@ async fn stale_writer_failure_cannot_reconcile_replacement_connection() {
                 connection_id: "conn-a",
                 notify: notify_a,
                 cancel: cancel_a,
-                transport_label: "quic",
+                transport: RunnerTransport::Quic,
             },
             out_tx,
             PendingReader,

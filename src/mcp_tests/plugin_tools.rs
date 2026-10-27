@@ -6,6 +6,9 @@ use webcodex_core::plugin::{
     PluginGatewayResponsePayload, PluginProviderView, PluginTool, PluginToolResult,
 };
 
+#[path = "plugin_tools/argument_recovery.rs"]
+mod argument_recovery;
+
 async fn wait_for_plugin_request(
     registry: &crate::runner_http::RunnerRegistry,
     client_id: &str,
@@ -47,6 +50,8 @@ async fn complete_plugin_request(
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -85,6 +90,7 @@ fn plugin_auth_with_scopes(scopes: &[&str]) -> crate::auth::AuthContext {
 
 fn plugin_tool(name: &str) -> PluginTool {
     PluginTool {
+        project_bound: false,
         name: name.to_string(),
         title: Some("Repository Search".to_string()),
         description: Some("Search repository symbols".to_string()),
@@ -191,6 +197,7 @@ async fn register_plugin_runner_with_status(
         .runner_registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 client_id: client_id.to_string(),
                 runner_instance_id: runner_instance_id.to_string(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -222,6 +229,7 @@ async fn register_non_plugin_runner_for_owner(
         .runner_registry
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
+                computer_session_availability: None,
                 client_id: client_id.to_string(),
                 runner_instance_id: runner_instance_id.to_string(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -404,6 +412,123 @@ fn spawn_binding_call(
     })
 }
 
+#[tokio::test]
+async fn openai_presentation_preserves_plugin_provider_errors_and_projects_governance_denials() {
+    let runtime = Arc::new(test_runtime());
+    let auth = plugin_auth_with_scopes(&[
+        crate::auth::SCOPE_PLUGIN_INSPECT,
+        crate::auth::SCOPE_PLUGIN_INVOKE,
+    ]);
+    let tool = plugin_tool("search_symbol");
+    register_plugin_runner(
+        &runtime,
+        "runner-a",
+        "runner-instance-a",
+        "repo-tools",
+        "provider-instance-a",
+        vec![tool.clone()],
+    )
+    .await;
+    let (binding, _) = describe_dynamic_binding(
+        &runtime,
+        &auth,
+        "runner-a",
+        "runner-instance-a",
+        PluginProviderView {
+            provider_id: "repo-tools".into(),
+            provider_instance_id: "provider-instance-a".into(),
+            name: "Repo Tools".into(),
+            status: "ready".into(),
+            error_code: None,
+        },
+        tool,
+        780,
+    )
+    .await;
+    let provider_result = PluginToolResult {
+        content: vec![PluginContent::Text {
+            text: "upstream rejected the request".into(),
+        }],
+        // Even a provider payload resembling ToolResult remains provider-owned.
+        structured_content: Some(
+            json!({"success": false, "output": {"provider_code": "REJECTED"}, "error": "provider failure"}),
+        ),
+        is_error: true,
+    };
+    let session =
+        start_authorized_test_session(&runtime, &auth, crate::tool_runtime::SessionMode::ReadOnly);
+    for client in ["generic-test-client", "openai-mcp"] {
+        let params = json!({
+            "name": "plugin_tool",
+            "arguments": {"action": "call", "binding": binding, "arguments": {"query": "probe"}},
+            "_meta": {"io.modelcontextprotocol/clientInfo": {"name": client, "version": "2"}},
+        });
+        let call = handle_mcp_request(
+            &runtime,
+            rpc("tools/call", Some(json!(781)), params),
+            Some(&auth),
+        );
+        let complete = async {
+            let request =
+                wait_for_plugin_request(&runtime.runner_registry, "runner-a", "runner-instance-a")
+                    .await;
+            complete_plugin_request(
+                &runtime,
+                request,
+                "runner-instance-a",
+                PluginGatewayResponse::success(PluginGatewayResponsePayload::ToolResult {
+                    result: provider_result.clone(),
+                }),
+            )
+            .await;
+        };
+        let (outcome, ()) = tokio::join!(call, complete);
+        let McpOutcome::Ok(body) = outcome else {
+            panic!("provider result must remain a result");
+        };
+        assert_eq!(
+            body["result"],
+            serde_json::to_value(&provider_result).unwrap()
+        );
+
+        let mut denied_params = mcp_2026_params(json!({
+            "name": "plugin_tool",
+            "arguments": {
+                "action": "call",
+                "binding": binding,
+                "arguments": {"query": "probe"},
+                "_wc": {"record": session.session_id}
+            }
+        }));
+        denied_params["_meta"]["io.modelcontextprotocol/clientInfo"] =
+            json!({"name": client, "version": "2"});
+        let denied = handle_mcp_request(
+            &runtime,
+            rpc("tools/call", Some(json!(782)), denied_params),
+            Some(&auth),
+        )
+        .await;
+        let McpOutcome::Ok(body) = denied else {
+            panic!("canonical governance denial must remain a result");
+        };
+        assert_eq!(body["result"]["isError"], client != "openai-mcp");
+        assert_eq!(body["result"]["structuredContent"]["success"], false);
+        assert_eq!(
+            body["result"]["structuredContent"]["output"]["error_kind"],
+            "session_guard_denied"
+        );
+        assert!(runtime
+            .runner_registry
+            .poll(RunnerPollRequest {
+                client_id: "runner-a".into(),
+                runner_instance_id: "runner-instance-a".into()
+            })
+            .await
+            .unwrap()
+            .is_none());
+    }
+}
+
 fn spawn_plugin_metadata_call(
     runtime: &Arc<ToolRuntime>,
     auth: &crate::auth::AuthContext,
@@ -459,7 +584,7 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
             681,
             json!({
                 "action":"call",
-                "binding":"wc_pbind_00000000000000000000000000000000",
+                "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
                 "arguments":{}
             }),
             crate::auth::SCOPE_PLUGIN_INVOKE,
@@ -486,9 +611,12 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
         )
         .await;
         match outcome {
-            McpOutcome::Forbidden { required_scope, .. } => {
-                assert_eq!(required_scope, Some(required));
-            }
+            McpOutcome::Ok(body) => super::fixed_scope::assert_fixed_scope_failure(
+                &body,
+                required,
+                false,
+                "fixed token",
+            ),
             other => panic!("plugin:inspect must not escalate to {required}: {other:?}"),
         }
     }
@@ -502,7 +630,7 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_00000000000000000000000000000000",
+                    "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
                     "arguments":{}
                 }
             }),
@@ -539,9 +667,12 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
         )
         .await;
         match outcome {
-            McpOutcome::Forbidden { required_scope, .. } => {
-                assert_eq!(required_scope, Some(crate::auth::SCOPE_PLUGIN_MANAGE));
-            }
+            McpOutcome::Ok(body) => super::fixed_scope::assert_fixed_scope_failure(
+                &body,
+                crate::auth::SCOPE_PLUGIN_MANAGE,
+                false,
+                "fixed token",
+            ),
             other => panic!("plugin:invoke must not manage Plugins: {other:?}"),
         }
     }
@@ -555,7 +686,7 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_00000000000000000000000000000000",
+                    "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
                     "arguments":{}
                 }
             }),
@@ -564,9 +695,12 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
     )
     .await;
     match manage_call {
-        McpOutcome::Forbidden { required_scope, .. } => {
-            assert_eq!(required_scope, Some(crate::auth::SCOPE_PLUGIN_INVOKE));
-        }
+        McpOutcome::Ok(body) => super::fixed_scope::assert_fixed_scope_failure(
+            &body,
+            crate::auth::SCOPE_PLUGIN_INVOKE,
+            false,
+            "fixed token",
+        ),
         other => panic!("plugin:manage must not imply plugin:invoke: {other:?}"),
     }
 
@@ -595,7 +729,10 @@ async fn plugin_operation_scopes_are_independent_and_fail_closed() {
 
 #[tokio::test]
 async fn read_only_session_allows_plugin_inspect_but_denies_call_before_provider_dispatch() {
-    let runtime = test_runtime();
+    let tmp = tempfile::tempdir().unwrap();
+    let runtime = test_runtime().with_project_reference_database(std::sync::Arc::new(
+        crate::Database::open(&tmp.path().join("plugin-recorder-refs.db")).unwrap(),
+    ));
     let auth = plugin_auth_with_scopes(&[
         crate::auth::SCOPE_PLUGIN_INSPECT,
         crate::auth::SCOPE_PLUGIN_INVOKE,
@@ -611,19 +748,22 @@ async fn read_only_session_allows_plugin_inspect_but_denies_call_before_provider
     .await;
     let session =
         start_authorized_test_session(&runtime, &auth, crate::tool_runtime::SessionMode::ReadOnly);
+    let recorder_ref = runtime
+        .session_reference_for_id(&session.session_id, Some(&auth))
+        .expect("authorized Plugin recorder should expose a Session ref");
 
     let inspect = handle_mcp_request(
         &runtime,
         rpc(
             "tools/call",
             Some(json!(689)),
-            json!({
+            mcp_2026_params(json!({
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"list",
-                    "recording_session_id":session.session_id
+                    "_wc":{"record":recorder_ref}
                 }
-            }),
+            })),
         ),
         Some(&auth),
     )
@@ -638,15 +778,15 @@ async fn read_only_session_allows_plugin_inspect_but_denies_call_before_provider
         rpc(
             "tools/call",
             Some(json!(690)),
-            json!({
+            mcp_2026_params(json!({
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_0123456789abcdef0123456789abcdef",
+                    "binding":"wc_pbind_ASNFZ4mrze8BI0VniavN7w",
                     "arguments":{"query":"must-not-run"},
-                    "recording_session_id":session.session_id
+                    "_wc":{"record":recorder_ref}
                 }
-            }),
+            })),
         ),
         Some(&auth),
     )
@@ -677,7 +817,7 @@ async fn read_only_session_allows_plugin_inspect_but_denies_call_before_provider
         runtime.sessions.summary(&session.session_id, Some(100))
     );
     assert!(!ledger.contains("must-not-run"));
-    assert!(!ledger.contains("wc_pbind_0123456789abcdef0123456789abcdef"));
+    assert!(!ledger.contains("wc_pbind_ASNFZ4mrze8BI0VniavN7w"));
 }
 
 #[tokio::test]
@@ -696,13 +836,13 @@ async fn specialized_recording_session_authority_fails_closed_at_mcp_boundary() 
         rpc(
             "tools/call",
             Some(json!(693)),
-            json!({
+            mcp_2026_params(json!({
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"list",
-                    "recording_session_id":session.session_id
+                    "_wc":{"record":session.session_id}
                 }
-            }),
+            })),
         ),
         Some(&foreign),
     )
@@ -722,8 +862,8 @@ async fn specialized_recording_session_authority_fails_closed_at_mcp_boundary() 
 }
 
 #[tokio::test]
-async fn plugin_tool_does_not_accept_stateless_continuity_wrappers() {
-    let runtime = test_runtime_with_surface(ModelSurface::FullOperatorRuntime);
+async fn plugin_tool_accepts_collaboration_ack_but_rejects_other_stateless_wrappers() {
+    let runtime = test_runtime();
     let auth = plugin_auth_with_scopes(&[crate::auth::SCOPE_PLUGIN_INSPECT]);
     register_plugin_runner(
         &runtime,
@@ -735,37 +875,47 @@ async fn plugin_tool_does_not_accept_stateless_continuity_wrappers() {
     )
     .await;
 
-    for (id, arguments) in [
-        (
-            694,
-            json!({
-                "action":"list",
-                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD: ["wc_msg_cached"]
-            }),
+    let ack = handle_mcp_request(
+        &runtime,
+        rpc(
+            "tools/call",
+            Some(json!(694)),
+            mcp_2026_params(json!({
+                "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
+                "arguments": {
+                    "action":"list",
+                    "_wc":{"ack":["wc_msg_0123456789abcdef"]}
+                }
+            })),
         ),
-        (
-            695,
-            json!({
-                "action":"list",
-                crate::tool_runtime::sessions::TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD: 7
-            }),
-        ),
-        (
-            696,
-            json!({
-                "action":"list",
-                crate::tool_runtime::context_projection::TOOL_CALL_CONTEXT_REQUEST_FIELD: ["webcodex.workflow"]
-            }),
-        ),
+        Some(&auth),
+    )
+    .await;
+    let McpOutcome::Ok(ack) = ack else {
+        panic!("specialized plugin_tool must accept the collaboration ACK wrapper");
+    };
+    assert_eq!(ack["result"]["isError"], false, "{ack}");
+    assert!(!serde_json::to_string(&ack)
+        .unwrap()
+        .contains("ack_session_message_ids"));
+    assert!(runtime
+        .runner_registry
+        .poll(RunnerPollRequest {
+            client_id: "runner-a".to_string(),
+            runner_instance_id: "runner-instance-a".to_string(),
+        })
+        .await
+        .unwrap()
+        .is_none());
+
+    for (id, envelope) in [
+        (696, json!({"context": ["webcodex.workflow"]})),
         (
             697,
-            json!({
-                "action":"list",
-                crate::tool_runtime::sessions::TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD: {
-                    "message_id": "wc_msg_cached",
-                    "resolution": "handled"
-                }
-            }),
+            json!({"resolve": {
+                "message_id": "wc_msg_cached",
+                "resolution": "handled"
+            }}),
         ),
     ] {
         let outcome = handle_mcp_request(
@@ -775,17 +925,17 @@ async fn plugin_tool_does_not_accept_stateless_continuity_wrappers() {
                 Some(json!(id)),
                 mcp_2026_params(json!({
                     "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
-                    "arguments": arguments
+                    "arguments": {"action":"list", "_wc": envelope}
                 })),
             ),
             Some(&auth),
         )
         .await;
         let McpOutcome::BadRequest(value) = outcome else {
-            panic!("specialized plugin_tool must reject generic continuity wrappers");
+            panic!("specialized plugin_tool must reject non-ACK generic continuity wrappers");
         };
         let encoded = serde_json::to_string(&value).unwrap();
-        assert!(encoded.contains("unknown field"), "{encoded}");
+        assert!(encoded.contains("unsupported _wc field"), "{encoded}");
         assert!(runtime
             .runner_registry
             .poll(RunnerPollRequest {
@@ -825,7 +975,7 @@ async fn restricted_permission_denies_plugin_call_and_outer_direct_name_never_di
                 "name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                 "arguments": {
                     "action":"call",
-                    "binding":"wc_pbind_0123456789abcdef0123456789abcdef",
+                    "binding":"wc_pbind_ASNFZ4mrze8BI0VniavN7w",
                     "arguments":{"query":"must-not-run"}
                 }
             }),
@@ -1409,7 +1559,7 @@ async fn plugin_tool_list_argument_matrix_rejects_ambiguous_inputs_before_dispat
         ),
         (
             769,
-            json!({"action":"list","runner":"runner-a","binding":"wc_pbind_00000000000000000000000000000000"}),
+            json!({"action":"list","runner":"runner-a","binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA"}),
         ),
         (
             770,
@@ -1559,6 +1709,7 @@ async fn generic_runtime_plugin_gateway_list_describe_call_and_error_certainty_s
     assert!(matches!(
         call_request.plugin_gateway,
         Some(PluginGatewayRequest::ToolsCall {
+            project_target: None,
             ref provider_id,
             ref provider_instance_id,
             ref name,
@@ -1719,7 +1870,7 @@ async fn generic_runtime_plugin_governance_is_action_aware_and_records_one_api_l
         &invoke,
         json!({
             "action":"call",
-            "binding":"wc_pbind_00000000000000000000000000000000",
+            "binding":"wc_pbind_AAAAAAAAAAAAAAAAAAAAAA",
             "arguments":{}
         }),
         None,
@@ -1750,58 +1901,47 @@ async fn generic_runtime_plugin_governance_is_action_aware_and_records_one_api_l
 }
 
 #[tokio::test]
-async fn provider_tool_names_never_enter_outer_mcp_inventory_on_any_model_surface() {
+async fn provider_tool_names_never_enter_outer_mcp_inventory() {
     let auth = plugin_auth(true);
-    for surface in [
-        ModelSurface::LocalCoding,
-        ModelSurface::AdaptiveRuntime,
-        ModelSurface::FullOperatorRuntime,
-    ] {
-        let runtime = test_runtime_with_surface(surface);
-        register_plugin_runner(
-            &runtime,
-            "runner-a",
-            "runner-instance-a",
-            "repo-tools-a",
-            "provider-instance-a",
-            vec![plugin_tool("safe_delete"), plugin_tool("runtime_status")],
-        )
-        .await;
-        register_plugin_runner(
-            &runtime,
-            "runner-b",
-            "runner-instance-b",
-            "repo-tools-b",
-            "provider-instance-b",
-            vec![plugin_tool("safe_delete")],
-        )
-        .await;
+    let runtime = test_runtime();
+    register_plugin_runner(
+        &runtime,
+        "runner-a",
+        "runner-instance-a",
+        "repo-tools-a",
+        "provider-instance-a",
+        vec![
+            plugin_tool("safe_delete"),
+            plugin_tool("get_runtime_status"),
+        ],
+    )
+    .await;
+    register_plugin_runner(
+        &runtime,
+        "runner-b",
+        "runner-instance-b",
+        "repo-tools-b",
+        "provider-instance-b",
+        vec![plugin_tool("safe_delete")],
+    )
+    .await;
 
-        let value = tools_list(&runtime, &auth, true).await;
-        let names = value["result"]["tools"]
-            .as_array()
-            .unwrap()
+    let value = tools_list(&runtime, &auth, true).await;
+    let names = value["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&crate::plugin_gateway::PLUGIN_TOOL_NAME));
+    assert!(!names.contains(&"safe_delete"));
+    assert_eq!(
+        names
             .iter()
-            .filter_map(|tool| tool["name"].as_str())
-            .collect::<Vec<_>>();
-        assert!(
-            names.contains(&crate::plugin_gateway::PLUGIN_TOOL_NAME),
-            "stable gateway missing on {surface:?}"
-        );
-        assert!(
-            !names.contains(&"safe_delete"),
-            "provider-local name leaked into outer MCP on {surface:?}"
-        );
-        // A provider-local collision with a built-in is legal because the
-        // provider tool never contributes a second outer ToolSpec.
-        assert_eq!(
-            names
-                .iter()
-                .filter(|name| **name == "runtime_status")
-                .count(),
-            usize::from(surface != ModelSurface::LocalCoding)
-        );
-    }
+            .filter(|name| **name == "get_runtime_status")
+            .count(),
+        1
+    );
 
     let specs = registered_tool_specs();
     assert_eq!(
@@ -1816,7 +1956,7 @@ async fn provider_tool_names_never_enter_outer_mcp_inventory_on_any_model_surfac
 
 #[tokio::test]
 async fn outer_direct_provider_tool_call_is_never_plugin_dispatch() {
-    let runtime = test_runtime_with_surface(ModelSurface::LocalCoding);
+    let runtime = test_runtime();
     let auth = plugin_auth(true);
     register_plugin_runner(
         &runtime,
@@ -1871,7 +2011,7 @@ async fn any_plugin_scope_exposes_only_the_stable_gateway() {
         (705, crate::auth::SCOPE_PLUGIN_INVOKE),
         (706, crate::auth::SCOPE_PLUGIN_MANAGE),
     ] {
-        let runtime = test_runtime_with_surface(ModelSurface::LocalCoding);
+        let runtime = test_runtime();
         register_plugin_runner(
             &runtime,
             "runner-a",
@@ -1904,7 +2044,7 @@ async fn any_plugin_scope_exposes_only_the_stable_gateway() {
 
 #[tokio::test]
 async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner_inventory() {
-    let runtime = test_runtime_with_surface(ModelSurface::AdaptiveRuntime);
+    let runtime = test_runtime();
     let auth = plugin_auth_with_scopes(&[
         crate::auth::SCOPE_PLUGIN_INSPECT,
         crate::auth::SCOPE_RUNTIME_READ,
@@ -1915,7 +2055,7 @@ async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner
             "tools/call",
             Some(json!(7061)),
             mcp_2026_params(json!({
-                "name": "tool_manifest",
+                "name": "read_tool_manifest",
                 "arguments": {
                     "tool_name": crate::plugin_gateway::PLUGIN_TOOL_NAME,
                     "include_recommended_flows": false,
@@ -1927,15 +2067,24 @@ async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner
     )
     .await;
     let McpOutcome::Ok(value) = outcome else {
-        panic!("tool_manifest(plugin_tool) must succeed without any Runner inventory");
+        panic!("read_tool_manifest(plugin_tool) must succeed without any Runner inventory");
     };
     let output = &value["result"]["structuredContent"]["output"];
     assert_eq!(output["name"], crate::plugin_gateway::PLUGIN_TOOL_NAME);
-    assert_eq!(output["route"]["mode"], "direct");
-    assert!(output["route"].get("via").is_none());
+    assert_eq!(output["route"]["primary"]["mode"], "direct");
+    assert_eq!(
+        output["route"]["primary"]["tool"],
+        crate::plugin_gateway::PLUGIN_TOOL_NAME
+    );
+    assert_eq!(output["route"]["fallback"]["mode"], "gateway");
+    assert_eq!(output["route"]["fallback"]["tool"], "call_runtime_tool");
+    assert_eq!(
+        output["route"]["fallback"]["target"],
+        crate::plugin_gateway::PLUGIN_TOOL_NAME
+    );
     assert_eq!(
         output["input_schema"]["properties"]["binding"]["pattern"],
-        "^wc_pbind_[0-9a-f]{32}$"
+        "^wc_pbind_[A-Za-z0-9_-]{21}[AQgw]$"
     );
     assert_eq!(output["authority"]["policy"], "require_any");
     let scopes = output["authority"]["scopes"]
@@ -1965,7 +2114,10 @@ async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner
         .iter()
         .find(|tool| tool["name"] == crate::plugin_gateway::PLUGIN_TOOL_NAME)
         .expect("plugin_tool after Runner registration");
-    assert_eq!(gateway["inputSchema"], output["input_schema"]);
+    assert_eq!(
+        super::cli::business_schema_with_collaboration_checked(&gateway["inputSchema"]),
+        output["input_schema"]
+    );
     assert!(!listed["result"]["tools"]
         .as_array()
         .unwrap()
@@ -1986,10 +2138,14 @@ async fn tool_manifest_returns_sparse_static_plugin_tool_contract_without_runner
             "Stateless MCP must preserve canonical Plugin business schema for {field}"
         );
     }
-    assert_eq!(
-        stateless_gateway["inputSchema"]["properties"]["recording_session_id"]["pattern"],
-        "^wc_sess_[A-Za-z0-9_]+$"
-    );
+    for schema in [&output["input_schema"], &stateless_gateway["inputSchema"]] {
+        assert!(
+            schema["properties"]["recording_session_id"]
+                .get("pattern")
+                .is_none(),
+            "sparse Plugin discovery intentionally omits the opaque wc_sess_* regex"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2109,6 +2265,7 @@ async fn same_tool_name_is_legal_across_runners_and_providers_and_bindings_dispa
         assert!(matches!(
             request.plugin_gateway,
             Some(PluginGatewayRequest::ToolsCall {
+            project_target: None,
                 ref provider_id,
                 ref provider_instance_id,
                 ref name,
@@ -2288,6 +2445,7 @@ async fn plugin_tool_reload_describe_call_binds_exact_dynamic_provider_and_forge
     let call_request =
         wait_for_plugin_request(&runtime.runner_registry, "runner-a", "runner-instance-a").await;
     let Some(PluginGatewayRequest::ToolsCall {
+        project_target: None,
         provider_instance_id,
         name,
         arguments,
@@ -2339,6 +2497,7 @@ async fn plugin_tool_reload_describe_call_binds_exact_dynamic_provider_and_forge
     assert!(matches!(
         replacement_request.plugin_gateway,
         Some(PluginGatewayRequest::ToolsCall {
+            project_target: None,
             ref provider_instance_id,
             ..
         }) if provider_instance_id == "dynamic-provider-instance"
@@ -2492,6 +2651,7 @@ async fn plugin_binding_a_never_retargets_across_reload_and_binding_b_still_call
     assert!(matches!(
         request_a.plugin_gateway,
         Some(PluginGatewayRequest::ToolsCall {
+            project_target: None,
             ref provider_instance_id,
             ref name,
             ..
@@ -2524,6 +2684,7 @@ async fn plugin_binding_a_never_retargets_across_reload_and_binding_b_still_call
     let request_b =
         wait_for_plugin_request(&runtime.runner_registry, "runner-a", "runner-instance-a").await;
     let Some(PluginGatewayRequest::ToolsCall {
+        project_target: None,
         provider_instance_id,
         name,
         arguments,
@@ -2604,7 +2765,15 @@ async fn plugin_binding_rechecks_scope_and_runner_owner_without_invalidating_own
         Some(&plugin_auth_for("alice", false)),
     )
     .await;
-    assert!(matches!(no_scope, McpOutcome::Forbidden { .. }));
+    let McpOutcome::Ok(no_scope) = no_scope else {
+        panic!("missing plugin scope must return a failed MCP result");
+    };
+    super::fixed_scope::assert_fixed_scope_failure(
+        &no_scope,
+        crate::auth::SCOPE_PLUGIN_INVOKE,
+        false,
+        "fixed token",
+    );
 
     let bob = plugin_auth_for("bob", true);
     let bob_result = handle_mcp_request(
@@ -2776,6 +2945,7 @@ async fn plugin_binding_runner_replacement_and_schema_change_fail_closed() {
     assert!(matches!(
         schema_request.plugin_gateway,
         Some(PluginGatewayRequest::ToolsCall {
+            project_target: None,
             ref provider_instance_id,
             ..
         }) if provider_instance_id == "dynamic-provider-instance"

@@ -14,7 +14,7 @@ use super::catalog::{
     project_root_fingerprint, project_wire_kind, AUTO_REGISTERED_REGISTRATION_SOURCE,
 };
 use super::{project_registry_write_lock, structured_project_error_cmd, RunnerProjectFile};
-use crate::{ok_cmd, CommandResult};
+use crate::webcodex_runner::output::{ok_cmd, CommandResult};
 
 const AUTO_PROJECT_HASH_PREFIX_LENGTHS: &[usize] = &[8, 12, 16, 24, 32, 48, 64];
 
@@ -526,7 +526,6 @@ fn path_resolution_success(
         "changed": registered,
         "recovered": !registered,
         "project_record_path": project_record_path.map(|path| path.to_string_lossy().to_string()),
-        "projects_config_path": project_record_path.map(|path| path.to_string_lossy().to_string()),
     })
 }
 

@@ -1,7 +1,8 @@
 use super::reconnect::dispatch_coding_call_in_window;
 use super::support::*;
-use crate::runner_http::ShellJobStartMetadata;
-use crate::runner_protocol::{RunnerCapabilities, RunnerJobUpdateRequest, ShellJobOpRequest};
+use webcodex_runner_registry::{JobStartContext, JobStartRequest};
+
+use crate::runner_protocol::{RunnerCapabilities, RunnerJobUpdateRequest};
 use crate::tool_runtime::startup_brief::{
     startup_brief_size, validate_schema_instance_for_test, STANDARD_STARTUP_HARD_MAX_BYTES,
 };
@@ -48,11 +49,11 @@ async fn start(
                 .await
         }
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + CODING_WORKFLOW_FIXTURE_TIMEOUT;
     while !task.is_finished() {
         assert!(
             std::time::Instant::now() < deadline,
-            "coding workflow did not finish within the 10-second test deadline"
+            "coding workflow did not finish within the {CODING_WORKFLOW_FIXTURE_TIMEOUT:?} test deadline"
         );
         if let Some(req) = runtime
             .runner_registry
@@ -108,127 +109,202 @@ fn instruction_source<'a>(output: &'a Value, path: &str) -> &'a Value {
 fn assert_builtin_workflow(output: &Value) {
     let workflow = &output["workflow"];
     assert_eq!(workflow["contract"], "webcodex.coding_workflow");
-    assert_eq!(workflow["version"], 9);
+    assert_eq!(
+        workflow["version"],
+        crate::tool_runtime::startup_brief::BUILTIN_CODING_WORKFLOW_VERSION
+    );
     assert_eq!(workflow["authority"], "model_guidance_only");
-    assert!(workflow["role_selection"]
+    assert!(workflow.get("roles").is_none());
+    assert!(workflow["model_protocol"]["coding_guidance"]
         .as_str()
-        .is_some_and(|value| !value.is_empty()));
-    let ack_guidance = workflow["model_protocol"]["session_context_ack"]
+        .is_some_and(
+            |value| value.contains(crate::tool_runtime::guidance::CODING_GUIDANCE_CONTEXT_KEY)
+        ));
+    let recovery = workflow["model_protocol"]["handoff_recovery"]
         .as_str()
-        .expect("Session context ACK guidance");
-    assert!(ack_guidance.contains("ack_session_context_revision"));
-    assert!(ack_guidance.contains("Checkpoint/recovery tools"));
-    assert!(ack_guidance.contains("only where exposed"));
-    assert!(ack_guidance.contains("never invent it"));
-    assert!(ack_guidance.contains("If unknown, omit"));
-    assert!(ack_guidance.contains("Session handoff recovery path"));
-    assert!(ack_guidance.contains("nonblocking"));
+        .unwrap();
+    assert!(recovery.contains("read_session_handoff"));
+    assert!(recovery.contains("exact session_id"));
+    assert!(recovery.contains("basis completeness"));
+    assert!(recovery.contains("Snapshot changed: re-read exact handoff"));
+    assert!(recovery
+        .contains("latest instructions/decisions/progress/validation before dependent work"));
+    assert!(recovery.contains("only after task-context loss/compaction/restart"));
+    assert!(recovery.contains("Never use it for routine progress/baselines"));
+    assert!(workflow["model_protocol"]
+        .get("session_context_ack")
+        .is_none());
     let recording_guidance = workflow["model_protocol"]["session_recording"]
         .as_str()
         .expect("Session recording guidance");
     assert!(recording_guidance.contains("work_on_project creates or resumes"));
-    assert!(recording_guidance.contains("recording_session_id"));
+    assert!(recording_guidance.contains("_wc.record"));
+    assert!(recording_guidance.contains("prefer its returned session_ref"));
+    assert!(recording_guidance.contains("canonical wc_sess_* remains valid"));
     assert!(recording_guidance.contains("recorder provenance only"));
     assert!(recording_guidance.contains("business session_id may target another Session"));
     assert!(recording_guidance.contains("grants no authority"));
+    assert!(!recording_guidance.contains("recording_session_id"));
     let message_ack_guidance = workflow["model_protocol"]["session_message_ack"]
         .as_str()
         .expect("Session message ACK guidance");
     assert!(message_ack_guidance.contains("session_attention"));
     assert!(message_ack_guidance.contains("requires_ack"));
-    assert!(message_ack_guidance.contains("ack_session_message_ids"));
-    assert!(message_ack_guidance.contains("request-scoped model-context proof"));
-    assert!(message_ack_guidance.contains("resolves messages"));
+    assert!(message_ack_guidance.contains("_wc.ack"));
+    assert!(message_ack_guidance.contains("operator_messages"));
+    assert!(message_ack_guidance.contains("peer_messages"));
+    assert!(message_ack_guidance.contains("_wc.ack_ref remains Session-only"));
+    assert!(message_ack_guidance.contains("model-context retention"));
+    assert!(message_ack_guidance.contains("never resolves messages"));
     assert!(message_ack_guidance.contains("grants authority"));
     assert!(message_ack_guidance.contains("gates execution"));
+    assert!(!message_ack_guidance.contains("ack_session_message_ids"));
+    let window_reply_guidance = workflow["model_protocol"]["window_reply"]
+        .as_str()
+        .expect("Window reply guidance");
+    assert!(window_reply_guidance.contains("operator_messages"));
+    assert!(window_reply_guidance.contains("_wc.reply"));
+    assert!(window_reply_guidance.contains("reply_to"));
+    assert!(window_reply_guidance.contains("No _wc.record"));
+    assert!(window_reply_guidance.contains("_wc.ack"));
+    assert!(window_reply_guidance.contains("post-result"));
+    assert!(!window_reply_guidance.contains("window_reply={"));
     let message_resolution_guidance = workflow["model_protocol"]["session_message_resolution"]
         .as_str()
         .expect("Session message resolution guidance");
-    assert!(message_resolution_guidance.contains("session_message_resolution"));
+    assert!(message_resolution_guidance.contains("_wc.resolve"));
     assert!(message_resolution_guidance.contains("next ordinary call"));
-    assert!(message_resolution_guidance.contains("recording_session_id"));
-    assert!(message_resolution_guidance.contains("ack_session_message_ids"));
-    assert!(message_resolution_guidance.contains("cannot predict the main call"));
+    assert!(message_resolution_guidance.contains("_wc.record"));
+    assert!(message_resolution_guidance.contains("_wc.ack"));
+    assert!(message_resolution_guidance.contains("Resolve cannot predict"));
     assert!(message_resolution_guidance.contains("complete_session_message"));
+    assert!(!message_resolution_guidance.contains("session_message_resolution on"));
     let sidecar_guidance = workflow["model_protocol"]["context_sidecar"]
         .as_str()
         .expect("context sidecar guidance");
-    assert!(sidecar_guidance.contains("context_request"));
-    assert!(sidecar_guidance.contains("after the main tool"));
+    assert!(sidecar_guidance.contains("_wc.context"));
+    assert!(sidecar_guidance.contains("post-result context request"));
     assert!(sidecar_guidance.contains("never authorizes"));
     assert!(sidecar_guidance.contains("observation call before dependent mutation"));
+    assert!(!sidecar_guidance.contains("context_request"));
     let runner_targeting_guidance = workflow["model_protocol"]["runner_targeting"]
         .as_str()
         .expect("exact Runner targeting guidance");
     assert!(runner_targeting_guidance.contains("exact Runner client_id"));
-    assert!(runner_targeting_guidance.contains("runtime_status(client_id=...)"));
+    assert!(runner_targeting_guidance.contains("get_runtime_status(client_id=...)"));
     assert!(runner_targeting_guidance.contains("list_projects(client_id=...)"));
     assert!(runner_targeting_guidance.contains("before treating it as absent"));
-    let defaults = workflow["guidance"]
-        .as_array()
-        .expect("default workflow guidance")
-        .iter()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>()
-        .join("\n");
-    for phrase in [
-        "cargo_fmt(check=false)",
-        "instead of reproducing rustfmt edits manually",
-        "independent read-only inspection",
-        "short sync_wait_secs",
-        "same-execution Job handoff",
-        "do not fan out heavy validations",
-        "stale/cache-warmup",
-        "final source needs fresh validation",
-    ] {
-        assert!(defaults.contains(phrase), "workflow guidance: {phrase}");
-    }
+    assert_eq!(workflow["tool_strategy"]["profile"], "direct");
+    // The real startup must carry the complete selected shared guidance.
+    // Contributor applicability and critical safety text have focused tests;
+    // do not duplicate editorial phrase lists in this integration helper.
+    assert_eq!(
+        workflow["guidance"],
+        serde_json::to_value(crate::tool_runtime::guidance::core_guidance()).unwrap()
+    );
     let persistent_shell_guidance = workflow["model_protocol"]["persistent_shell"]
         .as_str()
         .expect("persistent shell guidance");
-    assert!(persistent_shell_guidance.contains("primarily for repeated remote commands"));
-    assert!(persistent_shell_guidance.contains("one named SSH resource"));
-    assert!(persistent_shell_guidance.contains("remote cwd/env/exports/functions/umask"));
-    assert!(persistent_shell_guidance
+    for phrase in [
+        "run_process=literal argv",
+        "run_shell=shell grammar/short chains",
+        "run_script=program-like scripts",
+        "specialize for added semantics",
+        "repeated named-SSH state",
+        "local same-process state",
+    ] {
+        assert!(
+            persistent_shell_guidance.contains(phrase),
+            "persistent shell guidance: {phrase}"
+        );
+    }
+    assert!(!persistent_shell_guidance
         .contains("structured tools -> run_process/run_script -> run_shell"));
-    assert!(persistent_shell_guidance
-        .contains("local persistent shell only when same-process state is required"));
     assert!(!persistent_shell_guidance.contains("For repeated commands in one Workflow Session"));
+    let work_result_guidance = workflow["model_protocol"]["work_result_presentation"]
+        .as_str()
+        .expect("work result presentation guidance");
+    for phrase in [
+        "substantial coding work",
+        "present_pdf(project, path)",
+        "stable client Window",
+        "present_work_result(project) exactly once",
+        "first successful project-scoped WebCodex action",
+        "Do not wait for work_on_project",
+        "same Window ActionAudit activity as WebUI",
+        "observe/diagnostic actions",
+        "optional linked Session collaboration",
+        "final changes may appear later",
+        "Never repeat presentation or model-poll it",
+        "Tiny one-step/read-only lookups may skip it",
+        "fallback if no card was presented",
+    ] {
+        assert!(work_result_guidance.contains(phrase), "{phrase}");
+    }
     let closeout_guidance = workflow["model_protocol"]["normal_closeout"]
         .as_str()
         .expect("normal closeout guidance");
+    assert!(closeout_guidance.contains("Source/validation/open evidence"));
     assert!(closeout_guidance.contains("finish_coding_task(summary_only=true)"));
-    assert!(closeout_guidance.contains("full closeout only"));
-    for role in ["implementation_owner", "independent_review"] {
-        let role = &workflow["roles"][role];
-        assert!(role["purpose"]
-            .as_str()
-            .is_some_and(|value| !value.is_empty()));
-        let guidance = role["guidance"]
-            .as_array()
-            .expect("workflow guidance array");
-        assert!(!guidance.is_empty());
-        assert!(
-            guidance.len()
-                <= crate::tool_runtime::startup_brief::BUILTIN_CODING_WORKFLOW_MAX_GUIDANCE_ITEMS
-        );
-    }
-    let implementation_guidance = workflow["roles"]["implementation_owner"]["guidance"]
-        .as_array()
+    assert!(closeout_guidance.contains("Read/planning/artifact"));
+    assert!(closeout_guidance.contains("finalize directly"));
+    assert!(closeout_guidance.contains("goal_follow_up"));
+    assert!(closeout_guidance.contains("never complete a Goal"));
+    let goal_workflow = workflow["model_protocol"]["goal_workflow"]
+        .as_str()
         .unwrap();
-    assert!(implementation_guidance.iter().any(|item| {
-        item.as_str().is_some_and(|value| {
-            value.contains("intentionally rerunning the same logical validation")
-                && value.contains("reuse the same assertion_name")
-                && value
-                    .contains("do not rerun solely to clear stale historical validation evidence")
-        })
-    }));
-    assert!(!implementation_guidance.iter().any(|item| {
-        item.as_str()
-            .is_some_and(|value| value.contains("resolve that validation identity"))
-    }));
-    let serialized = workflow.to_string();
+    for phrase in [
+        "Goal workflow is on-demand",
+        "do not require a Goal",
+        "work_on_project.goal_context",
+        "choose explicitly among multiple candidates",
+        "never infer from Project/Window/title/recency",
+        "webcodex.goal_workflow",
+    ] {
+        assert!(goal_workflow.contains(phrase), "{phrase}");
+    }
+    let details = crate::model_workflow::ModelWorkflowPolicy::default().goal_workflow_projection();
+    let continuation = details["continuation"].as_str().unwrap();
+    for phrase in [
+        "exact explicit durable controller Agent",
+        "Reuse the same Agent",
+        "never infer Agent identity from a Window",
+        "both Task assignee and Goal controller",
+        "separate Agent Continuation",
+        "Stalled is not offline",
+        "never retry an uncertain prior effect",
+    ] {
+        assert!(continuation.contains(phrase), "{phrase}");
+    }
+    let checkpoint = details["checkpoint"].as_str().unwrap();
+    for phrase in [
+        "After a plan phase completes",
+        "call checkpoint_goal",
+        "facts already true",
+        "never pre-complete tests",
+        "no gateway or _wc.control fallback",
+        "explicit update_goal",
+        "current client configuration",
+        "cannot judge natural-language conditions",
+    ] {
+        assert!(checkpoint.contains(phrase), "{phrase}");
+    }
+    assert!(goal_workflow.len() <= 720 && continuation.len() <= 720 && checkpoint.len() <= 480);
+    let sidecars = workflow["model_protocol"]["control_sidecars"]
+        .as_str()
+        .unwrap();
+    for phrase in [
+        "optional",
+        "otherwise omit",
+        "standalone",
+        "independently authorized",
+        "preserves main success",
+        "fail-closed",
+    ] {
+        assert!(sidecars.contains(phrase), "{phrase}");
+    }
+    assert!(sidecars.len() <= 640);
+    let serialized = workflow.to_string().replace("Stalled is not offline", "");
     for forbidden in ["ChatGPT", "browser", "another window", "online", "offline"] {
         assert!(
             !serialized.contains(forbidden),
@@ -285,7 +361,10 @@ async fn fresh_coding_task_session_loads_all_bounded_repository_rules() {
     }
     let bytes = startup_brief_size(&result.output);
     eprintln!("common_clean_standard_startup_bytes={bytes}");
-    assert!(bytes < 16 * 1024, "{bytes}");
+    // v30 adds architecture discovery/completion and structural review guidance.
+    // Allow that measured prose increment in this common-case regression target;
+    // the independent hard startup and context envelopes remain unchanged.
+    assert!(bytes < 17 * 1024, "{bytes}");
     assert!(bytes <= STANDARD_STARTUP_HARD_MAX_BYTES);
     let serialized = result.output.to_string();
     assert_ne!(
@@ -825,6 +904,7 @@ async fn restart_restored_coding_task_session_reloads_rules_without_persisting_b
                 path: "src/restart.rs".to_string(),
                 start_line: None,
                 limit: None,
+                expected_read_revision: None,
             }],
             session_id: Some(session_id.clone()),
             with_line_numbers: None,
@@ -836,7 +916,7 @@ async fn restart_restored_coding_task_session_reloads_rules_without_persisting_b
     .await;
     assert!(read.success, "{:?}", read.error);
     runtime1.sessions.flush_persistence();
-    let persisted = fs::read_to_string(&ledger).unwrap();
+    let persisted = runtime1.sessions.persisted_json_for_test();
     assert!(!persisted.contains(marker));
     assert!(!persisted.contains(source_marker));
     assert!(!persisted.contains("Repository rules"));
@@ -971,26 +1051,19 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
     let project_b = crate::tool_runtime::runner_project_runtime_id("startup-jobs", "b");
     let job = runtime
         .runner_registry
-        .start_job_with_metadata(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("startup-jobs".to_string()),
+        .start_job(
+            JobStartRequest {
                 cwd: Some(root_a.path().to_string_lossy().to_string()),
-                command: Some("sleep 60".to_string()),
-                timeout_secs: Some(120),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
+                context: JobStartContext {
+                    project_id: Some(project_a.clone()),
+                    project_cwd: Some(root_a.path().to_string_lossy().to_string()),
+                    ..Default::default()
+                },
+                ..JobStartRequest::shell("startup-jobs".to_string(), "sleep 60".to_string())
             },
             "startup-test".to_string(),
-            ShellJobStartMetadata {
-                project_id: Some(project_a.clone()),
-                project_cwd: Some(root_a.path().to_string_lossy().to_string()),
-                ..Default::default()
-            },
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -1000,24 +1073,14 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: "startup-jobs".to_string(),
-            runner_instance_id: "inst".to_string(),
-            job_id: job.job_id.clone(),
             request_id: Some(start_request.request_id.clone()),
-            update_seq: None,
-            status: "running".to_string(),
-            stdout_chunk: None,
-            stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
-            log_snapshot: None,
-            exit_code: None,
-            duration_ms: None,
-            error: None,
-            command_execution_state: None,
-            validation_progress: None,
-            activity: None,
-            finished: false,
+            ..runner_job_update(
+                "startup-jobs".to_string(),
+                "inst".to_string(),
+                job.job_id.clone(),
+                "running".to_string(),
+                false,
+            )
         })
         .await
         .unwrap();
@@ -1139,24 +1202,15 @@ async fn startup_uses_project_scoped_lifecycle_aware_job_summary() {
     runtime
         .runner_registry
         .update_job(RunnerJobUpdateRequest {
-            client_id: "startup-jobs".to_string(),
-            runner_instance_id: "inst".to_string(),
-            job_id: job.job_id.clone(),
             request_id: Some(start_request.request_id),
-            update_seq: None,
-            status: "stopped".to_string(),
-            stdout_chunk: None,
-            stderr_chunk: None,
-            stdout_tail: None,
-            stderr_tail: None,
-            log_snapshot: None,
-            exit_code: None,
             duration_ms: Some(1),
-            error: None,
-            command_execution_state: None,
-            validation_progress: None,
-            activity: None,
-            finished: true,
+            ..runner_job_update(
+                "startup-jobs".to_string(),
+                "inst".to_string(),
+                job.job_id.clone(),
+                "stopped".to_string(),
+                true,
+            )
         })
         .await
         .unwrap();
@@ -1206,9 +1260,7 @@ async fn startup_runner_health_uses_the_exact_project_client() {
 
     let status = runtime.runtime_status(None).await;
     assert!(status.success);
-    let clients = status.output["agents"]["summary"]["clients"]
-        .as_array()
-        .unwrap();
+    let clients = status.output["runners"]["clients"].as_array().unwrap();
     assert!(clients
         .iter()
         .any(|client| client["client_id"] == "startup-peer" && client["status"] == "online"));
@@ -1365,7 +1417,7 @@ async fn minimal_standard_and_full_coding_workflow_diagnostics_validate_against_
             "has_open_messages": true,
             "open_counts": {"guidance": 1, "question": 0, "todo": 0, "risk": 0},
             "highest_priority": "normal",
-            "suggested_next_tool": "session_discussion_summary"
+            "suggested_next_tool": "read_session_discussion_summary"
         });
         recorded.output["permission"] = json!({"status": "auto_approved"});
         let recorded_value = json!({
@@ -1443,9 +1495,9 @@ async fn worst_case_startup_with_huge_repository_stays_below_hard_limit() {
         )
         .unwrap();
     }
-    for cmd in ["git add -A", "git commit -m 'seed worst-case repo'"] {
+    for cmd in ["git add -A", "git commit -q -m 'seed worst-case repo'"] {
         let (exit_code, stdout, stderr, _) =
-            crate::tool_runtime::helpers::run_command_sync(cmd, root.path(), 30);
+            crate::tool_runtime::helpers::run_command_sync(cmd, root.path(), 5);
         assert_eq!(exit_code, 0, "{stdout}{stderr}");
     }
 

@@ -8,14 +8,13 @@
 //! projection, and the pure-read contract.
 
 use super::support::*;
+use crate::tool_runtime::closeout_evidence::CloseoutSessionEvidence;
 use crate::tool_runtime::continuation_feedback::{
     continuation_feedback_value, continuation_projection_hooks, continuation_validation_snapshot,
     root_tool_is_meaningful, ContinuationFeedbackInput, ContinuationToolFailureSnapshot,
 };
-use crate::tool_runtime::handoff::reconcile_closeout_evidence;
 use crate::tool_runtime::sessions::{
-    self, tool_failure_summary_from_events, SessionDiscussionCounts, SessionGuards,
-    SessionTransport,
+    self, SessionDiscussionCounts, SessionGuards, SessionTransport,
 };
 use crate::tool_runtime::tool_definition::{
     runtime_tool_captures_validation_output, runtime_tool_is_git_like, runtime_tool_is_shell_like,
@@ -29,6 +28,8 @@ use crate::tool_runtime::{
     ToolRuntime, ToolSpec,
 };
 use serde_json::{json, Value};
+use webcodex_validation::ValidationReport;
+use webcodex_workflow_session::ContinuationJobSnapshot;
 
 fn continuation_feedback_subschema(specs: &[ToolSpec], tool: &str) -> Value {
     let spec = spec_named(specs, tool);
@@ -62,24 +63,10 @@ fn continuation_feedback_output_conforms_to_strict_schema_shape() {
     // Every field present in the serialized output must be declared in the
     // strict schema's properties for its parent object (no drift fields).
     fn assert_no_unknown_fields(output: &Value, schema: &Value, path: &str) {
-        if let (Some(out_obj), Some(schema_obj)) = (output.as_object(), schema.as_object()) {
-            if schema_obj.get("type").and_then(Value::as_str) == Some("object") {
-                let declared = schema_obj["properties"].as_object().unwrap();
-                for key in out_obj.keys() {
-                    assert!(
-                        declared.contains_key(key),
-                        "{path}: output field '{key}' is not declared in the strict schema"
-                    );
-                }
-            }
-        }
-        if let (Some(out_obj), Some(schema_obj)) = (output.as_object(), schema.as_object()) {
-            for (key, child) in out_obj {
-                if let Some(child_schema) = schema_obj["properties"].get(key) {
-                    assert_no_unknown_fields(child, child_schema, &format!("{path}.{key}"));
-                }
-            }
-        }
+        // The shared validator also follows nullable anyOf branches, bounded
+        // arrays and required fields; a properties-only walker misses those.
+        crate::tool_runtime::startup_brief::validate_schema_instance_for_test(output, schema)
+            .unwrap_or_else(|error| panic!("{path}: {error}"));
     }
     assert_no_unknown_fields(&feedback, &schema, "continuation_feedback");
 
@@ -197,17 +184,16 @@ fn exploration_continuity_suggestion_is_lower_priority_than_blocking_evidence() 
     let conflict_validation = validation_summary_from_events(&conflict_summary.events, 20);
     let conflict_current_validation =
         current_validation_evidence_for_session(&conflict_summary, 20);
-    let conflict_tool_failures = tool_failure_summary_from_events(&conflict_summary.events, 20);
-    let conflict_reconciliation = reconcile_closeout_evidence(
-        &conflict_tool_failures,
-        &conflict_summary,
-        &conflict_validation,
+    let conflict_evidence = CloseoutSessionEvidence::new(
+        conflict_summary.clone(),
+        ValidationReport::from_events(&conflict_summary, &conflict_summary.events, 100),
+        None,
     );
     let conflict_discussion = empty_discussion();
     let conflict_feedback = continuation_feedback_value(ContinuationFeedbackInput {
         session_summary: &conflict_summary,
         validation: &conflict_validation,
-        jobs: &json!({"active_count": 0, "running_count": 0, "recent": []}),
+        jobs: ContinuationJobSnapshot::default(),
         discussion: &conflict_discussion,
         continuation: "continued",
         suggest_exploration_continuity: true,
@@ -215,7 +201,7 @@ fn exploration_continuity_suggestion_is_lower_priority_than_blocking_evidence() 
         hooks: continuation_projection_hooks(),
         current_validation: continuation_validation_snapshot(&conflict_current_validation),
         tool_failures: ContinuationToolFailureSnapshot::new(
-            &conflict_reconciliation.actionable_unexpected_event_ids,
+            &conflict_evidence.failures.actionable_unexpected_event_ids,
         ),
     });
     assert!(!has_exploration_action(&conflict_feedback));
@@ -261,7 +247,12 @@ async fn diagnostic_coding_workflow(
                 .await
         }
     });
+    let deadline = std::time::Instant::now() + CODING_WORKFLOW_FIXTURE_TIMEOUT;
     while !task.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "diagnostic coding workflow did not finish within {CODING_WORKFLOW_FIXTURE_TIMEOUT:?}"
+        );
         if let Some(req) = runtime
             .runner_registry
             .poll(crate::runner_protocol::RunnerPollRequest {
@@ -420,7 +411,7 @@ fn handoff_call(session_id: &str) -> ToolCall {
         include_workspace: None,
         include_checkpoints: None,
         include_validation: None,
-        summary_only: false,
+        diagnostic: true,
         limit: None,
     }
 }
@@ -477,7 +468,7 @@ async fn handoff_summary_only_and_include_validation_false_shape() {
             include_workspace: None,
             include_checkpoints: None,
             include_validation: Some(false),
-            summary_only: true,
+            diagnostic: true,
             limit: None,
         })
         .await;
@@ -625,13 +616,13 @@ async fn validation_summary_surfaces_validation_delta_without_shell_or_new_event
         .len();
     assert_eq!(
         events_after, events_before,
-        "validation_summary appended events"
+        "read_validation_summary appended events"
     );
     assert!(
         probe_patch_agent_request(&runtime, "vsummary-agent")
             .await
             .is_none(),
-        "validation_summary enqueued an agent request"
+        "read_validation_summary enqueued an agent request"
     );
 }
 
@@ -676,7 +667,7 @@ async fn finish_coding_task_continuation_matches_handoff_attempt_without_rerunni
             Some(false),
             Some(false),
             Some(false),
-            false,
+            true,
             Some(20),
             Some(&auth),
         )
@@ -694,6 +685,7 @@ async fn finish_coding_task_continuation_matches_handoff_attempt_without_rerunni
     let finish = runtime
         .dispatch_with_auth(
             ToolCall::FinishCodingTask {
+                outputs: Vec::new(),
                 project: project.clone(),
                 session_id: session_id.clone(),
                 summary_only: false,
@@ -759,9 +751,9 @@ fn meaningful_tool_classification_excludes_status_and_manifest_queries() {
     // Pure status/manifest/summary queries must never count as work progress.
     for name in [
         "runtime_status",
-        "tool_manifest",
+        "read_tool_manifest",
         "list_tools",
-        "session_summary",
+        "read_session_summary",
     ] {
         assert!(
             !is_meaningful(name),
@@ -770,9 +762,9 @@ fn meaningful_tool_classification_excludes_status_and_manifest_queries() {
     }
     // Write / shell / git / validation tools do count.
     for name in [
-        "apply_text_edits",
+        "edit_project_files",
         "run_shell",
-        "show_changes",
+        "read_workspace_changes",
         "cargo_test",
     ] {
         assert!(is_meaningful(name), "{name} should count as meaningful");
@@ -813,7 +805,7 @@ fn current_validation_window_excludes_pre_mutation_failure_from_attempt_activity
 
     let feedback = feedback_for(&runtime, &summary, "continued");
     assert_eq!(feedback["attempt"]["activity"]["unresolved_failures"], 0);
-    assert_eq!(feedback["attempt"]["validation"]["status"], "passed");
+    assert_eq!(feedback["attempt"]["validation"]["status"], "unproven");
     assert_eq!(
         feedback["attempt"]["validation"]["unresolved_failure_count"],
         0
@@ -892,12 +884,12 @@ fn record_write_for(runtime: &ToolRuntime, session_id: &str, project: &str, path
     let start = runtime.sessions.record_tool_call_started(
         Some(session_id),
         SessionTransport::Api,
-        "apply_text_edits",
+        "edit_project_files",
         &json!({
             "project": project,
             "changes": changes,
         }),
-        crate::tool_runtime::sessions::session_tool_contract("apply_text_edits"),
+        crate::tool_runtime::sessions::session_tool_contract("edit_project_files"),
     );
     runtime.sessions.record_tool_call_finished(
         start,
@@ -933,7 +925,7 @@ fn record_exploration_event(
 }
 
 /// Project-scoped variants of the helpers above for real entry tests that
-/// dispatch tools against a registered agent project (e.g. validation_summary).
+/// dispatch tools against a registered agent project (e.g. read_validation_summary).
 fn add_instruction_for(
     runtime: &ToolRuntime,
     session_id: &str,
@@ -1117,13 +1109,16 @@ fn feedback_for_with_discussion(
 ) -> Value {
     let validation = validation_summary_from_events(&summary.events, 20);
     let current_validation = current_validation_evidence_for_session(summary, 20);
-    let tool_failures = tool_failure_summary_from_events(&summary.events, 20);
-    let reconciliation = reconcile_closeout_evidence(&tool_failures, summary, &validation);
+    let evidence = CloseoutSessionEvidence::new(
+        summary.clone(),
+        ValidationReport::from_events(summary, &summary.events, 100),
+        None,
+    );
     let jobs = json!({"active_count": 0, "terminal_pending_count": 0, "recent": []});
     continuation_feedback_value(ContinuationFeedbackInput {
         session_summary: summary,
         validation: &validation,
-        jobs: &jobs,
+        jobs: ContinuationJobSnapshot::from_json(&jobs),
         discussion,
         continuation,
         suggest_exploration_continuity: true,
@@ -1131,7 +1126,7 @@ fn feedback_for_with_discussion(
         hooks: continuation_projection_hooks(),
         current_validation: continuation_validation_snapshot(&current_validation),
         tool_failures: ContinuationToolFailureSnapshot::new(
-            &reconciliation.actionable_unexpected_event_ids,
+            &evidence.failures.actionable_unexpected_event_ids,
         ),
     })
 }
@@ -1144,13 +1139,16 @@ fn feedback_for_with_jobs(
 ) -> Value {
     let validation = validation_summary_from_events(&summary.events, 20);
     let current_validation = current_validation_evidence_for_session(summary, 20);
-    let tool_failures = tool_failure_summary_from_events(&summary.events, 20);
-    let reconciliation = reconcile_closeout_evidence(&tool_failures, summary, &validation);
+    let evidence = CloseoutSessionEvidence::new(
+        summary.clone(),
+        ValidationReport::from_events(summary, &summary.events, 100),
+        None,
+    );
     let discussion = empty_discussion();
     continuation_feedback_value(ContinuationFeedbackInput {
         session_summary: summary,
         validation: &validation,
-        jobs,
+        jobs: ContinuationJobSnapshot::from_json(jobs),
         discussion: &discussion,
         continuation,
         suggest_exploration_continuity: true,
@@ -1158,7 +1156,153 @@ fn feedback_for_with_jobs(
         hooks: continuation_projection_hooks(),
         current_validation: continuation_validation_snapshot(&current_validation),
         tool_failures: ContinuationToolFailureSnapshot::new(
-            &reconciliation.actionable_unexpected_event_ids,
+            &evidence.failures.actionable_unexpected_event_ids,
         ),
     })
+}
+
+#[test]
+fn task_context_keeps_job_lifecycle_and_explicit_unknown_outcomes_distinct() {
+    let runtime = test_runtime();
+    let session = create_session(&runtime, "accepted Job");
+    add_instruction(&runtime, &session, "run validation", SessionMode::Normal);
+    record_validation_event(
+        &runtime,
+        &session,
+        "cargo_test",
+        true,
+        json!({
+            "job_id":"job-task-context", "execution_state":"started",
+            "command_started":true, "command_completed":false,
+            "promoted_to_job":true, "terminal":false,
+        }),
+    );
+    let summary = runtime.sessions.summary(&session, Some(200)).unwrap();
+    for (recovering, recovery_state) in [(0, "active"), (1, "recovering")] {
+        let jobs = json!({"active_count":1,"running_count":1,"recovering_count":recovering,"terminal_pending_count":0,"recent":[],"truncated":false});
+        let feedback = feedback_for_with_jobs(&runtime, &summary, &jobs, "continued");
+        assert_ne!(
+            feedback["attempt"]["task_context"]["stall"]["status"],
+            "reconcile_required"
+        );
+        assert_eq!(
+            feedback["attempt"]["jobs"]["recovery_state"],
+            recovery_state
+        );
+        if recovering > 0 {
+            assert!(
+                feedback["attempt"]["suggested_next_actions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|action| action == "await recovering jobs before relying on their output"),
+                "{feedback}"
+            );
+        }
+    }
+    for field in ["failure_kind", "error_kind"] {
+        let session = create_session(&runtime, field);
+        add_instruction(&runtime, &session, "recover execution", SessionMode::Normal);
+        let mut output = json!({});
+        output[field] = json!("outcome_unknown");
+        record_validation_event(&runtime, &session, "run_process", false, output);
+        let summary = runtime.sessions.summary(&session, Some(200)).unwrap();
+        let feedback = feedback_for(&runtime, &summary, "continued");
+        assert_eq!(
+            feedback["attempt"]["task_context"]["stall"]["status"], "reconcile_required",
+            "{field}: {feedback}"
+        );
+        assert_eq!(
+            feedback["attempt"]["suggested_next_actions"],
+            json!([
+                "reconcile the exact Job or execution outcome before considering another execution"
+            ])
+        );
+    }
+}
+
+#[test]
+fn task_context_uses_canonical_runtime_diagnostics_and_never_treats_recovery_as_progress() {
+    let runtime = test_runtime();
+    let session = create_session(&runtime, "repeat diagnostic recovery");
+    add_instruction(
+        &runtime,
+        &session,
+        "fix the failing test",
+        SessionMode::Normal,
+    );
+    let identity = webcodex_core::validation_identity::structured_validation_target_identity(
+        webcodex_core::validation_identity::ToolValidationIdentityKind::CargoTest,
+        &json!({"cwd":".","filter":"tests::same"}),
+    )
+    .unwrap();
+    for index in 0..3 {
+        let started = runtime.sessions.record_tool_call_started(
+            Some(&session),
+            SessionTransport::Api,
+            "cargo_test",
+            &json!({"project":"test-project","execution_identity":identity}),
+            sessions::session_tool_contract("cargo_test"),
+        );
+        let mut output = test_output(0, 1, 0, &["tests::same"]);
+        output["stdout_tail"] = json!(format!(
+            "{}\nfinished in {index}.01s\n",
+            output["stdout_tail"].as_str().unwrap()
+        ));
+        runtime.sessions.record_tool_call_finished(
+            started,
+            false,
+            &output,
+            Some("validation failed"),
+            None,
+        );
+    }
+    let summary = runtime.sessions.summary(&session, Some(200)).unwrap();
+    let feedback = feedback_for(&runtime, &summary, "continued");
+    let context = &feedback["attempt"]["task_context"];
+    assert_eq!(context["stall"]["status"], "suspected");
+    assert_eq!(context["stall"]["event_ids"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        context["scope"]["instruction_event_id"],
+        feedback["attempt"]["boundary"]["event_id"]
+    );
+    assert_eq!(
+        context["next_steps"]["items"][0]["source_refs"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    crate::tool_runtime::startup_brief::validate_schema_instance_for_test(
+        &feedback,
+        &continuation_feedback_subschema(&registered_tool_specs(), "finish_coding_task"),
+    )
+    .unwrap();
+    let reread = feedback_for(&runtime, &summary, "continued");
+    assert_eq!(feedback, reread);
+    assert_eq!(
+        summary.events.len(),
+        runtime
+            .sessions
+            .summary(&session, Some(200))
+            .unwrap()
+            .events
+            .len()
+    );
+    add_instruction(
+        &runtime,
+        &session,
+        "a separate next task",
+        SessionMode::Normal,
+    );
+    let new_summary = runtime.sessions.summary(&session, Some(200)).unwrap();
+    let new_feedback = feedback_for(&runtime, &new_summary, "continued");
+    assert_eq!(
+        new_feedback["attempt"]["task_context"]["stall"]["status"],
+        "not_observed"
+    );
+    assert_eq!(
+        new_feedback["attempt"]["task_context"]["stall"]["event_ids"],
+        json!([])
+    );
 }

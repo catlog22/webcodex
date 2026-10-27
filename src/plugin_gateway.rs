@@ -8,17 +8,25 @@
 pub(crate) use webcodex_core::plugin::*;
 
 use crate::auth::{AuthContext, SCOPE_PLUGIN_INSPECT, SCOPE_PLUGIN_INVOKE, SCOPE_PLUGIN_MANAGE};
+use crate::json_measurement::serialized_json_len;
 use crate::tool_runtime::sessions::SessionTransport;
+#[cfg(test)]
+use crate::tool_runtime::specialized::SpecializedAuthorityRequirement;
 use crate::tool_runtime::specialized::{
     SpecializedGovernanceDenial, SpecializedOperationPolicy, SpecializedSource,
 };
 use crate::tool_runtime::{PluginToolCall, ToolResult, ToolRuntime};
+use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use std::time::Duration;
+use webcodex_tool_contracts::PluginToolAction;
 
 pub(crate) const PLUGIN_TOOL_NAME: &str = "plugin_tool";
+mod project_binding;
+use project_binding::{invocation_project, resolve_bound_project, BoundPluginProject};
+
 const MAX_PLUGIN_BINDINGS: usize = 512;
 const GATEWAY_WAIT_TIMEOUT: Duration = Duration::from_secs(125);
 pub(crate) const MAX_PLUGIN_CATALOG_CONTEXT_BYTES: usize = 8 * 1024;
@@ -31,6 +39,7 @@ struct PluginBinding {
     provider_instance_id: String,
     tool_name: String,
     schema: PluginSchemaObservation,
+    project: Option<BoundPluginProject>,
 }
 
 #[derive(Default)]
@@ -51,7 +60,7 @@ impl PluginGatewayRuntime {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let binding = loop {
-            let candidate = format!("wc_pbind_{}", uuid::Uuid::new_v4().simple());
+            let candidate = format!("wc_pbind_{}", webcodex_core::compact::random_suffix::<16>());
             if !store.values.contains_key(&candidate) {
                 break candidate;
             }
@@ -141,18 +150,19 @@ pub(crate) enum PluginOperation {
     Call,
 }
 
-impl PluginOperation {
-    fn parse(action: &str) -> Option<Self> {
+impl From<PluginToolAction> for PluginOperation {
+    fn from(action: PluginToolAction) -> Self {
         match action {
-            "list" => Some(Self::List),
-            "check" => Some(Self::Check),
-            "reload" => Some(Self::Reload),
-            "describe" => Some(Self::Describe),
-            "call" => Some(Self::Call),
-            _ => None,
+            PluginToolAction::List => Self::List,
+            PluginToolAction::Check => Self::Check,
+            PluginToolAction::Reload => Self::Reload,
+            PluginToolAction::Describe => Self::Describe,
+            PluginToolAction::Call => Self::Call,
         }
     }
+}
 
+impl PluginOperation {
     pub(crate) fn policy(self) -> SpecializedOperationPolicy {
         match self {
             Self::List => SpecializedOperationPolicy::read(
@@ -265,6 +275,20 @@ async fn audit_request_with_identity(
     if runner.runner_instance_id != binding.runner_instance_id {
         return audit;
     }
+    if let Some(project) = &binding.project {
+        if !resolve_bound_project(
+            runtime,
+            &project.canonical_id,
+            &binding.client_id,
+            crate::auth::SCOPE_PROJECT_WRITE,
+            auth,
+        )
+        .await
+        .is_ok_and(|current| &current == project)
+        {
+            return audit;
+        }
+    }
     audit_arguments_with_resolved_binding(audit, &binding)
 }
 
@@ -273,6 +297,9 @@ fn audit_arguments_with_resolved_binding(mut audit: Value, binding: &PluginBindi
     audit["plugin"] = Value::String(binding.provider_id.clone());
     audit["tool"] = Value::String(binding.tool_name.clone());
     audit["binding_resolved"] = Value::Bool(true);
+    if let Some(project) = &binding.project {
+        audit["project"] = Value::String(project.canonical_id.clone());
+    }
     audit
 }
 
@@ -280,6 +307,7 @@ fn audit_arguments_with_resolved_binding(mut audit: Value, binding: &PluginBindi
 pub(crate) struct PluginInvocationResult {
     operation: PluginOperation,
     result: Result<GatewaySuccess, GatewayError>,
+    delegation: Option<Value>,
 }
 
 impl PluginInvocationResult {
@@ -315,11 +343,18 @@ impl PluginInvocationResult {
     }
 
     pub(crate) fn to_mcp_result(&self) -> Value {
-        render_gateway_result(self.result.clone())
+        let mut value = render_gateway_result(self.result.clone());
+        if let (Some(target), Some(content)) = (
+            &self.delegation,
+            value.get_mut("content").and_then(Value::as_array_mut),
+        ) {
+            content.insert(0, json!({"type":"text", "text":format!("Trusted WebCodex delegation target: {target}. Project binding is routing, not a native-tool sandbox.")}));
+        }
+        value
     }
 
     pub(crate) fn to_tool_result(&self) -> ToolResult {
-        match &self.result {
+        let mut rendered = match &self.result {
             Ok(GatewaySuccess::Metadata(value)) => ToolResult::ok(value.clone()),
             Ok(GatewaySuccess::ToolResult(result)) => {
                 let mut output = serde_json::to_value(result).unwrap_or_else(|_| json!({}));
@@ -342,7 +377,12 @@ impl PluginInvocationResult {
                 }
             }
             Err(error) => gateway_error_tool_result(error),
+        };
+        if let Some(target) = &self.delegation {
+            rendered.output["delegation"] = target.clone();
+            rendered.output["project"] = target["project"].clone();
         }
+        rendered
     }
 }
 
@@ -355,23 +395,41 @@ pub(crate) async fn invoke(
     auth: Option<&AuthContext>,
     transport: SessionTransport,
 ) -> Result<PluginInvocationResult, SpecializedGovernanceDenial> {
-    let operation = PluginOperation::parse(&request.action)
-        .expect("PluginToolCall parser admits only the closed action vocabulary");
+    let operation = PluginOperation::from(request.action);
     let policy = operation.policy();
     let audit = audit_request_with_identity(runtime, &request, auth).await;
+    let target = invocation_project(runtime, &request, auth).await;
+    let target_project = target
+        .as_ref()
+        .ok()
+        .and_then(Option::as_ref)
+        .map(|project| project.canonical_id.as_str());
+    let delegation = target_project.and_then(|project| {
+        let binding = request.binding.as_deref().and_then(|id| runtime.plugin_gateway.binding(id))?;
+        Some(json!({"runner":binding.client_id,"runner_instance":binding.runner_instance_id,
+            "provider":binding.provider_id,"provider_instance":binding.provider_instance_id,"project":project}))
+    });
     let permit = runtime
-        .govern_specialized_invocation(
+        .govern_specialized_invocation_on_project(
             PLUGIN_TOOL_NAME,
             policy,
             transport,
             recording_session_id,
             auth,
             &audit,
+            target_project,
         )
         .await?;
 
-    let result = execute_business(runtime, operation, request, auth).await;
-    let invocation = PluginInvocationResult { operation, result };
+    let result = match target {
+        Ok(_) => execute_business(runtime, operation, request, auth).await,
+        Err(error) => Err(error),
+    };
+    let invocation = PluginInvocationResult {
+        operation,
+        result,
+        delegation,
+    };
     runtime.finish_specialized_invocation(
         permit,
         invocation.success(),
@@ -552,7 +610,7 @@ async fn describe(
     if args.binding.is_some() || args.arguments.is_some() {
         return Err(GatewayError::local(
             "invalid_arguments",
-            "action=describe accepts only runner, plugin, and tool",
+            "action=describe requires runner, plugin, and tool, plus project when projectBound; not binding or arguments",
         ));
     }
     let runner_id = required_runner(args.runner.as_deref())?;
@@ -570,6 +628,26 @@ async fn describe(
                 "the requested tool is not present on the current effective Plugin provider",
             )
         })?;
+    let project = match args.project.as_deref() {
+        Some(project) => Some(
+            resolve_bound_project(
+                runtime,
+                project,
+                &runner.client_id,
+                crate::auth::SCOPE_PROJECT_READ,
+                auth,
+            )
+            .await?,
+        ),
+        None if tool.project_bound => {
+            return Err(GatewayError::local(
+                "plugin_project_required",
+                "This Plugin tool requires project on describe; cwd binding is not a sandbox",
+            ).recovery("Repeat plugin_tool action=describe for the same runner, plugin, and tool with the intended explicit project. Use its returned binding for that Project; call accepts only binding and arguments. Re-describing does not authorize replay of an uncertain effect."))
+        }
+        None => None,
+    };
+    let project_id = project.as_ref().map(|project| project.canonical_id.clone());
     let binding = runtime.plugin_gateway.remember(PluginBinding {
         client_id: runner.client_id.clone(),
         runner_instance_id: runner.runner_instance_id.clone(),
@@ -577,14 +655,19 @@ async fn describe(
         provider_instance_id: provider.provider_instance_id.clone(),
         tool_name: tool.name.clone(),
         schema: tool.schema_observation(),
+        project,
     });
-    Ok(json!({
+    let mut result = json!({
         "runner": runner.client_id,
         "plugin": provider.provider_id,
         "pluginName": provider.name,
         "tool": tool,
         "binding": binding
-    }))
+    });
+    if let Some(project) = project_id {
+        result["project"] = Value::String(project);
+    }
+    Ok(result)
 }
 
 async fn observe_effective_provider_tools(
@@ -651,7 +734,11 @@ async fn call_plugin(
     args: PluginToolCall,
     auth: Option<&AuthContext>,
 ) -> Result<PluginToolResult, GatewayError> {
-    if args.runner.is_some() || args.plugin.is_some() || args.tool.is_some() {
+    if args.runner.is_some()
+        || args.plugin.is_some()
+        || args.tool.is_some()
+        || args.project.is_some()
+    {
         return Err(GatewayError::local(
             "invalid_arguments",
             "action=call accepts only binding and arguments",
@@ -690,6 +777,27 @@ async fn call_plugin(
         .recovery("Re-describe this Plugin tool. WebCodex did not retarget or replay the call."));
     }
 
+    let project_target = if let Some(project) = &observed.project {
+        let current = resolve_bound_project(
+            runtime,
+            &project.canonical_id,
+            &observed.client_id,
+            crate::auth::SCOPE_PROJECT_WRITE,
+            auth,
+        )
+        .await?;
+        if &current != project {
+            runtime.plugin_gateway.forget(&binding_id);
+            return Err(GatewayError::local(
+                "plugin_project_changed",
+                "The described Project root changed; re-describe without replaying effects",
+            ));
+        }
+        Some(current.target)
+    } else {
+        None
+    };
+
     // Deliberately do not re-list/re-resolve the provider here. The exact
     // provider instance, tool name, and schema from this binding are the only
     // legal dispatch target.
@@ -702,6 +810,7 @@ async fn call_plugin(
             name: observed.tool_name.clone(),
             arguments,
             expected_schema: observed.schema,
+            project_target,
         },
         auth,
     )
@@ -922,6 +1031,19 @@ pub(crate) fn project_plugin_catalog_projection(
     catalog: &ProjectPluginCatalog,
     max_bytes: usize,
 ) -> Value {
+    const DISCOVERY_HINT: &str =
+        "Use explicit plugin_tool list and describe for broader or current schema discovery.";
+
+    #[derive(Serialize)]
+    struct ProjectionMeasure<'a> {
+        catalog_revision: &'a str,
+        total_count: usize,
+        returned_count: usize,
+        truncated: bool,
+        entries: &'a [ProjectPluginCatalogEntry],
+        discovery_hint: Option<&'static str>,
+    }
+
     fn value(catalog: &ProjectPluginCatalog, entries: &[ProjectPluginCatalogEntry]) -> Value {
         let truncated = entries.len() < catalog.total_count;
         json!({
@@ -930,26 +1052,32 @@ pub(crate) fn project_plugin_catalog_projection(
             "returned_count": entries.len(),
             "truncated": truncated,
             "entries": entries,
-            "discovery_hint": truncated.then_some(
-                "Use explicit plugin_tool list and describe for broader or current schema discovery."
-            ),
+            "discovery_hint": truncated.then_some(DISCOVERY_HINT),
         })
     }
 
-    let mut entries = Vec::new();
-    for entry in &catalog.entries {
-        let mut candidate = entries.clone();
-        candidate.push(entry.clone());
-        if serde_json::to_vec(&value(catalog, &candidate))
-            .map(|bytes| bytes.len() <= max_bytes)
+    let mut returned_count = 0;
+    for candidate_count in 1..=catalog.entries.len() {
+        let entries = &catalog.entries[..candidate_count];
+        let truncated = entries.len() < catalog.total_count;
+        let measure = ProjectionMeasure {
+            catalog_revision: &catalog.catalog_revision,
+            total_count: catalog.total_count,
+            returned_count: entries.len(),
+            truncated,
+            entries,
+            discovery_hint: truncated.then_some(DISCOVERY_HINT),
+        };
+        if serialized_json_len(&measure)
+            .map(|bytes| bytes <= max_bytes)
             .unwrap_or(false)
         {
-            entries.push(entry.clone());
+            returned_count = candidate_count;
         } else {
             break;
         }
     }
-    value(catalog, &entries)
+    value(catalog, &catalog.entries[..returned_count])
 }
 
 fn project_catalog_reason(error: &GatewayError) -> &'static str {
@@ -1106,11 +1234,7 @@ fn required_binding(value: Option<&str>) -> Result<&str, GatewayError> {
             "binding is not a valid opaque Plugin binding",
         ));
     };
-    if random.len() != 32
-        || !random
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    {
+    if webcodex_core::compact::decode::<16>(random).is_none() {
         return Err(GatewayError::local(
             "invalid_arguments",
             "binding is not a valid opaque Plugin binding",
@@ -1125,7 +1249,7 @@ fn describe_required_error() -> GatewayError {
         "this Plugin binding is unavailable to the current credential or is no longer retained",
     )
     .recovery(
-        "Call plugin_tool with action=describe for the intended runner, plugin, and tool, then call with the returned binding. WebCodex did not retarget or replay the call.",
+        "Call plugin_tool with action=describe for the intended runner, plugin, and tool. For projectBound tools, include the intended explicit project and use its binding only for that Project. Reconcile any earlier unknown outcome before retrying an effect. WebCodex did not retarget or replay the call.",
     )
 }
 
@@ -1184,7 +1308,15 @@ fn bounded_gateway_error_fallback(message: &str) -> String {
 }
 
 fn gateway_error_result(error: GatewayError) -> Value {
-    let text = bounded_gateway_error_fallback(&error.message);
+    // Hosts may expose only error text. Keep recovery ahead of a potentially
+    // long message without increasing the existing fallback byte budget.
+    let text = match error.recovery {
+        Some(recovery) => bounded_gateway_error_fallback(&format!(
+            "Recovery: {recovery}\n\n{}",
+            bounded_gateway_error_fallback(&error.message)
+        )),
+        None => bounded_gateway_error_fallback(&error.message),
+    };
     let dispatch_state = error.dispatch_state.map(dispatch_state_name);
     let mut structured = json!({
         "error": {"code": error.code, "message": error.message}
@@ -1221,7 +1353,9 @@ mod tests {
             provider_id: provider.to_string(),
             provider_instance_id: format!("{provider}-instance"),
             tool_name: tool.to_string(),
+            project: None,
             schema: PluginSchemaObservation {
+                project_bound: false,
                 input_schema: json!({"type":"object"}),
                 output_schema: None,
                 annotations: None,
@@ -1230,7 +1364,37 @@ mod tests {
     }
 
     #[test]
-    fn webcodex_generated_gateway_results_keep_canonical_data_only_in_structured_content() {
+    fn project_delegation_preserves_native_schema_and_separates_trusted_target() {
+        let native =
+            json!({"project":"untrusted-native-text", "native_dispatch_state":"outcome_unknown"});
+        let result: PluginToolResult = serde_json::from_value(json!({
+            "content":[{"type":"text","text":"Native tool timed out"}], "structuredContent":native, "isError":true
+        })).unwrap();
+        let invocation = PluginInvocationResult {
+            operation: PluginOperation::Call,
+            result: Ok(GatewaySuccess::ToolResult(result)),
+            delegation: Some(
+                json!({"project":"agent:runner:authorized", "provider":"pi", "provider_instance":"exact-instance"}),
+            ),
+        };
+        let mcp = invocation.to_mcp_result();
+        assert_eq!(mcp["structuredContent"], native);
+        assert!(mcp["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("agent:runner:authorized"));
+        let generic = invocation.to_tool_result();
+        assert_eq!(generic.output["project"], "agent:runner:authorized");
+        assert_eq!(generic.output["structuredContent"], native);
+        assert_eq!(
+            generic.output["delegation"]["provider_instance"],
+            "exact-instance"
+        );
+        assert!(!generic.success);
+    }
+
+    #[test]
+    fn webcodex_generated_gateway_results_project_bounded_recovery_text() {
         let metadata = json!({
             "runner": "runner-a",
             "plugins": [{"plugin": "repo-tools", "status": "ready"}]
@@ -1271,7 +1435,17 @@ mod tests {
         let fallback = rendered["content"][0]["text"].as_str().unwrap();
         assert!(fallback.len() <= GATEWAY_ERROR_FALLBACK_BYTES);
         assert!(!fallback.contains("plugin_replaced"));
-        assert!(!fallback.contains("Re-list the Plugin"));
+        assert!(fallback.starts_with("Recovery: Re-list the Plugin before retrying."));
+        assert!(fallback.contains("é"));
+
+        let without_recovery = gateway_error_result(GatewayError::local(
+            "plugin_not_found",
+            "Plugin unavailable",
+        ));
+        assert_eq!(without_recovery["content"][0]["text"], "Plugin unavailable");
+        assert!(without_recovery["structuredContent"]
+            .get("recovery")
+            .is_none());
     }
 
     #[test]
@@ -1360,7 +1534,7 @@ mod tests {
             .any(|action| action == "check"));
         assert_eq!(
             spec["inputSchema"]["properties"]["binding"]["pattern"],
-            "^wc_pbind_[0-9a-f]{32}$"
+            "^wc_pbind_[A-Za-z0-9_-]{21}[AQgw]$"
         );
         assert!(spec["description"]
             .as_str()
@@ -1432,7 +1606,7 @@ mod tests {
         assert_eq!(audit["plugin"], "provider-a");
         assert_eq!(audit["tool"], "tool-a");
         assert_eq!(audit["binding_resolved"], true);
-        assert!(!encoded.contains(&opaque));
+        assert!(!encoded.contains(opaque));
         assert!(!encoded.contains(secret));
         assert!(!encoded.contains("provider-a-instance"));
     }
@@ -1462,16 +1636,16 @@ mod tests {
             SpecializedEffect::Management
         );
         assert_eq!(
-            PluginOperation::Check.policy().required_scope,
-            SCOPE_PLUGIN_MANAGE
+            PluginOperation::Check.policy().authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_MANAGE)
         );
         assert!(!PluginOperation::Check.policy().write_like);
         assert!(PluginOperation::Check.policy().shell_like);
         assert!(PluginOperation::Reload.policy().write_like);
         assert!(PluginOperation::Reload.policy().shell_like);
         assert_eq!(
-            PluginOperation::Call.policy().required_scope,
-            SCOPE_PLUGIN_INVOKE
+            PluginOperation::Call.policy().authority,
+            SpecializedAuthorityRequirement::Scope(SCOPE_PLUGIN_INVOKE)
         );
     }
 }

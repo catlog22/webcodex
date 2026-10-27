@@ -2,10 +2,9 @@
 //!
 //! Handler mounting stays explicit in the owning HTTP modules. This registry owns
 //! the security- and surface-relevant metadata that previously drifted across
-//! auth, OpenAPI, console, audit, and test-only route tables.
+//! auth, console, audit, and test-only route tables.
 
 mod account;
-mod connector;
 mod consoles;
 mod mcp;
 mod oauth;
@@ -28,13 +27,6 @@ impl RouteMethod {
             Self::Post => method.trim().eq_ignore_ascii_case("POST"),
         }
     }
-
-    pub(crate) const fn openapi_key(self) -> &'static str {
-        match self {
-            Self::Get => "get",
-            Self::Post => "post",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -54,8 +46,6 @@ pub(crate) enum RouteSurface {
     OAuth,
     Mcp,
     RuntimeApi,
-    Connector,
-    HostConsole,
     RuntimeConsole,
     Admin,
     Audit,
@@ -66,14 +56,6 @@ pub(crate) enum RouteSurface {
     /// Public browser/document delivery only. This surface carries no bearer
     /// authentication or token-admission semantics.
     PublicWeb,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum RouteOpenApiProjection {
-    Hidden,
-    /// Project Connector capability identity; semantic ToolSpec data stays in the
-    /// canonical Connector capability registry.
-    ConnectorCapability(&'static str),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -103,43 +85,23 @@ pub(crate) enum RouteId {
     PairingEnroll,
     McpGet,
     McpPost,
-    ConnectorReadiness,
-    ConnectorTaskStart,
-    ConnectorTaskList,
-    ConnectorTaskResume,
-    ConnectorFilesList,
-    ConnectorFilesRead,
-    ConnectorFilesSearch,
-    ConnectorCodeNavigate,
-    ConnectorCodeImpact,
-    ConnectorEditsApply,
-    ConnectorChecksRun,
-    ConnectorCommandsRun,
-    ConnectorTaskReview,
-    ConnectorTaskCancel,
-    ConnectorTaskFinish,
-    HostConsoleReadiness,
-    HostConsoleTasks,
-    HostConsoleActivity,
-    HostConsoleWorkflowSessions,
-    HostConsoleWorkflowSession,
-    HostConsoleWorkflowSessionProjects,
-    HostConsoleProjects,
-    HostConsoleTaskReview,
-    HostConsoleTaskCancel,
-    HostConsoleTaskGuide,
-    HostConsoleApprovals,
-    HostConsoleApprovalDecide,
-    HostConsoleDevices,
-    HostConsoleResultAccept,
-    HostConsoleResultReject,
-    HostConsoleConnect,
     RuntimeConsoleOverview,
     RuntimeConsoleRunner,
+    RuntimeConsoleBrowserStatus,
     RuntimeConsoleWindows,
     RuntimeConsoleWindow,
+    RuntimeConsoleTrace,
+    RuntimeConsoleWindowCollaboration,
+    RuntimeConsoleWindowCollaborationPost,
     RuntimeConsoleProjects,
+    RuntimeConsoleGoals,
+    RuntimeConsoleGoal,
+    RuntimeConsoleExtensions,
+    RuntimeConsoleInstruction,
+    RuntimeConsoleProjectGit,
+    RuntimeConsolePluginReload,
     RuntimeConsoleWorkflowSessions,
+    RuntimeConsoleWorkflowSessionLocate,
     RuntimeConsoleWorkflowSession,
     RuntimeConsoleWorkflowSessionMessages,
     RuntimeConsoleWorkflowSessionObserve,
@@ -166,29 +128,17 @@ pub(crate) enum RouteId {
     AdminProjectsUnregister,
     ToolsList,
     ToolsCall,
-    GptActionsInvoke,
-    ArtifactsImport,
-    JobsStop,
-    JobsList,
-    JobsTail,
-    RunnerConfigCheck,
-    RunnerConfigReload,
-    ProjectsList,
-    ProjectsRegister,
-    ProjectsCreate,
-    ProjectsUnregister,
+
     ProjectsResolveOrRegister,
-    ProjectsGitStatus,
-    ProjectsListFiles,
-    ProjectsApplyUnifiedDiff,
-    ProjectsRunShell,
-    ProjectsGitRestorePaths,
-    ProjectsDiscardUntracked,
-    ProjectsRunJob,
     RuntimeStatus,
+    RuntimeUpgradeMaintenance,
+    CloudflareControl,
+    CloudflareForwardingProbe,
     OAuthClientsCreate,
     OAuthClientsList,
     OAuthClientsUpdateScopes,
+    OAuthClientsAddRedirectUri,
+    OAuthClientsRemoveRedirectUri,
     OAuthClientsRevoke,
     OAuthSharedKeyClientProvision,
     UsersCreate,
@@ -203,13 +153,8 @@ pub(crate) enum RouteId {
     AgentTokensList,
     AgentTokensRevoke,
     PairingCreate,
-    ShellRun,
-    ShellFile,
-    ShellJob,
-    ShellJobsStatus,
-    ShellJobsLog,
-    ShellJobsStop,
-    ShellJobsList,
+    PairingRunnerCapabilities,
+    RunnerCapabilityAuthorization,
     RunnerRegister,
     RunnerOffline,
     RunnerPoll,
@@ -220,10 +165,8 @@ pub(crate) enum RouteId {
     AuditSessions,
     AuditSession,
     AuditStats,
-    OpenApiDocument,
-    ConsoleWebRoot,
-    ConsoleWebAppJs,
-    ConsoleWebStylesCss,
+    Healthz,
+
     RuntimeWebRoot,
     RuntimeWebAppJs,
     RuntimeWebStylesCss,
@@ -239,7 +182,7 @@ pub(crate) struct RouteSpec {
     pub(crate) path: &'static str,
     pub(crate) scope_policy: OAuthRouteScopePolicy,
     pub(crate) surface: RouteSurface,
-    pub(crate) openapi_projection: RouteOpenApiProjection,
+
     pub(crate) audit_class: AuditClass,
     pub(crate) auth: RouteAuth,
 }
@@ -250,7 +193,7 @@ const fn route(
     path: &'static str,
     scope_policy: OAuthRouteScopePolicy,
     surface: RouteSurface,
-    openapi_projection: RouteOpenApiProjection,
+
     audit_class: AuditClass,
     auth: RouteAuth,
 ) -> RouteSpec {
@@ -260,7 +203,7 @@ const fn route(
         path,
         scope_policy,
         surface,
-        openapi_projection,
+
         audit_class,
         auth,
     }
@@ -275,21 +218,17 @@ use OAuthRouteScopePolicy::*;
 #[cfg(test)]
 use RouteId::*;
 #[cfg(test)]
-use RouteOpenApiProjection::*;
-#[cfg(test)]
 use RouteSurface::*;
 
 const ROUTE_GROUPS: &[&[RouteSpec]] = &[
     oauth::PUBLIC_ROUTES,
     account::ENROLLMENT_ROUTES,
     mcp::ROUTES,
-    connector::ROUTES,
     consoles::ROUTES,
     operations::ADMIN_ROUTES,
     runtime::ROUTES,
     oauth::MANAGEMENT_ROUTES,
     account::ROUTES,
-    runtime::SHELL_ROUTES,
     runner_transport::ROUTES,
     operations::AUDIT_ROUTES,
     operations::PUBLIC_WEB_ROUTES,
@@ -304,11 +243,6 @@ pub(crate) fn spec(id: RouteId) -> &'static RouteSpec {
     iter_routes()
         .find(|spec| spec.id == id)
         .unwrap_or_else(|| panic!("RouteId {id:?} has no canonical RouteSpec"))
-}
-
-#[cfg(test)]
-pub(crate) fn path(id: RouteId) -> &'static str {
-    spec(id).path
 }
 
 /// Path relative to the production `/api` parent router.
@@ -352,18 +286,7 @@ pub(crate) fn shared_root_path(first: RouteId, second: RouteId) -> &'static str 
 
 pub(crate) fn lookup(method: &str, path: &str) -> Option<&'static RouteSpec> {
     let path = normalize_path(path);
-    iter_routes().find(|spec| {
-        spec.method.matches(method)
-            && (spec.path == path
-                || (spec.id == RouteId::GptActionsInvoke && gpt_action_runtime_path_matches(&path)))
-    })
-}
-
-fn gpt_action_runtime_path_matches(path: &str) -> bool {
-    let Some(tool_name) = path.strip_prefix("/api/actions/") else {
-        return false;
-    };
-    !tool_name.is_empty() && !tool_name.contains('/')
+    iter_routes().find(|spec| spec.method.matches(method) && spec.path == path)
 }
 
 /// Exact path-only lookup for consumers whose historical contract was an
@@ -388,8 +311,9 @@ pub(crate) fn audit_class_for_path(path: &str) -> Option<AuditClass> {
 pub(crate) fn audit_class_for_runtime_tool(tool_name: &str) -> Option<AuditClass> {
     use webcodex_tool_contracts::{
         ToolActivityKind, ToolEffect, ToolExecutionForm, ToolExecutionStart,
-        TOOL_CATEGORY_ARTIFACT, TOOL_CATEGORY_EDIT, TOOL_CATEGORY_GIT, TOOL_CATEGORY_JOB,
-        TOOL_CATEGORY_PATCH, TOOL_CATEGORY_RUNTIME, TOOL_CATEGORY_VALIDATION,
+        TOOL_CATEGORY_ARTIFACT, TOOL_CATEGORY_EDIT, TOOL_CATEGORY_EXECUTION, TOOL_CATEGORY_GIT,
+        TOOL_CATEGORY_JOB, TOOL_CATEGORY_MEMORY, TOOL_CATEGORY_PATCH, TOOL_CATEGORY_PLUGIN,
+        TOOL_CATEGORY_RUNTIME, TOOL_CATEGORY_SKILL, TOOL_CATEGORY_VALIDATION,
     };
 
     let definition = webcodex_tool_contracts::lookup_tool_definition(tool_name)?;
@@ -416,7 +340,12 @@ pub(crate) fn audit_class_for_runtime_tool(tool_name: &str) -> Option<AuditClass
     }) {
         return Some(AuditClass::Shell);
     }
-    if definition.category == TOOL_CATEGORY_RUNTIME {
+    // The discovery taxonomy may split runtime extensions without rewriting
+    // the historical ActionAudit report/command buckets used by fleet analyses.
+    if matches!(
+        definition.category,
+        TOOL_CATEGORY_RUNTIME | TOOL_CATEGORY_SKILL | TOOL_CATEGORY_MEMORY | TOOL_CATEGORY_PLUGIN
+    ) {
         return Some(if definition.metadata().effect == ToolEffect::Observe {
             AuditClass::Report
         } else {
@@ -425,7 +354,7 @@ pub(crate) fn audit_class_for_runtime_tool(tool_name: &str) -> Option<AuditClass
     }
     if matches!(
         definition.category,
-        TOOL_CATEGORY_JOB | TOOL_CATEGORY_VALIDATION
+        TOOL_CATEGORY_EXECUTION | TOOL_CATEGORY_JOB | TOOL_CATEGORY_VALIDATION
     ) || matches!(
         activity.kind,
         ToolActivityKind::Run | ToolActivityKind::Test
@@ -444,14 +373,13 @@ pub(crate) fn audit_class_for_runtime_tool(tool_name: &str) -> Option<AuditClass
     })
 }
 
-/// Persisted GPT Action events share one dynamic HTTP adapter, so endpoint-only
-/// classification is intentionally insufficient. Their canonical `operation`
-/// records the resolved runtime tool identity and is projected through the same
-/// ToolDefinition semantics used elsewhere. Ordinary and historical REST events
-/// keep their route-based compatibility classes unchanged.
+/// Classify mounted REST routes. Retired endpoint records remain historical
+/// evidence, not current route admission or a tool-name compatibility table.
 pub(crate) fn audit_class_for_event(endpoint: &str, operation: Option<&str>) -> Option<AuditClass> {
-    if lookup("POST", endpoint).is_some_and(|spec| spec.id == RouteId::GptActionsInvoke) {
-        return operation.and_then(audit_class_for_runtime_tool);
+    if lookup("POST", endpoint).is_some_and(|spec| spec.id == RouteId::ToolsCall) {
+        return operation
+            .and_then(audit_class_for_runtime_tool)
+            .or(Some(AuditClass::Command));
     }
     audit_class_for_path(endpoint)
 }
@@ -484,10 +412,10 @@ mod tests {
     fn mounted_route_sources() -> [&'static str; 5] {
         [
             include_str!("lib.rs"),
-            production_prefix(include_str!("connector_runtime/http.rs")),
-            production_prefix(include_str!("host_console_http.rs")),
+            production_prefix(include_str!("runner_http/mod.rs")),
             production_prefix(include_str!("runtime_console_http.rs")),
             production_prefix(include_str!("admin_http.rs")),
+            production_prefix(include_str!("cloudflare_ingress.rs")),
         ]
     }
 
@@ -542,25 +470,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_project_activation_operator_routes_stay_hidden_and_narrowly_scoped() {
-        let check = spec(RouteId::RunnerConfigCheck);
-        assert_eq!(
-            check.scope_policy,
-            webcodex_core::authority::OAuthRouteScopePolicy::Require(
-                webcodex_core::authority::SCOPE_RUNTIME_READ,
-            )
-        );
-        assert_eq!(check.openapi_projection, RouteOpenApiProjection::Hidden);
-
-        let reload = spec(RouteId::RunnerConfigReload);
-        assert_eq!(
-            reload.scope_policy,
-            webcodex_core::authority::OAuthRouteScopePolicy::Require(
-                webcodex_core::authority::SCOPE_RUNNER_MANAGE,
-            )
-        );
-        assert_eq!(reload.openapi_projection, RouteOpenApiProjection::Hidden);
-
+    fn desktop_project_activation_internal_route_stays_hidden_and_narrowly_scoped() {
         let activate = spec(RouteId::ProjectsResolveOrRegister);
         assert_eq!(
             activate.scope_policy,
@@ -568,66 +478,25 @@ mod tests {
                 webcodex_core::authority::SCOPE_PROJECT_WRITE,
             )
         );
-        assert_eq!(activate.openapi_projection, RouteOpenApiProjection::Hidden);
     }
 
     #[test]
-    fn openapi_projection_is_connector_bijective_and_runtime_routes_are_hidden() {
-        let mut connector_capabilities = BTreeSet::new();
-
-        for route_spec in iter_routes() {
-            match route_spec.openapi_projection {
-                Hidden => {}
-                ConnectorCapability(name) => {
-                    assert_eq!(route_spec.method, RouteMethod::Post, "{:?}", route_spec.id);
-                    assert_eq!(route_spec.surface, Connector, "{:?}", route_spec.id);
-                    assert_eq!(
-                        route_spec.auth,
-                        RouteAuth::AuthMiddleware,
-                        "{:?} Connector OpenAPI declares bearer security and must stay behind AuthMiddleware",
-                        route_spec.id
-                    );
-                    assert!(!name.is_empty(), "{:?}", route_spec.id);
-                    assert!(
-                        connector_capabilities.insert(name),
-                        "duplicate Connector capability route binding: {name}"
-                    );
-                }
-            }
-        }
-
-        let canonical_connector_capabilities =
-            webcodex_connector_runtime::surface::CAPABILITY_NAMES
-                .iter()
-                .copied()
-                .collect::<BTreeSet<_>>();
-        assert_eq!(
-            connector_capabilities, canonical_connector_capabilities,
-            "RouteSpec Connector bindings must be a bijection with the canonical capability registry"
-        );
-        assert_eq!(spec(GptActionsInvoke).openapi_projection, Hidden);
-        for id in [
-            ToolsList,
-            ToolsCall,
-            ArtifactsImport,
-            JobsList,
-            JobsTail,
-            ProjectsList,
-            ProjectsRegister,
-            ProjectsCreate,
-            ProjectsGitStatus,
-            ProjectsListFiles,
-            ProjectsApplyUnifiedDiff,
-            ProjectsRunShell,
-            ProjectsGitRestorePaths,
-            ProjectsDiscardUntracked,
-            ProjectsRunJob,
-            RuntimeStatus,
+    fn retired_execution_routes_have_no_metadata_admission() {
+        assert!(lookup("GET", "/openapi.json").is_none());
+        assert!(lookup("POST", "/api/actions/read_files").is_none());
+        assert!(lookup("POST", "/api/artifacts/import").is_none());
+        for path in [
+            "/api/shell/run",
+            "/api/shell/file",
+            "/api/shell/job",
+            "/api/shell/jobs/status",
+            "/api/shell/jobs/log",
+            "/api/shell/jobs/stop",
+            "/api/shell/jobs/list",
         ] {
-            assert_eq!(spec(id).openapi_projection, Hidden, "{id:?}");
+            assert!(lookup("POST", path).is_none(), "{path}");
         }
     }
-
     #[test]
     fn canonical_lookup_normalizes_only_benign_request_path_variants() {
         assert_eq!(
@@ -639,10 +508,7 @@ mod tests {
         assert!(lookup("GET", "/api/runtime/status").is_none());
         assert!(lookup("POST", "/api/future/authenticated-route").is_none());
         assert!(lookup("POST", "/api/runtime/status/extra").is_none());
-        assert_eq!(
-            lookup("POST", "/api/actions/read_files").unwrap().id,
-            GptActionsInvoke
-        );
+        assert!(lookup("POST", "/api/actions/read_files").is_none());
         assert!(lookup("POST", "/api/actions/read_files/extra").is_none());
 
         // Path-only surface/audit consumers replaced exact historical
@@ -661,8 +527,23 @@ mod tests {
             let needle = format!("RouteId::{:?}", spec.id);
             assert_eq!(
                 exact_route_id_reference_count(&combined, &needle),
-                1,
-                "production leaf mount must reference {needle} exactly once"
+                if matches!(
+                    spec.id,
+                    RouteId::McpGet
+                        | RouteId::McpPost
+                        | RouteId::WellKnownProtectedResource
+                        | RouteId::WellKnownAuthorizationServer
+                        | RouteId::OAuthAuthorize
+                        | RouteId::OAuthAuthorizeLogin
+                        | RouteId::OAuthAuthorizeConsent
+                        | RouteId::OAuthToken
+                        | RouteId::OAuthRevoke
+                ) {
+                    2
+                } else {
+                    1
+                },
+                "production leaf mount must reference {needle} once per owning listener"
             );
             references += 1;
         }
@@ -700,7 +581,8 @@ mod tests {
         let routes = iter_routes()
             .filter(|spec| spec.surface == PublicWeb)
             .collect::<Vec<_>>();
-        assert_eq!(routes.len(), 10);
+        // The obsolete schema document is no longer a public route.
+        assert_eq!(routes.len(), 7);
         for route in routes {
             assert_eq!(route.method, RouteMethod::Get, "{:?}", route.id);
             assert_eq!(
@@ -710,18 +592,12 @@ mod tests {
                 route.id
             );
             assert_eq!(route.auth, RouteAuth::Public, "{:?}", route.id);
-            assert_eq!(route.openapi_projection, Hidden, "{:?}", route.id);
             assert_eq!(route.audit_class, Other, "{:?}", route.id);
         }
-        assert_eq!(direct_child_path(ConsoleWebRoot, ConsoleWebAppJs), "app.js");
         assert_eq!(
             direct_child_path(RuntimeWebRoot, RuntimeWebStylesCss),
             "styles.css"
         );
-        assert!(std::panic::catch_unwind(|| {
-            direct_child_path(ConsoleWebRoot, RuntimeWebAppJs)
-        })
-        .is_err());
     }
 
     #[test]
@@ -737,9 +613,6 @@ mod tests {
                 Require(SCOPE_SESSION_COLLABORATE),
                 "{id:?} must retain mutation-capable Session authority"
             );
-        }
-        for spec in iter_routes().filter(|spec| spec.surface == RuntimeConsole) {
-            assert_eq!(spec.openapi_projection, Hidden, "{:?}", spec.id);
         }
     }
 
@@ -802,49 +675,37 @@ mod tests {
     #[test]
     fn audit_class_preserves_existing_http_stats_semantics() {
         for (path, class) in [
-            ("/api/projects/apply_unified_diff", Edit),
-            ("/api/projects/run_job", Job),
             ("/api/tools/call", Command),
             ("/api/runtime/status", Report),
-            ("/api/artifacts/import", Artifact),
-            ("/api/projects/git_status", Git),
-            ("/api/projects/run_shell", Shell),
-            ("/api/actions/{tool_name}", Other),
         ] {
             assert_eq!(audit_class_for_path(path), Some(class), "{path}");
         }
         for (tool, class) in [
-            ("apply_text_edits", Edit),
+            ("edit_project_files", Edit),
             ("run_shell", Shell),
-            ("import_conversation_files_to_project", Artifact),
-            ("git_diff_hunks", Git),
+            ("import_host_files", Artifact),
+            ("read_git_diff_hunks", Git),
             ("read_files", Context),
-            ("runtime_status", Report),
+            ("get_runtime_status", Report),
             ("cargo_test", Job),
-            ("workspace_hygiene_check", Report),
+            ("check_workspace_hygiene", Report),
             ("plugin_tool", Command),
+            ("run_process", Job),
+            ("run_script", Job),
+            ("run_detached_process", Job),
+            ("get_session_shell_status", Job),
+            ("load_skill", Report),
+            ("run_skill_resource", Command),
+            ("read_memory", Report),
+            ("set_memory", Command),
         ] {
             assert_eq!(audit_class_for_runtime_tool(tool), Some(class), "{tool}");
-            assert_eq!(
-                audit_class_for_event("/api/actions/{tool_name}", Some(tool)),
-                Some(class),
-                "{tool} placeholder route"
-            );
-            assert_eq!(
-                audit_class_for_event(&format!("/api/actions/{tool}"), Some(tool)),
-                Some(class),
-                "{tool} concrete route"
-            );
         }
         assert_eq!(
             audit_class_for_event("/api/actions/{tool_name}", None),
             None
         );
 
-        assert_eq!(
-            audit_class_for_path("/api/connector/edits/apply"),
-            Some(Other)
-        );
         assert_eq!(
             audit_class_for_path("/api/runtime-console/projects"),
             Some(Other)

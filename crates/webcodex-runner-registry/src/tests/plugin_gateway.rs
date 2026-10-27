@@ -10,6 +10,7 @@ use webcodex_core::plugin::{
 
 fn plugin_tool() -> PluginTool {
     PluginTool {
+        project_bound: false,
         name: "echo".to_string(),
         title: None,
         description: Some("Echo a value".to_string()),
@@ -26,6 +27,7 @@ fn plugin_registration(client_id: &str, runner_instance_id: &str) -> RunnerRegis
     let mut capabilities = RunnerCapabilities::default();
     capabilities.native_tool_plugins = true;
     current_runner_registration(RunnerRegisterRequest {
+        computer_session_availability: None,
         client_id: client_id.to_string(),
         runner_instance_id: runner_instance_id.to_string(),
         runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -152,6 +154,8 @@ async fn plugin_reload_can_target_exact_plugin_capable_runner_without_registrati
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -214,6 +218,8 @@ async fn plugin_check_targets_exact_runner_without_registration_provider_invento
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -283,6 +289,8 @@ async fn plugin_check_rejects_mismatched_provider_report_after_dispatch() {
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -356,6 +364,8 @@ async fn project_catalog_rejects_mixed_runner_response_kind() {
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -440,6 +450,8 @@ async fn plugin_enqueue_rechecks_owner_and_exact_runner_but_not_provider_invento
                 exit_code: None,
                 stdout: None,
                 stderr: None,
+                stdout_truncated: false,
+                stderr_truncated: false,
                 duration_ms: None,
                 error: None,
             },
@@ -504,6 +516,7 @@ async fn provider_identity_is_runner_owned_and_forwarded_exactly() {
     register_plugin_runner(&registry).await;
     let alice = auth_context(Some("alice"), false);
     let schema = PluginSchemaObservation {
+        project_bound: false,
         input_schema: plugin_tool().input_schema,
         output_schema: None,
         annotations: None,
@@ -513,6 +526,7 @@ async fn provider_identity_is_runner_owned_and_forwarded_exactly() {
             "plugin-runner",
             "runner-instance",
             PluginGatewayRequest::ToolsCall {
+                project_target: None,
                 provider_id: "repo-tools".to_string(),
                 provider_instance_id: "dynamic-provider-instance".to_string(),
                 name: "echo".to_string(),
@@ -535,6 +549,7 @@ async fn provider_identity_is_runner_owned_and_forwarded_exactly() {
     assert!(matches!(
         request.plugin_gateway,
         Some(PluginGatewayRequest::ToolsCall {
+            project_target: None,
             ref provider_instance_id,
             ..
         }) if provider_instance_id == "dynamic-provider-instance"

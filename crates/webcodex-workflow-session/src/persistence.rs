@@ -1,11 +1,9 @@
 //! JSON session ledger load/save, sanitize-on-restore, and atomic writes.
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{self, Write};
-use std::path::PathBuf;
+use std::io;
 use std::sync::Arc;
 
-use serde::Deserialize;
 use serde_json::Value;
 
 use super::assignment::is_valid_assignment_fence_fingerprint;
@@ -16,11 +14,10 @@ use super::events::{
     sanitize_tool_execution_state, session_input_summary_for_tool,
 };
 use super::model::{
-    ColdSessionRecord, PersistedSessionLedger, PersistedSessionRecord, SessionEvent, SessionGuards,
-    SessionMessage, SessionRecord, StoredSession, DEFAULT_MAX_MESSAGES_PER_SESSION,
-    EVENT_ID_PREFIX, MAX_CODING_INSTRUCTION_CHARS, MAX_INPUT_ARRAY_ITEMS,
-    MAX_MATERIALIZED_VALIDATION_JOB_IDS, MAX_MESSAGE_CHARS, MAX_MESSAGE_RESOLUTION_CHARS,
-    MESSAGE_ID_PREFIX, SESSION_LEDGER_VERSION,
+    ColdSessionRecord, PersistedRetentionTombstoneRow, PersistedSessionRecord, SessionEvent,
+    SessionGuards, SessionMessage, SessionRecord, SessionRetentionTombstone, EVENT_ID_PREFIX,
+    MAX_CODING_INSTRUCTION_CHARS, MAX_INPUT_ARRAY_ITEMS, MAX_MATERIALIZED_VALIDATION_JOB_IDS,
+    MAX_MESSAGE_CHARS, MAX_MESSAGE_RESOLUTION_CHARS, SESSION_LEDGER_VERSION,
 };
 use super::query::{is_valid_completion_id, validate_message_tags};
 use super::util::{
@@ -29,17 +26,12 @@ use super::util::{
 use webcodex_core::project_instructions::ProjectInstructionsSummarySnapshot;
 use webcodex_core::workflow_session_contract::is_safe_job_id;
 
-#[derive(Deserialize)]
-struct SessionLedgerVersionProbe {
-    version: u32,
-}
+#[cfg(test)]
+use crate::model::StoredSession;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct LoadedSessionLedgerV2 {
-    version: u32,
-    sessions: Vec<Value>,
-}
+pub(crate) mod database;
+mod resident;
+mod stream;
 
 fn v2_record_has_canonical_logical_invocation_shape(value: &Value) -> bool {
     value
@@ -65,14 +57,33 @@ fn v2_record_has_canonical_logical_invocation_shape(value: &Value) -> bool {
 }
 
 impl PersistedSessionRecord {
-    pub fn from_record(record: &SessionRecord, max_events_per_session: usize) -> Self {
-        let event_skip = record.events.len().saturating_sub(max_events_per_session);
-        let message_skip = record
-            .messages
-            .len()
-            .saturating_sub(DEFAULT_MAX_MESSAGES_PER_SESSION);
+    pub fn from_record(record: &SessionRecord, recent_event_limit: usize) -> Self {
+        Self::snapshot(record, recent_event_limit, None)
+    }
+
+    pub(crate) fn database_delta(record: &SessionRecord, after: u64) -> Self {
+        Self::snapshot(record, 0, Some(after))
+    }
+
+    fn snapshot(record: &SessionRecord, recent_event_limit: usize, after: Option<u64>) -> Self {
+        let changed = |id: &String| {
+            after.is_none_or(|after| {
+                record
+                    .message_observation_revisions
+                    .get(id)
+                    .copied()
+                    .unwrap_or(0)
+                    > after
+            })
+        };
+        let event_skip = record.events.len().saturating_sub(recent_event_limit);
         let events: Vec<_> = record.events.iter().skip(event_skip).cloned().collect();
-        let messages: Vec<_> = record.messages.iter().skip(message_skip).cloned().collect();
+        let messages: Vec<_> = record
+            .messages
+            .iter()
+            .filter(|message| changed(&message.message_id))
+            .cloned()
+            .collect();
         debug_assert!(record
             .events
             .iter()
@@ -82,7 +93,7 @@ impl PersistedSessionRecord {
         debug_assert!(record
             .messages
             .iter()
-            .skip(message_skip)
+            .filter(|message| changed(&message.message_id))
             .zip(&messages)
             .all(|(record, snapshot)| Arc::ptr_eq(record, snapshot)));
         Self {
@@ -96,10 +107,26 @@ impl PersistedSessionRecord {
             lifecycle: record.lifecycle,
             created_at: record.created_at,
             updated_at: record.updated_at,
+            current_instruction: record.current_instruction.clone(),
+            event_history_start: if record.history_is_durable {
+                record.event_history_start
+            } else {
+                record
+                    .events_observed
+                    .saturating_sub(record.events.len() as u64)
+            },
             events,
             messages,
+            message_delivery_replays: record
+                .message_delivery_replays
+                .iter()
+                .filter(|(_, replay)| changed(&replay.message_id))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
             events_observed: record.events_observed,
-            context_revision: record.context_revision,
+            legacy_context_revision: None,
+            git_baseline_tree: record.git_baseline_tree.clone(),
+            repository_edit_observed: record.repository_edit_observed,
             materialized_validation_job_ids: record
                 .materialized_validation_job_ids
                 .iter()
@@ -107,12 +134,23 @@ impl PersistedSessionRecord {
                 .collect(),
             message_observation_revision: record.message_observation_revision,
             message_observation_floor: record.message_observation_floor,
-            message_observation_revisions: record.message_observation_revisions.clone(),
-            assignment_history_floors: record.assignment_history_floors.clone(),
+            message_observation_revisions: record
+                .message_observation_revisions
+                .iter()
+                .filter(|(id, _)| changed(id))
+                .map(|(key, value)| (key.clone(), *value))
+                .collect(),
+            assignment_history_floors: record
+                .assignment_history_floors
+                .iter()
+                .filter(|(id, _)| changed(id))
+                .map(|(key, value)| (key.clone(), *value))
+                .collect(),
             assignment_history_tracking_complete: record.assignment_history_tracking_complete,
             completion_assignment_fence_fingerprints: record
                 .completion_assignment_fence_fingerprints
                 .iter()
+                .filter(|(id, _)| changed(id))
                 .filter_map(|(todo_id, fingerprint)| {
                     fingerprint
                         .as_ref()
@@ -135,13 +173,17 @@ impl PersistedSessionRecord {
             && self.lifecycle == record.lifecycle
             && self.created_at == record.created_at
             && self.updated_at == record.updated_at
+            && self.current_instruction.as_ref().map(|e| &e.event_id)
+                == record.current_instruction.as_ref().map(|e| &e.event_id)
             && self.events_observed == record.events_observed
-            && self.context_revision == record.context_revision
+            && self.git_baseline_tree == record.git_baseline_tree
+            && self.repository_edit_observed == record.repository_edit_observed
             && self
                 .materialized_validation_job_ids
                 .iter()
                 .eq(record.materialized_validation_job_ids.iter())
             && self.message_observation_revision == record.message_observation_revision
+            && self.message_delivery_replays == record.message_delivery_replays
             && self.message_observation_floor == record.message_observation_floor
             && self.message_observation_revisions == record.message_observation_revisions
             && self.assignment_history_floors == record.assignment_history_floors
@@ -175,7 +217,7 @@ impl PersistedSessionRecord {
                 .all(|(snapshot, live)| Arc::ptr_eq(snapshot, live))
     }
 
-    fn into_record(self, max_events_per_session: usize) -> Option<SessionRecord> {
+    fn into_record(self, recent_event_limit: usize) -> Option<SessionRecord> {
         let session_id = self.session_id.trim().to_string();
         if !is_valid_session_id(&session_id) {
             return None;
@@ -192,7 +234,7 @@ impl PersistedSessionRecord {
             .filter_map(|event| sanitize_persisted_event(event, &session_id))
             .map(Arc::new)
             .rev()
-            .take(max_events_per_session)
+            .take(recent_event_limit)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -205,7 +247,6 @@ impl PersistedSessionRecord {
             .filter_map(|message| sanitize_persisted_message(message, &session_id))
             .map(Arc::new)
             .rev()
-            .take(DEFAULT_MAX_MESSAGES_PER_SESSION)
             .collect::<Vec<_>>()
             .into_iter()
             .rev()
@@ -231,6 +272,16 @@ impl PersistedSessionRecord {
             .iter()
             .map(|message| message.message_id.clone())
             .collect::<HashSet<_>>();
+        let message_delivery_replays = self
+            .message_delivery_replays
+            .into_iter()
+            .filter(|(scope_key, replay)| {
+                is_lower_hex_sha256(scope_key.split_once(':').map_or("", |(scope, _)| scope))
+                    && is_lower_hex_sha256(scope_key.split_once(':').map_or("", |(_, key)| key))
+                    && is_lower_hex_sha256(&replay.payload_fingerprint)
+                    && retained_message_ids.contains(&replay.message_id)
+            })
+            .collect();
         let current_observation_revision = self.message_observation_revision;
         let mut observation_floor = self
             .message_observation_floor
@@ -365,11 +416,6 @@ impl PersistedSessionRecord {
         // retained. A live ledger that exceeded the cap has the true cumulative
         // count persisted.
         let retained_events = events.len() as u64;
-        let retained_context_revision = events
-            .iter()
-            .filter_map(|event| event.context_revision)
-            .max()
-            .unwrap_or(0);
         let project = self.project.map(|value| bound_summary_string(value.trim()));
         let execution_context = if project.is_some() {
             self.execution_context.sanitized_for_restore()
@@ -377,6 +423,22 @@ impl PersistedSessionRecord {
             Default::default()
         };
         Some(SessionRecord {
+            current_instruction: self
+                .current_instruction
+                .and_then(|event| sanitize_persisted_event((*event).clone(), &session_id))
+                .filter(|event| event.kind == "task_instruction")
+                .map(Arc::new)
+                .or_else(|| {
+                    events
+                        .iter()
+                        .rev()
+                        .find(|event| event.kind == "task_instruction")
+                        .cloned()
+                }),
+            history_is_durable: false,
+            event_history_start: self.event_history_start,
+            pending_events: VecDeque::new(),
+            durable: None,
             session_id,
             project,
             owner_authority_fingerprint,
@@ -389,9 +451,13 @@ impl PersistedSessionRecord {
             updated_at: self.updated_at.max(self.created_at),
             events,
             events_observed: self.events_observed.max(retained_events),
-            context_revision: self.context_revision.max(retained_context_revision),
+            git_baseline_tree: self.git_baseline_tree.filter(|tree| {
+                matches!(tree.len(), 40 | 64) && tree.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+            repository_edit_observed: self.repository_edit_observed,
             materialized_validation_job_ids,
             messages,
+            message_delivery_replays,
             project_instructions: None,
             message_observation_revision: current_observation_revision,
             message_observation_floor: observation_floor,
@@ -432,15 +498,27 @@ fn sanitize_owner_authority_fingerprint(value: String) -> Option<String> {
 
 pub fn cold_session_from_record(
     record: &SessionRecord,
-    max_events_per_session: usize,
+    recent_event_limit: usize,
 ) -> Result<ColdSessionRecord, serde_json::Error> {
-    debug_assert!(!record.lifecycle.allows_mutation());
     let project_instructions = record
         .project_instructions
         .as_ref()
         .map(|snapshot| snapshot.to_summary());
-    let persisted = PersistedSessionRecord::from_record(record, max_events_per_session);
-    cold_session_from_persisted(&persisted, project_instructions)
+    let persisted = PersistedSessionRecord::from_record(record, recent_event_limit);
+    let mut cold = cold_session_from_persisted(&persisted, project_instructions)?;
+    if record.lifecycle.allows_mutation() {
+        cold.resident_instructions = record
+            .project_instructions
+            .as_ref()
+            .map(|value| Arc::new(value.clone()));
+        cold.unfenced_completion_ids = record
+            .completion_assignment_fence_fingerprints
+            .iter()
+            .filter(|(_, fence)| fence.is_none())
+            .map(|(id, _)| id.clone())
+            .collect();
+    }
+    Ok(cold)
 }
 
 pub fn cold_session_from_persisted(
@@ -457,7 +535,10 @@ pub fn cold_session_from_persisted(
             })?;
     let lifecycle = persisted.lifecycle;
     let raw = Arc::from(serde_json::value::to_raw_value(persisted)?);
+    let revision_raw = Arc::downgrade(&raw);
     Ok(ColdSessionRecord {
+        database: None,
+        database_revision: 0,
         session_id: persisted.session_id.clone(),
         project: persisted.project.clone(),
         owner_authority_fingerprint,
@@ -465,174 +546,61 @@ pub fn cold_session_from_persisted(
         guards: persisted.guards,
         lifecycle,
         updated_at: persisted.updated_at,
-        context_revision: persisted.context_revision,
+        created_at: persisted.created_at,
         project_instructions,
         raw,
+        console_list_cache: Arc::new(std::sync::Mutex::new(None)),
+        resident_instructions: None,
+        unfenced_completion_ids: Vec::new(),
+        revision_raw,
+        retained_events_observed: persisted.events_observed.max(persisted.events.len() as u64),
+        retained_message_revision: persisted.message_observation_revision,
     })
 }
 
 pub fn materialize_cold_session(
     record: &ColdSessionRecord,
-    max_events_per_session: usize,
+    recent_event_limit: usize,
 ) -> Option<SessionRecord> {
-    serde_json::from_str::<PersistedSessionRecord>(record.raw.get())
-        .ok()?
-        .into_record(max_events_per_session)
+    let persisted = if let Some(database) = &record.database {
+        database.load(record, recent_event_limit).ok()?
+    } else {
+        serde_json::from_str::<PersistedSessionRecord>(record.raw.get()).ok()?
+    };
+    if persisted.session_id != record.session_id
+        || persisted.project != record.project
+        || persisted.owner_authority_fingerprint != record.owner_authority_fingerprint
+        || persisted.lifecycle != record.lifecycle
+        || persisted.mode != record.mode
+        || persisted.guards != record.guards
+        || persisted.updated_at != record.updated_at
+    {
+        return None;
+    }
+    // SQLite validates persisted input on load. Memory-only Cold bytes were
+    // produced by our own canonical serializer. Both restore process-local
+    // instruction/fence metadata separately without changing identity.
+    Some(resident::materialize(persisted, record))
 }
 
-pub struct RestoredSessionLedger {
-    pub sessions: HashMap<String, StoredSession>,
-    pub lru: VecDeque<String>,
-    pub restored_sessions: usize,
-    pub last_persist_error: Option<String>,
+fn parse_retention_tombstone_row(value: &Value) -> Option<SessionRetentionTombstone> {
+    let row = serde_json::from_value::<PersistedRetentionTombstoneRow>(value.clone()).ok()?;
+    let tombstone = row.retention_tombstone;
+    if !is_valid_session_id(&tombstone.session_id)
+        || !is_lower_hex_sha256(&tombstone.owner_authority_fingerprint)
+        || !is_lower_hex_sha256(&tombstone.incarnation_fingerprint)
+    {
+        return None;
+    }
+    Some(tombstone)
 }
 
-impl RestoredSessionLedger {
-    fn empty(last_persist_error: Option<String>) -> Self {
-        Self {
-            sessions: HashMap::new(),
-            lru: VecDeque::new(),
-            restored_sessions: 0,
-            last_persist_error,
-        }
-    }
-}
-
-pub fn load_persisted_ledger(
-    path: &PathBuf,
-    max_sessions: usize,
-    max_events_per_session: usize,
-) -> RestoredSessionLedger {
-    let content = match fs::read_to_string(path) {
-        Ok(content) => content,
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
-            return RestoredSessionLedger::empty(None);
-        }
-        Err(err) => {
-            let error = bound_summary_string(&format!("restore_failed: {}: {err}", path.display()));
-            tracing::warn!("session ledger restore failed: {}", error);
-            return RestoredSessionLedger::empty(Some(error));
-        }
-    };
-    let version = match serde_json::from_str::<SessionLedgerVersionProbe>(&content) {
-        Ok(probe) => probe.version,
-        Err(err) => {
-            let error = bound_summary_string(&format!(
-                "restore_failed: invalid session ledger JSON: {err}"
-            ));
-            tracing::warn!("session ledger restore failed: {}", error);
-            return RestoredSessionLedger::empty(Some(error));
-        }
-    };
-    let restored_records: Result<Vec<SessionRecord>, String> = match version {
-        SESSION_LEDGER_VERSION => serde_json::from_str::<LoadedSessionLedgerV2>(&content)
-            .map_err(|err| format!("invalid v2 session ledger: {err}"))
-            .map(|ledger| {
-                debug_assert_eq!(ledger.version, SESSION_LEDGER_VERSION);
-                ledger
-                    .sessions
-                    .into_iter()
-                    .filter_map(|value| {
-                        if !v2_record_has_canonical_logical_invocation_shape(&value) {
-                            tracing::warn!(
-                                "discarding malformed v2 Session row: event correlation shape is partial"
-                            );
-                            return None;
-                        }
-                        let record = match serde_json::from_value::<PersistedSessionRecord>(value) {
-                            Ok(record) => record,
-                            Err(err) => {
-                                tracing::warn!("discarding malformed v2 Session row: {err}");
-                                return None;
-                            }
-                        };
-                        record.into_record(max_events_per_session)
-                    })
-                    .collect()
-            }),
-        other => Err(format!("unsupported session ledger version {other}")),
-    };
-    let restored_records = match restored_records {
-        Ok(records) => records,
-        Err(err) => {
-            let error = bound_summary_string(&format!("restore_failed: {err}"));
-            tracing::warn!("session ledger restore failed: {}", error);
-            return RestoredSessionLedger::empty(Some(error));
-        }
-    };
-    let mut records: Vec<StoredSession> = restored_records
-        .into_iter()
-        .map(|record| {
-            if record.lifecycle.allows_mutation() {
-                StoredSession::Hot(record)
-            } else {
-                match cold_session_from_record(&record, max_events_per_session) {
-                    Ok(cold) => StoredSession::Cold(cold),
-                    Err(err) => {
-                        tracing::warn!("session cold restore serialization failed: {err}");
-                        StoredSession::Hot(record)
-                    }
-                }
-            }
-        })
-        .collect();
-    records.sort_by_key(StoredSession::updated_at);
-    while records.len() > max_sessions {
-        records.remove(0);
-    }
-    let mut sessions = HashMap::new();
-    let mut lru = VecDeque::new();
-    for record in records {
-        let session_id = record.session_id().to_string();
-        lru.push_back(session_id.clone());
-        sessions.insert(session_id, record);
-    }
-    let restored_sessions = sessions.len();
-
-    RestoredSessionLedger {
-        sessions,
-        lru,
-        restored_sessions,
-        last_persist_error: None,
-    }
-}
-
-fn is_lower_hex_sha256(value: &str) -> bool {
+pub(super) fn is_lower_hex_sha256(value: &str) -> bool {
     value.len() == 64
         && value
             .as_bytes()
             .iter()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
-}
-
-pub fn write_ledger_atomic(path: &PathBuf, ledger: &PersistedSessionLedger) -> io::Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("sessions.json");
-    let tmp_path = path.with_file_name(format!(
-        ".{file_name}.tmp-{}",
-        uuid::Uuid::new_v4().simple()
-    ));
-    let result = (|| {
-        let file = fs::File::create(&tmp_path)?;
-        let mut writer = io::BufWriter::new(file);
-        serde_json::to_writer(&mut writer, ledger).map_err(io::Error::other)?;
-        writer.flush()?;
-        drop(writer);
-        fs::rename(&tmp_path, path)
-    })();
-    if let Err(err) = result {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(err);
-    }
-    Ok(())
 }
 
 pub fn sanitize_persisted_event(mut event: SessionEvent, session_id: &str) -> Option<SessionEvent> {
@@ -758,38 +726,24 @@ pub fn sanitize_persisted_event(mut event: SessionEvent, session_id: &str) -> Op
 }
 
 fn is_valid_persisted_message_id(message_id: &str) -> bool {
-    message_id
-        .strip_prefix(MESSAGE_ID_PREFIX)
-        .is_some_and(|suffix| {
-            !suffix.is_empty()
-                && suffix
-                    .as_bytes()
-                    .iter()
-                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        })
+    webcodex_core::workflow_session_contract::is_valid_session_message_id(message_id)
 }
 
 pub fn sanitize_persisted_message(
     mut message: SessionMessage,
     session_id: &str,
 ) -> Option<SessionMessage> {
-    if message.session_id != session_id || !message.message_id.starts_with(MESSAGE_ID_PREFIX) {
+    if message.session_id != session_id || !is_valid_persisted_message_id(&message.message_id) {
         return None;
     }
     message.message = bound_chars(message.message.trim(), MAX_MESSAGE_CHARS);
     message.tags = validate_message_tags(message.tags).unwrap_or_default();
-    if message.requires_ack
-        && (message.kind != super::model::SessionMessageKind::Guidance
-            || message.priority != super::model::SessionMessagePriority::High)
-    {
-        message.requires_ack = false;
-    }
     message.first_ack_observed_at = message
         .first_ack_observed_at
         .filter(|value| *value > 0 && message.requires_ack);
     message.reply_to = message.reply_to.and_then(|reply_to| {
         let reply_to = reply_to.trim().to_string();
-        reply_to.starts_with(MESSAGE_ID_PREFIX).then_some(reply_to)
+        is_valid_persisted_message_id(&reply_to).then_some(reply_to)
     });
     message.author_session_id = message.author_session_id.and_then(|author_session_id| {
         let author_session_id = author_session_id.trim().to_string();
@@ -797,9 +751,7 @@ pub fn sanitize_persisted_message(
     });
     message.resolved_by_message_id = message.resolved_by_message_id.and_then(|message_id| {
         let message_id = message_id.trim().to_string();
-        message_id
-            .starts_with(MESSAGE_ID_PREFIX)
-            .then_some(message_id)
+        is_valid_persisted_message_id(&message_id).then_some(message_id)
     });
     message.superseded_by_message_id = message.superseded_by_message_id.and_then(|message_id| {
         let message_id = message_id.trim().to_string();
@@ -829,16 +781,133 @@ pub fn sanitize_persisted_message(
             }
         }
     }
-    message.completion_id = message.completion_id.and_then(|completion_id| {
+    message.completion_id = message.completion_id.map(|completion_id| {
         let completion_id = completion_id.trim().to_ascii_lowercase();
         if is_valid_completion_id(&completion_id) {
-            Some(completion_id)
+            completion_id
         } else {
-            Some("invalid".to_string())
+            "invalid".to_string()
         }
     });
     message.resolution = message
         .resolution
         .map(|resolution| bound_chars(resolution.trim(), MAX_MESSAGE_RESOLUTION_CHARS));
     Some(message)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn closed_cold_ledger_fixture() -> (ColdSessionRecord, usize) {
+        use crate::model::SessionTransport;
+        use crate::store::SessionStore;
+        use crate::SessionToolContract;
+        let max_events = 2_000;
+        let store = SessionStore::new(4, max_events);
+        let id = store
+            .start_session(Some("project".into()), Some("history".into()))
+            .session_id;
+        let contract = SessionToolContract {
+            risk_class: "read_only",
+            read_like: true,
+            write_like: false,
+            shell_like: false,
+            git_like: false,
+            change_summary_like: false,
+            project_write: false,
+            path_hint: crate::events::SessionPathHint::SinglePath,
+        };
+        for index in 0..800 {
+            let start = store.record_tool_call_started(
+                Some(&id),
+                SessionTransport::Api,
+                "read_files",
+                &serde_json::json!({"project":"project", "items":[{"path":format!("file_{index}.rs")}]}),
+                contract,
+            );
+            store.record_tool_call_finished(
+                start,
+                true,
+                &serde_json::json!({"ok":true}),
+                None,
+                None,
+            );
+        }
+        store.close_session(&id).unwrap();
+        let cold = store
+            .with_record_for_query(&id, |record, _| {
+                cold_session_from_record(record, max_events).unwrap()
+            })
+            .unwrap();
+        (cold, max_events)
+    }
+
+    #[test]
+    fn closed_cold_canonical_read_matches_original_sanitizing_materialization() {
+        let (cold, limit) = closed_cold_ledger_fixture();
+        let old = serde_json::from_str::<PersistedSessionRecord>(cold.raw.get())
+            .unwrap()
+            .into_record(limit)
+            .unwrap();
+        let new = materialize_cold_session(&cold, limit).unwrap();
+        assert_eq!(
+            serde_json::to_value(PersistedSessionRecord::from_record(&old, limit)).unwrap(),
+            serde_json::to_value(PersistedSessionRecord::from_record(&new, limit)).unwrap()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual hot/cold materialization comparison, synthetic 1,600-event closed Session"]
+    fn closed_cold_canonical_read_cost_comparison() {
+        use std::time::Instant;
+        let (cold, limit) = closed_cold_ledger_fixture();
+        let rounds = 25_u128;
+        let mut legacy_ns = 0_u128;
+        let mut canonical_ns = 0_u128;
+        for iteration in 0..rounds {
+            if iteration % 2 == 0 {
+                let begin = Instant::now();
+                let record = serde_json::from_str::<PersistedSessionRecord>(cold.raw.get())
+                    .unwrap()
+                    .into_record(limit)
+                    .unwrap();
+                std::hint::black_box(record);
+                legacy_ns += begin.elapsed().as_nanos();
+            }
+            let begin = Instant::now();
+            std::hint::black_box(materialize_cold_session(&cold, limit).unwrap());
+            canonical_ns += begin.elapsed().as_nanos();
+            if iteration % 2 != 0 {
+                let begin = Instant::now();
+                let record = serde_json::from_str::<PersistedSessionRecord>(cold.raw.get())
+                    .unwrap()
+                    .into_record(limit)
+                    .unwrap();
+                std::hint::black_box(record);
+                legacy_ns += begin.elapsed().as_nanos();
+            }
+        }
+        println!(
+            "closed_cold_materialization events=1600 legacy_avg_ms={:.3} canonical_avg_ms={:.3} speedup={:.2}x",
+            legacy_ns as f64 / rounds as f64 / 1e6,
+            canonical_ns as f64 / rounds as f64 / 1e6,
+            legacy_ns as f64 / canonical_ns as f64
+        );
+    }
+
+    #[test]
+    fn tombstone_row_is_not_a_session_record() {
+        let row = serde_json::json!({
+            "retention_tombstone": {
+                "session_id": "wc_sess_0123456789abcdef0123456789abcdef",
+                "owner_authority_fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "incarnation_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "expiry_ordinal": 1
+            }
+        });
+        assert!(row.get("events").is_none());
+        assert!(!v2_record_has_canonical_logical_invocation_shape(&row));
+        assert!(serde_json::from_value::<PersistedSessionRecord>(row).is_err());
+    }
 }

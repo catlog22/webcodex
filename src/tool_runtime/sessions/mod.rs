@@ -9,32 +9,32 @@ pub(crate) use webcodex_workflow_session::{
     safe_model_facing_assertion_name, strip_tool_call_expectation_metadata,
     tool_failure_summary_from_events, tool_supports_model_facing_assertion_name,
     validate_model_facing_assertion_name, validate_model_facing_result_expectation,
-    CodingSessionError, CodingSessionRequest, CompleteSessionMessageInput, ConsoleValidationHooks,
-    ExplorationToolKind, ListSessionMessagesFilter, PostSessionMessageInput,
-    RecordedModelFacingToolCall, ReplaceSessionMessageInput, SessionAckObservation,
-    SessionCloseError, SessionContextRevisionAck, SessionCreateOptions, SessionDiscussionCounts,
-    SessionDiscussionSummary, SessionEvent, SessionExecutionContext,
-    SessionExecutionContextUpdateError, SessionGuardDenial, SessionGuards, SessionLifecycle,
-    SessionLifecycleDenial, SessionMessage, SessionMessageError, SessionMessageKind,
-    SessionMessageObservationError, SessionMessagePriority, SessionMessageStatus, SessionPathHint,
-    SessionStore, SessionSummary, SessionToolContract, SessionTransport, ToolCallExpectation,
-    ToolCallRecorderMetadata, ToolCallSessionMessageResolution, ToolCallStart,
-    WorkflowSessionConsoleAggregate, WorkflowSessionConsoleAttentionOverview,
-    WorkflowSessionConsoleDetail, WorkflowSessionConsoleList, WorkflowSessionConsoleListItem,
-    WorkflowSessionConsoleProject, DEFAULT_MAX_EVENTS_PER_SESSION, DEFAULT_MAX_SESSIONS,
-    MAX_CODING_INSTRUCTION_CHARS, MAX_MESSAGE_COMPLETION_KEY_CHARS, MAX_MESSAGE_LIST_LIMIT,
-    MAX_MESSAGE_RESOLUTION_CHARS, MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS,
-    MAX_TOOL_CALL_ACK_MESSAGE_IDS, SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_INSTRUCTION,
-    SESSION_INBOX_HIGH_GUIDANCE_ATTENTION_REASON, TOOL_ACCEPTED_EXIT_CODES_FIELD,
-    TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_ACK_SESSION_CONTEXT_REVISION_FIELD,
-    TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD, TOOL_CALL_RECORDING_SESSION_ID_FIELD,
-    TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD, TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE,
-    TOOL_RESULT_EXPECTATION_FIELD,
+    workflow_session_incarnation_fingerprint, CodingSessionError, CodingSessionRequest,
+    CompleteSessionMessageInput, ConsoleValidationHooks, ExplorationToolKind,
+    ListSessionMessagesFilter, PostSessionMessageInput, ReplaceSessionMessageInput,
+    SessionAckObservation, SessionCloseError, SessionCreateOptions, SessionDiscoveryItem,
+    SessionDiscoveryPage, SessionDiscussionCounts, SessionDiscussionSummary, SessionEvent,
+    SessionExecutionContext, SessionExecutionContextUpdateError, SessionGuardDenial, SessionGuards,
+    SessionLifecycle, SessionLifecycleDenial, SessionMessage, SessionMessageDelivery,
+    SessionMessageError, SessionMessageKind, SessionMessageObservationError,
+    SessionMessagePriority, SessionMessageStatus, SessionPathHint, SessionStore, SessionSummary,
+    SessionToolContract, SessionTransport, ToolCallExpectation, ToolCallRecorderMetadata,
+    ToolCallSessionMessageResolution, ToolCallStart, WorkflowSessionConsoleAggregate,
+    WorkflowSessionConsoleAttentionOverview, WorkflowSessionConsoleDetail,
+    WorkflowSessionConsoleList, WorkflowSessionConsoleListItem, DEFAULT_MAX_SESSIONS,
+    DEFAULT_RECENT_EVENT_LIMIT, DEFAULT_SESSION_CACHE_BYTES, MAX_CODING_INSTRUCTION_CHARS,
+    MAX_MESSAGE_CHARS, MAX_MESSAGE_COMPLETION_KEY_CHARS, MAX_MESSAGE_DELIVERY_KEY_CHARS,
+    MAX_MESSAGE_LIST_LIMIT, MAX_MESSAGE_RESOLUTION_CHARS, MAX_MESSAGE_TAGS, MAX_MESSAGE_TAG_CHARS,
+    MAX_MODEL_VALIDATION_ASSERTION_NAME_CHARS, MAX_TOOL_CALL_ACK_MESSAGE_IDS,
+    MAX_TOOL_CALL_ACK_REF_CHARS, SESSION_INBOX_ACK_REQUIRED_ATTENTION_INSTRUCTION,
+    SESSION_INBOX_ACK_REQUIRED_ATTENTION_REASON, TOOL_ACCEPTED_EXIT_CODES_FIELD,
+    TOOL_ASSERTION_NAME_FIELD, TOOL_CALL_ACK_REF_FIELD, TOOL_CALL_ACK_SESSION_MESSAGE_IDS_FIELD,
+    TOOL_CALL_RECORDING_SESSION_ID_FIELD, TOOL_CALL_SESSION_MESSAGE_RESOLUTION_FIELD,
+    TOOL_EXPECTATION_RESULT_UNEXPECTED_FAILURE, TOOL_RESULT_EXPECTATION_FIELD,
 };
 
 use super::metadata::{ToolPathHint, ToolRisk};
 use super::tool_definition::{
-    runtime_tool_accepts_context_ack, runtime_tool_advances_context_checkpoint,
     runtime_tool_is_change_summary_like, runtime_tool_is_git_like, runtime_tool_is_read_like,
     runtime_tool_is_shell_like, runtime_tool_is_write_like, runtime_tool_metadata,
     runtime_tool_session_risk_class,
@@ -59,8 +59,6 @@ pub(crate) fn session_tool_contract(tool_name: &str) -> SessionToolContract {
             ToolPathHint::Patch => SessionPathHint::Patch,
             ToolPathHint::Artifact => SessionPathHint::Artifact,
         },
-        accepts_context_ack: runtime_tool_accepts_context_ack(tool_name),
-        advances_context_checkpoint: runtime_tool_advances_context_checkpoint(tool_name),
     }
 }
 
@@ -112,14 +110,7 @@ pub(crate) mod events {
 
 #[cfg(test)]
 pub(crate) mod model {
-    pub(crate) use webcodex_workflow_session::root_test_support::{
-        PersistedSessionLedger, MAX_OBSERVED_PATHS_PER_EVENT, SESSION_LEDGER_VERSION,
-    };
-}
-
-#[cfg(test)]
-pub(crate) mod persistence {
-    pub(crate) use webcodex_workflow_session::root_test_support::write_ledger_atomic;
+    pub(crate) use webcodex_workflow_session::root_test_support::MAX_OBSERVED_PATHS_PER_EVENT;
 }
 
 #[cfg(test)]

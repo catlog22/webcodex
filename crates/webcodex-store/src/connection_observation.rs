@@ -16,39 +16,45 @@ pub(crate) enum StoreDomain {
     AgentTask,
     AgentWait,
     AgentWake,
+    ArtifactHandoff,
     Audit,
     Communication,
     Core,
-    Executions,
     Goal,
     JobReceipts,
+    JobTerminalWait,
     Memory,
+    ModelReference,
     OAuth,
+    ProjectReference,
     Schema,
-    TaskKernel,
     WindowActivity,
+    Workbench,
 }
 
 impl StoreDomain {
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 17] = [
+    pub(crate) const ALL: [Self; 20] = [
         Self::Accounts,
         Self::Activity,
         Self::AdminProjectLifecycle,
         Self::AgentTask,
         Self::AgentWait,
         Self::AgentWake,
+        Self::ArtifactHandoff,
         Self::Audit,
         Self::Communication,
         Self::Core,
-        Self::Executions,
         Self::Goal,
         Self::JobReceipts,
+        Self::JobTerminalWait,
         Self::Memory,
+        Self::ModelReference,
         Self::OAuth,
+        Self::ProjectReference,
         Self::Schema,
-        Self::TaskKernel,
         Self::WindowActivity,
+        Self::Workbench,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -59,17 +65,20 @@ impl StoreDomain {
             Self::AgentTask => "agent_task",
             Self::AgentWait => "agent_wait",
             Self::AgentWake => "agent_wake",
+            Self::ArtifactHandoff => "artifact_handoff",
             Self::Audit => "audit",
             Self::Communication => "communication",
             Self::Core => "core",
-            Self::Executions => "executions",
             Self::Goal => "goal",
             Self::JobReceipts => "job_receipts",
+            Self::JobTerminalWait => "job_terminal_wait",
             Self::Memory => "memory",
+            Self::ModelReference => "model_reference",
             Self::OAuth => "oauth",
+            Self::ProjectReference => "project_reference",
             Self::Schema => "schema",
-            Self::TaskKernel => "task_kernel",
             Self::WindowActivity => "window_activity",
+            Self::Workbench => "workbench",
         }
     }
 }
@@ -141,6 +150,32 @@ pub(crate) fn lock_connection<'a>(
     }
 }
 
+/// Optional projections never wait behind a busy Store lane. Required callers
+/// retain lock_connection and its original poison/error semantics.
+pub(crate) fn try_lock_connection<'a>(
+    connection: &'a Mutex<Connection>,
+    observer: &'a dyn StoreConnectionObserver,
+    domain: StoreDomain,
+) -> Option<StoreConnectionGuard<'a>> {
+    let acquired_at = Instant::now();
+    let guard = connection.try_lock().ok()?;
+    Some(StoreConnectionGuard {
+        guard: Some(guard),
+        observer,
+        domain,
+        wait: acquired_at.elapsed(),
+        acquired_at,
+    })
+}
+
+impl StoreConnectionGuard<'_> {
+    /// Budgeted admission polls try_lock; retain its entire wait, not only the
+    /// final successful try_lock call.
+    pub(crate) fn set_wait_duration(&mut self, wait: Duration) {
+        self.wait = wait;
+    }
+}
+
 impl Deref for StoreConnectionGuard<'_> {
     type Target = Connection;
 
@@ -168,6 +203,9 @@ impl Drop for StoreConnectionGuard<'_> {
         drop(self.guard.take());
         observe_fail_open(|| self.observer.record_acquisition(self.domain, self.wait));
         observe_fail_open(|| self.observer.record_hold(self.domain, hold));
+        tracing::debug!(target: "webcodex_store::connection", domain=self.domain.as_str(),
+            wait_ms=self.wait.as_secs_f64()*1000.0, hold_ms=hold.as_secs_f64()*1000.0,
+            "store wait and hold phase");
     }
 }
 

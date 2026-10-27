@@ -1,7 +1,13 @@
 use super::*;
 use crate::runner_protocol::{
-    RUNNER_PROTOCOL_GENERATION_V2, RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES,
+    RunnerCapabilities, RunnerPollRequest, RunnerProjectSummary, RunnerRegisterRequest,
 };
+use crate::runner_protocol::{
+    RUNNER_ENVELOPE_MAX_BYTES, RUNNER_PROTOCOL_GENERATION_V2,
+    RUNNER_PROTOCOL_GENERATION_V2_BASELINE_CAPABILITY_NAMES,
+};
+use serde_json::json;
+use tokio::sync::Notify;
 
 fn auth_context(username: Option<&str>, is_bootstrap: bool) -> crate::auth::AuthContext {
     let (role, scopes) = if is_bootstrap {
@@ -102,6 +108,7 @@ fn runner_registration(
     _projects: Vec<RunnerProjectSummary>,
 ) -> RunnerRegisterRequest {
     RunnerRegisterRequest {
+        computer_session_availability: None,
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,
@@ -149,5 +156,5 @@ mod shared_key_isolation;
 #[path = "mod_tests/protocol_http.rs"]
 mod protocol_http;
 
-#[path = "mod_tests/raw_shell_http.rs"]
-mod raw_shell_http;
+#[path = "mod_tests/retired_execution_routes.rs"]
+mod retired_execution_routes;

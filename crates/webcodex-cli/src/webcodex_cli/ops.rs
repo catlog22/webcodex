@@ -134,7 +134,7 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                 Ok(runtime) => ops_status_report(&opts.server_url, &Some(runtime)),
                 Err(failure) => ops_http_failure_report(
                     &opts.server_url,
-                    "runtime_status",
+                    "get_runtime_status",
                     failure,
                     token.is_some(),
                 ),
@@ -155,7 +155,7 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                 Ok(runtime) => ops_runners_report(&opts.server_url, &Some(runtime)),
                 Err(failure) => ops_http_failure_report(
                     &opts.server_url,
-                    "runtime_status",
+                    "get_runtime_status",
                     failure,
                     token.is_some(),
                 ),
@@ -179,7 +179,7 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                 }
                 Err(failure) => ops_http_failure_report(
                     &opts.common.server_url,
-                    "runtime_status",
+                    "get_runtime_status",
                     failure,
                     token.is_some(),
                 ),
@@ -189,7 +189,9 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
         OpsCommand::Projects(opts) => {
             let token = resolve_ops_token(&opts)?;
             let report =
-                match fetch_projects(&opts.server_url, &opts.server_http, token.as_deref()).await {
+                match fetch_projects(&opts.server_url, &opts.server_http, token.as_deref(), None)
+                    .await
+                {
                     Ok(projects) => ops_projects_report(&opts.server_url, Some(&projects)),
                     Err(failure) => ops_http_failure_report(
                         &opts.server_url,
@@ -236,7 +238,7 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                 Err(failure) => {
                     let report = ops_http_failure_report(
                         &opts.common.server_url,
-                        "runtime_status",
+                        "get_runtime_status",
                         failure,
                         token.is_some(),
                     );
@@ -251,6 +253,7 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                 &opts.common.server_url,
                 &opts.common.server_http,
                 token.as_deref(),
+                Some(&opts.project),
             )
             .await
             {
@@ -276,7 +279,7 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                     &opts.common.server_url,
                     &opts.common.server_http,
                     token.as_deref(),
-                    "show_changes",
+                    "read_workspace_changes",
                     json!({"project": opts.project, "include_diff": false}),
                 )
                 .await
@@ -285,7 +288,7 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                     Err(failure) => {
                         let report = ops_http_failure_report(
                             &opts.common.server_url,
-                            "show_changes",
+                            "read_workspace_changes",
                             failure,
                             token.is_some(),
                         );
@@ -300,7 +303,7 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                     &opts.common.server_url,
                     &opts.common.server_http,
                     token.as_deref(),
-                    "workspace_hygiene_check",
+                    "check_workspace_hygiene",
                     json!({"project": opts.project}),
                 )
                 .await
@@ -309,7 +312,7 @@ pub(crate) async fn run_ops_command(command: OpsCommand) -> Result<OpsCommandOut
                     Err(failure) => {
                         let report = ops_http_failure_report(
                             &opts.common.server_url,
-                            "workspace_hygiene_check",
+                            "check_workspace_hygiene",
                             failure,
                             token.is_some(),
                         );
@@ -482,15 +485,56 @@ async fn fetch_projects(
     server_url: &str,
     server_http: &ServerHttpOptions,
     token: Option<&str>,
+    project: Option<&str>,
 ) -> Result<Value, OpsHttpFailure> {
-    fetch_ops_json_output(
-        server_url,
-        server_http,
-        "/api/projects/list",
-        token,
-        json!({}),
-    )
-    .await
+    // Operator fleet reports explicitly traverse bounded pages. Exact smoke
+    // targets never depend on their position in the global inventory.
+    let mut projects = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut offset = 0;
+    for page in 0..20 {
+        let mut arguments = json!({"limit":100,"offset":offset,"summary_only":false});
+        if let Some(project) = project {
+            arguments["project"] = json!(project);
+        }
+        let mut output =
+            call_runtime_tool(server_url, server_http, token, "list_projects", arguments)
+                .await?
+                .unwrap_or(Value::Null);
+        let Some(rows) = output.get("projects").and_then(Value::as_array) else {
+            return Err(OpsHttpFailure::from_transport_error(
+                "invalid project inventory page".into(),
+            ));
+        };
+        for row in rows {
+            let Some(id) = row["id"].as_str() else {
+                return Err(OpsHttpFailure::from_transport_error(
+                    "project inventory row omitted identity".into(),
+                ));
+            };
+            if seen.insert(id.to_string()) {
+                projects.push(row.clone());
+            }
+        }
+        let next = output["next_offset"].as_u64();
+        if project.is_some() || next.is_none() || page == 19 {
+            output["count"] = json!(projects.len());
+            output["projects"] = json!(projects);
+            output["offset"] = json!(0);
+            // Preserve an older Server's explicit truncation too; never claim
+            // complete inventory merely because it omitted a continuation.
+            output["truncated"] = json!(next.is_some() || output["truncated"] == true);
+            return Ok(output);
+        }
+        let next = next.unwrap();
+        if next <= offset {
+            return Err(OpsHttpFailure::from_transport_error(
+                "non-advancing project inventory page".into(),
+            ));
+        }
+        offset = next;
+    }
+    unreachable!("the final bounded page returns")
 }
 
 fn ops_http_failure_report(
@@ -612,14 +656,14 @@ pub(crate) fn ops_status_report(server_url: &str, runtime: &Option<Value>) -> Op
         return OpsReport {
             verdict: verdict.finish(),
             summary: json!({"runtime_reachable": false}),
-            source: source_json(server_url, None, "runtime_status"),
+            source: source_json(server_url, None, "get_runtime_status"),
         };
     };
     let runtime_commit_value = runtime_commit(runtime);
     if runtime.get("service").and_then(Value::as_str).is_none() {
         verdict.fail_reason(
             "malformed_runtime_status",
-            "rerun runtime_status directly and inspect server logs",
+            "rerun get_runtime_status directly and inspect server logs",
         );
     }
 
@@ -705,7 +749,7 @@ pub(crate) fn ops_status_report(server_url: &str, runtime: &Option<Value>) -> Op
         "jobs": {
             "active_count": active_jobs,
         },
-        "agents": {
+        "runners": {
             "online_count": online,
             "stale_count": stale,
             "clients": runner_clients(runtime),
@@ -720,7 +764,7 @@ pub(crate) fn ops_status_report(server_url: &str, runtime: &Option<Value>) -> Op
     OpsReport {
         verdict: verdict.finish(),
         summary,
-        source: source_json(server_url, runtime_commit_value, "runtime_status"),
+        source: source_json(server_url, runtime_commit_value, "get_runtime_status"),
     }
 }
 
@@ -733,8 +777,8 @@ pub(crate) fn ops_runners_report(server_url: &str, runtime: &Option<Value>) -> O
         );
         return OpsReport {
             verdict: verdict.finish(),
-            summary: json!({"runtime_reachable": false, "agents": []}),
-            source: source_json(server_url, None, "runtime_status"),
+            summary: json!({"runtime_reachable": false, "runners": []}),
+            source: source_json(server_url, None, "get_runtime_status"),
         };
     };
     let clients = runner_clients(runtime);
@@ -767,12 +811,12 @@ pub(crate) fn ops_runners_report(server_url: &str, runtime: &Option<Value>) -> O
         "online_count": online,
         "stale_count": stale,
         "active_jobs": active_jobs,
-        "agents": clients,
+        "runners": clients,
     });
     OpsReport {
         verdict: verdict.finish(),
         summary,
-        source: source_json(server_url, runtime_commit(runtime), "runtime_status"),
+        source: source_json(server_url, runtime_commit(runtime), "get_runtime_status"),
     }
 }
 
@@ -793,7 +837,7 @@ pub(crate) fn ops_runner_report(
                 "runtime_reachable": false,
                 "client_id": expected_client_id,
             }),
-            source: source_json(server_url, None, "runtime_status"),
+            source: source_json(server_url, None, "get_runtime_status"),
         };
     };
     let focus = runtime.get("focus").filter(|value| value.is_object());
@@ -809,7 +853,7 @@ pub(crate) fn ops_runner_report(
                 "client_id": expected_client_id,
                 "connected": false,
             }),
-            source: source_json(server_url, runtime_commit(runtime), "runtime_status"),
+            source: source_json(server_url, runtime_commit(runtime), "get_runtime_status"),
         };
     };
     if focus.get("client_id").and_then(Value::as_str) != Some(expected_client_id) {
@@ -823,7 +867,7 @@ pub(crate) fn ops_runner_report(
         "client_id": focus.get("client_id").cloned().unwrap_or(Value::Null),
         "connected": focus.get("connected").cloned().unwrap_or(Value::Null),
         "status": focus.get("status").cloned().unwrap_or(Value::Null),
-        "agent_instance_id": focus.get("agent_instance_id").cloned().unwrap_or(Value::Null),
+        "runner_instance_id": focus.get("runner_instance_id").cloned().unwrap_or(Value::Null),
         "build": focus.get("build").cloned().unwrap_or(Value::Null),
         "compatibility_status": focus.get("compatibility_status").cloned().unwrap_or(Value::Null),
         "source_alignment": focus.get("source_alignment").cloned().unwrap_or(Value::Null),
@@ -831,7 +875,7 @@ pub(crate) fn ops_runner_report(
     OpsReport {
         verdict: verdict.finish(),
         summary,
-        source: source_json(server_url, runtime_commit(runtime), "runtime_status"),
+        source: source_json(server_url, runtime_commit(runtime), "get_runtime_status"),
     }
 }
 
@@ -847,6 +891,10 @@ pub(crate) fn ops_projects_report(server_url: &str, projects: Option<&Value>) ->
     let mut verdict = OpsVerdict::pass();
     let projects_list = project_entries(projects);
     let total = projects_list.len();
+    let truncated = projects.is_some_and(|value| value["truncated"] == true);
+    if truncated {
+        verdict.warn_reason("project_inventory_truncated", "the operator report reached its bounded inventory limit; use list_projects filters and next_offset for the remaining Projects");
+    }
     let online = projects_list
         .iter()
         .filter(|project| project_online(project))
@@ -907,6 +955,8 @@ pub(crate) fn ops_projects_report(server_url: &str, projects: Option<&Value>) ->
     }
     let summary = json!({
         "count": total,
+        "matched_count": projects.and_then(|value| value["matched_count"].as_u64()).unwrap_or(total as u64),
+        "truncated": truncated,
         "online_count": online,
         "disconnected_count": disconnected,
         "stale_count": stale,
@@ -994,7 +1044,7 @@ pub(crate) fn ops_smoke_preflight_report(
         if show_clean != Some(true) {
             verdict.fail_reason(
                 "workspace_dirty",
-                "review show_changes output and clean or commit workspace changes",
+                "review read_workspace_changes output and clean or commit workspace changes",
             );
         }
         if show_verdict.as_deref() == Some("fail") || show_verdict.is_none() {
@@ -1003,7 +1053,7 @@ pub(crate) fn ops_smoke_preflight_report(
                     "show_changes_verdict:{}",
                     show_verdict.as_deref().unwrap_or("unknown")
                 ),
-                "rerun show_changes directly and inspect the failure",
+                "rerun read_workspace_changes directly and inspect the failure",
             );
         }
     }
@@ -1016,7 +1066,7 @@ pub(crate) fn ops_smoke_preflight_report(
         if hygiene_clean != Some(true) {
             verdict.fail_reason(
                 "hygiene_not_clean",
-                "review workspace_hygiene_check findings before deploy smoke",
+                "review check_workspace_hygiene findings before deploy smoke",
             );
         }
         if hygiene_verdict.as_deref() == Some("fail") || hygiene_verdict.is_none() {
@@ -1025,7 +1075,7 @@ pub(crate) fn ops_smoke_preflight_report(
                     "hygiene_verdict:{}",
                     hygiene_verdict.as_deref().unwrap_or("unknown")
                 ),
-                "rerun workspace_hygiene_check directly and inspect the failure",
+                "rerun check_workspace_hygiene directly and inspect the failure",
             );
         } else if hygiene_verdict.as_deref() == Some("warn") {
             verdict.warn_reason(
@@ -1094,10 +1144,10 @@ pub(crate) fn render_ops_status(report: &OpsReport, json_output: bool) -> Result
     out.push_str("Runners:\n");
     out.push_str(&format!(
         "  online/stale: {}/{}\n",
-        display_value(&report.summary["agents"]["online_count"]),
-        display_value(&report.summary["agents"]["stale_count"])
+        display_value(&report.summary["runners"]["online_count"]),
+        display_value(&report.summary["runners"]["stale_count"])
     ));
-    for client in report.summary["agents"]["clients"]
+    for client in report.summary["runners"]["clients"]
         .as_array()
         .into_iter()
         .flatten()
@@ -1133,7 +1183,7 @@ pub(crate) fn render_ops_runners(report: &OpsReport, json_output: bool) -> Resul
     out.push_str(&render_http_failure(report));
     out.push_str("Runners:\n");
     out.push_str("  client_id status transport projects_count active_jobs pending_requests last_seen_age_secs\n");
-    for client in report.summary["agents"].as_array().into_iter().flatten() {
+    for client in report.summary["runners"].as_array().into_iter().flatten() {
         out.push_str(&format!(
             "  {} {} {} {} {} {} {}\n",
             display_value(&client["client_id"]),
@@ -1160,7 +1210,7 @@ pub(crate) fn render_ops_runner(report: &OpsReport, json_output: bool) -> Result
         "client_id",
         "connected",
         "status",
-        "agent_instance_id",
+        "runner_instance_id",
         "compatibility_status",
     ] {
         out.push_str(&format!(
@@ -1262,7 +1312,7 @@ pub(crate) fn render_ops_smoke_preflight(
         display_value(&report.summary["workspace"]["clean"])
     ));
     out.push_str(&format!(
-        "  show_changes.verdict.status: {}\n",
+        "  read_workspace_changes.verdict.status: {}\n",
         display_value(&report.summary["workspace"]["show_changes_verdict_status"])
     ));
     out.push_str("Hygiene:\n");
@@ -1360,17 +1410,17 @@ fn smoke_preflight_source_json(
     called_show_changes: bool,
     called_hygiene: bool,
 ) -> Value {
-    let mut tools = vec![json!("runtime_status"), json!("list_projects")];
+    let mut tools = vec![json!("get_runtime_status"), json!("list_projects")];
     if called_show_changes {
-        tools.push(json!("show_changes"));
+        tools.push(json!("read_workspace_changes"));
     }
     if called_hygiene {
-        tools.push(json!("workspace_hygiene_check"));
+        tools.push(json!("check_workspace_hygiene"));
     }
     json!({
         "server_url": server_url,
         "runtime_commit": runtime_commit,
-        "tool": "runtime_status",
+        "tool": "get_runtime_status",
         "tools": tools,
     })
 }
@@ -1391,23 +1441,22 @@ fn str_pointer(value: &Value, pointer: &str) -> Option<String> {
 }
 
 fn runner_count(runtime: &Value, field: &str, summary_field: &str) -> u64 {
-    // `/agents` remains the stable runtime_status JSON compatibility path.
+    // Read the canonical Runner observation; no legacy fleet aliases.
     runtime
-        .pointer(&format!("/agents/{field}"))
+        .pointer(&format!("/runners/{field}"))
         .and_then(Value::as_u64)
         .or_else(|| {
             runtime
-                .pointer(&format!("/agents/summary/{summary_field}"))
+                .pointer(&format!("/runners/summary/{summary_field}"))
                 .and_then(Value::as_u64)
         })
         .unwrap_or(0)
 }
 
 fn runner_clients(runtime: &Value) -> Vec<Value> {
-    // `/agents` remains the stable runtime_status JSON compatibility path.
+    // Read the canonical Runner observation; no legacy fleet aliases.
     let clients = runtime
-        .pointer("/agents/summary/clients")
-        .or_else(|| runtime.pointer("/agents/clients"))
+        .pointer("/runners/clients")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();

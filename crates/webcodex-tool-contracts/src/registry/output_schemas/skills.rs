@@ -7,16 +7,17 @@ use webcodex_core::skill_metadata::{MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_NAME_
 use webcodex_core::skill_store::MAX_OPERATOR_SKILL_KEY_CHARS;
 
 fn descriptor_schema() -> Value {
+    // Skill descriptors intentionally never expose native Runner Skill root paths.
     json!({
         "type": "object",
         "properties": {
-            "skill_id": {"type": "string", "pattern": "^wc_skill_[0-9a-f]{32}$"},
+            "skill_id": {"type": "string", "pattern": "^wc_skill_[A-Za-z0-9_-]{21}[AQgw]$"},
             "name": {"type": "string", "maxLength": MAX_SKILL_NAME_CHARS},
             "description": {"type": "string", "maxLength": MAX_SKILL_DESCRIPTION_CHARS},
             "definition_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
             "source_scope": {"type": "string", "enum": ["project", "runner"]},
             "trust": {"type": "string", "enum": ["project_content", "operator_configured_guidance", "operator_installed_guidance"]},
-            "package_revision": {"anyOf": [{"type":"string","pattern":"^wc_skillpkg_[0-9a-f]{64}$"},{"type":"null"}]},
+            "package_revision": {"anyOf": [{"type":"string","pattern":"^wc_skillpkg_[A-Za-z0-9_-]{43}$"},{"type":"null"}]},
             "name_conflict": {"type": "boolean"}
         },
         "required": ["skill_id", "name", "description", "definition_revision", "source_scope", "trust", "package_revision", "name_conflict"],
@@ -24,9 +25,56 @@ fn descriptor_schema() -> Value {
     })
 }
 
+fn skill_source_summary_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "kind": {
+                "type": "string",
+                "enum": ["project", "configured_runner_roots", "managed_runner_store"]
+            },
+            "status": {
+                "type": "string",
+                "enum": ["available", "unavailable"]
+            },
+            "root_hint": {
+                "type": "string",
+                "const": ".agents/skills",
+                "description": "Logical Project-relative root hint. Native Runner Skill root paths are never exposed."
+            },
+            "skill_count": {"type": "integer", "minimum": 0},
+            "invalid_count": {"type": "integer", "minimum": 0},
+            "discovery_truncated": {"type": "boolean"},
+            "reason_code": {
+                "type": "string",
+                "enum": ["runner_skill_sources_unavailable"]
+            }
+        },
+        "required": ["kind", "status", "skill_count", "invalid_count", "discovery_truncated"],
+        "additionalProperties": false
+    })
+}
+
+fn skill_load_candidate_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "skill_id": {"type": "string", "pattern": "^wc_skill_[A-Za-z0-9_-]{21}[AQgw]$"},
+            "name": {"type": "string", "maxLength": MAX_SKILL_NAME_CHARS},
+            "source_scope": {"type": "string", "enum": ["project", "runner"]},
+            "trust": {"type": "string", "enum": ["project_content", "operator_configured_guidance", "operator_installed_guidance"]},
+            "package_revision": {"anyOf": [{"type":"string","pattern":"^wc_skillpkg_[A-Za-z0-9_-]{43}$"},{"type":"null"}]},
+            "definition_revision": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "required": ["skill_id", "name", "source_scope", "trust", "package_revision", "definition_revision"],
+        "additionalProperties": false
+    })
+}
+
 fn skill_versions_recovery_call_schema() -> Value {
     suggested_tool_call_schema(
-        "skill_versions",
+        webcodex_core::runtime_contract::GeneratedFollowUpKind::FallbackRecovery,
+        "list_skill_versions",
         json!({
             "type": "object",
             "additionalProperties": false,
@@ -41,19 +89,44 @@ fn skill_versions_recovery_call_schema() -> Value {
             },
             "required": ["project", "skill_key"]
         }),
-        "Parser-ready advisory skill_versions reconciliation using only the exact Project and logical Skill key owned by the failed mutation. On Adaptive Runtime this target remains a discovered call_runtime_tool gateway action; the call grants no authority and is not mutation retry permission.",
+        "Parser-ready advisory list_skill_versions reconciliation using only the exact Project and logical Skill key owned by the failed mutation. On Adaptive Runtime this target remains a discovered call_runtime_tool gateway action; the call grants no authority and is not mutation retry permission.",
+    )
+}
+
+fn skill_read_continuation_schema() -> Value {
+    let mut arguments = crate::input_schema_for_tool("read_skill_file");
+    arguments["required"] = json!([
+        "project",
+        "skill_id",
+        "path",
+        "start_line",
+        "limit",
+        "expected_definition_revision",
+        "expected_resource_sha256"
+    ]);
+    suggested_tool_call_schema(
+        webcodex_core::runtime_contract::GeneratedFollowUpKind::MechanicallyFollowable,
+        "read_skill_file",
+        arguments,
+        "Exact next page of the same Skill resource, fenced by its full SHA-256 and definition/package revisions. Advisory only; the adapter projects the call through its existing admitted route and grants no authority.",
     )
 }
 
 fn apply_skill_recovery_contract(name: &str, schema: &mut Value) {
     let mutation = matches!(
         name,
-        "skill_install" | "skill_activate" | "skill_remove_revision"
+        "install_skill" | "activate_skill" | "remove_skill_revision"
     );
     {
         let properties = schema["properties"]["output"]["properties"]
             .as_object_mut()
             .expect("wrapped Skill output properties");
+        if matches!(name, "load_skill" | "read_skill_file") {
+            properties.insert(
+                "suggested_call".to_string(),
+                skill_read_continuation_schema(),
+            );
+        }
         if mutation {
             properties.insert(
                 "suggested_call".to_string(),
@@ -63,8 +136,8 @@ fn apply_skill_recovery_contract(name: &str, schema: &mut Value) {
                 "reconcile_with".to_string(),
                 json!({
                     "type": "string",
-                    "const": "skill_versions",
-                    "description": "Non-actionable reconciliation-family hint used only when a complete safe skill_versions invocation cannot be proven. It grants no authority."
+                    "const": "list_skill_versions",
+                    "description": "Non-actionable reconciliation-family hint used only when a complete safe list_skill_versions invocation cannot be proven. It grants no authority."
                 }),
             );
         }
@@ -82,9 +155,10 @@ fn apply_skill_recovery_contract(name: &str, schema: &mut Value) {
             json!({
                 "if": {"required": ["suggested_call"]},
                 "then": {
-                    "required": ["recovery_kind"],
-                    "not": {"required": ["reconcile_with"]},
-                    "properties": {"recovery_kind": {"const": "reconcile"}}
+                    "not": {"anyOf": [
+                        {"required": ["reconcile_with"]},
+                        {"required": ["recovery_kind"]}
+                    ]}
                 }
             }),
             json!({
@@ -104,6 +178,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn skill_continuation_schema_uses_the_canonical_read_input_and_resource_fence() {
+        for tool in ["load_skill", "read_skill_file"] {
+            let schema = output_schema_for_tool(tool).unwrap();
+            let call = &schema["properties"]["output"]["properties"]["suggested_call"];
+            assert_eq!(call["properties"]["tool"]["const"], "read_skill_file");
+            assert_eq!(
+                call["properties"]["follow_up_kind"]["const"],
+                "mechanically_followable"
+            );
+            let arguments = &call["properties"]["arguments"];
+            assert_eq!(arguments["additionalProperties"], false);
+            assert_eq!(
+                arguments["properties"],
+                crate::input_schema_for_tool("read_skill_file")["properties"]
+            );
+            assert!(arguments["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("expected_resource_sha256")));
+            assert!(!arguments["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("session_id")));
+        }
+    }
+
+    #[test]
     fn descriptor_trust_distinguishes_configured_and_managed_runner_guidance() {
         let schema = descriptor_schema();
         let values = schema["properties"]["trust"]["enum"]
@@ -121,12 +222,12 @@ mod tests {
     #[test]
     fn skill_recovery_schemas_use_exact_call_or_family_only_without_legacy_alias() {
         for tool in [
-            "skill_list",
-            "skill_read_file",
-            "skill_versions",
-            "skill_install",
-            "skill_activate",
-            "skill_remove_revision",
+            "list_skills",
+            "read_skill_file",
+            "list_skill_versions",
+            "install_skill",
+            "activate_skill",
+            "remove_skill_revision",
         ] {
             let schema = output_schema_for_tool(tool).expect("Skill output schema");
             let properties = schema["properties"]["output"]["properties"]
@@ -144,13 +245,16 @@ mod tests {
                 .any(|constraint| { constraint["not"]["required"] == json!(["recovery_tool"]) }));
         }
 
-        for tool in ["skill_install", "skill_activate", "skill_remove_revision"] {
+        for tool in ["install_skill", "activate_skill", "remove_skill_revision"] {
             let schema = output_schema_for_tool(tool).expect("Skill mutation output schema");
             let properties = schema["properties"]["output"]["properties"]
                 .as_object()
                 .expect("Skill mutation output properties");
             let suggested = &properties["suggested_call"];
-            assert_eq!(suggested["properties"]["tool"]["const"], "skill_versions");
+            assert_eq!(
+                suggested["properties"]["tool"]["const"],
+                "list_skill_versions"
+            );
             assert_eq!(
                 suggested["properties"]["arguments"]["required"],
                 json!(["project", "skill_key"])
@@ -159,14 +263,56 @@ mod tests {
                 suggested["properties"]["arguments"]["additionalProperties"],
                 false
             );
-            assert_eq!(properties["reconcile_with"]["const"], "skill_versions");
+            assert_eq!(properties["reconcile_with"]["const"], "list_skill_versions");
         }
     }
 }
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     let mut schema = match name {
-        "skill_list" => Some(wrapped_output_schema(vec![
+        "load_skill" => Some(wrapped_output_schema(vec![
+            ("project", schema_type("string", "Resolved Project id.")),
+            (
+                "catalog_revision",
+                schema_type("string", "Digest of the freshly observed bounded Skill catalog used for exact-name selection."),
+            ),
+            ("skill_id", schema_type("string", "Opaque project-scoped Skill identity.")),
+            ("name", schema_type("string", "Selected Skill metadata name.")),
+            ("source_scope", schema_type("string", "Selected Skill source: project or runner.")),
+            ("trust", schema_type("string", "Guidance trust label for the selected source; never execution authority.")),
+            (
+                "package_revision",
+                nullable_schema("string", "Active immutable whole-package revision for runner-installed Skills; null for project/configured Skills."),
+            ),
+            ("definition_revision", schema_type("string", "Current SKILL.md content digest.")),
+            ("skill_path", schema_type("string", "Normalized package-relative SKILL.md path; use as read_skill_file.path.")),
+            ("project_path", schema_type("string", "Authoritative Project-relative citation path; present only for project-source Skills. Never infer it from the Skill name.")),
+            ("sha256", schema_type("string", "Full current SKILL.md SHA-256.")),
+            ("text", schema_type("string", "Bounded UTF-8 SKILL.md text.")),
+            ("start_line", schema_type("integer", "Effective 1-based selected start line.")),
+            ("end_line", nullable_schema("integer", "Last returned line, or null when none.")),
+            ("returned_lines", schema_type("integer", "Returned SKILL.md source lines.")),
+            ("has_more", schema_type("boolean", "Whether SKILL.md lines remain.")),
+            ("next_start_line", nullable_schema("integer", "Continuation line when has_more.")),
+            ("descriptor", descriptor_schema()),
+            ("candidate_count", json!({"type":"integer","minimum":2,"description":"Total case-fold-equivalent exact-name candidates when selection is ambiguous."})),
+            (
+                "candidates",
+                {
+                    let mut schema = array_schema(
+                        skill_load_candidate_schema(),
+                        "At most eight bounded exact-name ambiguity candidates.",
+                    );
+                    schema["maxItems"] = json!(8);
+                    schema
+                },
+            ),
+            ("candidates_truncated", schema_type("boolean", "Whether more than eight ambiguity candidates exist.")),
+            ("discovery_truncated", schema_type("boolean", "True when bounded catalog discovery was incomplete and exact-name uniqueness could not be proven.")),
+            ("error_kind", schema_type("string", "Stable guard/error code on failure.")),
+            ("state_changed", schema_type("boolean", "Always false for Skill loading failures.")),
+        ])),
+        "list_skills" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved Project id.")),
             (
                 "catalog_revision",
@@ -209,6 +355,18 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
             (
+                "sources",
+                {
+                    let mut schema = array_schema(
+                        skill_source_summary_schema(),
+                        "Fixed three-source discovery participation summary: Project .agents/skills, configured Runner roots, and the managed Runner store. Empty available sources mean discovery succeeded and found zero Skills; unavailable Runner sources carry only a stable reason code. Native Runner paths are never exposed.",
+                    );
+                    schema["minItems"] = json!(3);
+                    schema["maxItems"] = json!(3);
+                    schema
+                },
+            ),
+            (
                 "invalid_count",
                 schema_type(
                     "integer",
@@ -238,7 +396,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("boolean", "Always false for Skill runtime failures."),
             ),
         ])),
-        "skill_read_file" => Some(wrapped_output_schema(vec![
+        "read_skill_file" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved Project id.")),
             (
                 "skill_id",
@@ -251,7 +409,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 "package_revision",
                 nullable_schema(
                     "string",
-                    "Active immutable whole-package revision for runner-installed Skills; null for project Skills.",
+                    "Active immutable whole-package revision for runner-installed Skills; null for project/configured Skills.",
                 ),
             ),
             (
@@ -262,8 +420,12 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 ),
             ),
             (
-                "path",
-                schema_type("string", "Package-relative resource path."),
+                "skill_path",
+                schema_type("string", "Normalized package-relative resource path; use as read_skill_file.path."),
+            ),
+            (
+                "project_path",
+                schema_type("string", "Authoritative Project-relative citation path; present only for project-source Skills. Never infer it from the Skill name."),
             ),
             (
                 "sha256",
@@ -302,7 +464,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
                 schema_type("boolean", "Always false for Skill runtime failures."),
             ),
         ])),
-        "skill_versions" => Some(wrapped_output_schema(vec![
+        "list_skill_versions" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved Project id.")),
             ("skill_id", schema_type("string", "Runner-scoped opaque Skill identity.")),
             ("skill_key", schema_type("string", "Stable logical operator Skill key.")),
@@ -328,7 +490,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("state_changed", schema_type("boolean", "Always false for version observation.")),
         ])),
 
-        "skill_install" => Some(wrapped_output_schema(vec![
+        "install_skill" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Authorized source Project id.")),
             ("skill_id", schema_type("string", "Runner-scoped opaque Skill identity.")),
             ("skill_key", schema_type("string", "Logical operator Skill key.")),
@@ -348,7 +510,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("error_kind", schema_type("string", "Stable error code on failure.")),
             ("state_changed", nullable_schema("boolean", "Observed mutation flag when outcome is known; null when the mutation outcome is unknown.")),
         ])),
-        "skill_activate" => Some(wrapped_output_schema(vec![
+        "activate_skill" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved Project id.")),
             ("skill_id", schema_type("string", "Runner-scoped opaque Skill identity.")),
             ("skill_key", schema_type("string", "Logical operator Skill key.")),
@@ -363,7 +525,7 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
             ("error_kind", schema_type("string", "Stable error code on failure.")),
             ("state_changed", nullable_schema("boolean", "Observed mutation flag when outcome is known; null when the mutation outcome is unknown.")),
         ])),
-        "skill_remove_revision" => Some(wrapped_output_schema(vec![
+        "remove_skill_revision" => Some(wrapped_output_schema(vec![
             ("project", schema_type("string", "Resolved Project id.")),
             ("skill_id", schema_type("string", "Runner-scoped opaque Skill identity.")),
             ("skill_key", schema_type("string", "Logical operator Skill key.")),

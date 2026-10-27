@@ -128,16 +128,11 @@ pub(crate) enum McpAppBindingState {
 fn validate_mcp_app_binding_id(binding_id: &str) -> Result<(), CommunicationStoreError> {
     if !binding_id
         .strip_prefix(MCP_APP_BINDING_ID_PREFIX)
-        .is_some_and(|suffix| {
-            suffix.len() == 32
-                && suffix
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-        })
+        .is_some_and(|suffix| webcodex_core::compact::decode::<16>(suffix).is_some())
     {
         return Err(CommunicationStoreError::new(
             "invalid_host_binding_id",
-            "binding_id must be wc_host_binding_ followed by 32 lowercase hex characters",
+            "binding_id must be wc_host_binding_ followed by canonical base64url of 16 random bytes",
         ));
     }
     Ok(())
@@ -213,10 +208,15 @@ impl EndpointContinuationCarrier {
         }
     }
 
-    fn production_auto_resume_available(&self) -> bool {
+    fn production_auto_resume_available(
+        &self,
+        mcp_app_resume_mode: crate::model_workflow::McpAppResumeMode,
+    ) -> bool {
         match self {
             Self::Push(adapter) => adapter.production_auto_resume_available(),
-            Self::McpApp { .. } => true,
+            // A message channel is not evidence of confirmation-free execution.
+            // This conservative projection does not suppress or replay delivery.
+            Self::McpApp { .. } => mcp_app_resume_mode.allows_unattended_claim(),
         }
     }
 
@@ -262,6 +262,7 @@ struct AgentContinuationControllerState {
 pub(crate) struct AgentContinuationController {
     state: Arc<AgentContinuationControllerState>,
     dispatch_tx: mpsc::SyncSender<String>,
+    mcp_app_resume_mode: crate::model_workflow::McpAppResumeMode,
 }
 
 impl AgentContinuationController {
@@ -301,7 +302,19 @@ impl AgentContinuationController {
                 }
             })
             .expect("Agent continuation controller thread must start");
-        Self { state, dispatch_tx }
+        Self {
+            state,
+            dispatch_tx,
+            mcp_app_resume_mode: Default::default(),
+        }
+    }
+
+    pub(crate) fn with_mcp_app_resume_mode(
+        mut self,
+        mode: crate::model_workflow::McpAppResumeMode,
+    ) -> Self {
+        self.mcp_app_resume_mode = mode;
+        self
     }
 
     /// Register a push-style process-local adapter for one exact current Endpoint.
@@ -1160,9 +1173,95 @@ impl AgentContinuationController {
         AgentHostBindingStatus {
             adapter_registered: binding.is_some(),
             adapter_kind: binding.map(|binding| binding.carrier.adapter_kind().to_string()),
-            production_auto_resume_available: binding
-                .is_some_and(|binding| binding.carrier.production_auto_resume_available()),
+            production_auto_resume_available: binding.is_some_and(|binding| {
+                binding
+                    .carrier
+                    .production_auto_resume_available(self.mcp_app_resume_mode)
+            }),
         }
+    }
+
+    /// Project an executor only for this exact live MCP App/Host Window. This
+    /// observation never attaches a carrier or grants execution authority.
+    pub(crate) fn workbench_window_endpoint(
+        &self,
+        principal: &CommunicationPrincipal,
+        agent_id: &str,
+        window_key: &str,
+    ) -> Option<(String, i64)> {
+        let _transition = self.state.binding_transitions.lock().ok()?;
+        let (endpoint_id, generation) = {
+            let bindings = self.state.bindings.lock().ok()?;
+            let binding = bindings.get(agent_id)?;
+            if binding.principal != *principal
+                || !binding
+                    .carrier
+                    .production_auto_resume_available(self.mcp_app_resume_mode)
+            {
+                return None;
+            }
+            match &binding.carrier {
+                EndpointContinuationCarrier::McpApp {
+                    client_window_key: Some(key),
+                    ..
+                } if key == window_key => {}
+                _ => return None,
+            }
+            (binding.endpoint_id.clone(), binding.controller_generation)
+        };
+        let endpoint = self
+            .state
+            .db
+            .verify_current_agent_endpoint(principal, agent_id, &endpoint_id, generation)
+            .ok()?;
+        endpoint.wake_capable.then_some((endpoint_id, generation))
+    }
+
+    /// Read-only readiness projection for a listed durable Agent snapshot.
+    ///
+    /// A production carrier is available only when the process-local binding still
+    /// belongs to the same principal/Agent/generation and the exact durable Endpoint
+    /// remains current, unexpired, and wake-capable. Holding the transition fence
+    /// prevents a carrier replacement from being observed half-applied.
+    pub(crate) fn production_auto_resume_available(
+        &self,
+        principal: &CommunicationPrincipal,
+        agent_id: &str,
+        expected_controller_generation: i64,
+    ) -> bool {
+        if expected_controller_generation < 1 {
+            return false;
+        }
+        let _transition = self
+            .state
+            .binding_transitions
+            .lock()
+            .expect("Agent continuation binding transition mutex poisoned");
+        let (endpoint_id, controller_generation) = {
+            let bindings = self
+                .state
+                .bindings
+                .lock()
+                .expect("Agent continuation registry mutex poisoned");
+            let Some(binding) = bindings.get(agent_id) else {
+                return false;
+            };
+            if binding.principal != *principal
+                || binding.agent_id != agent_id
+                || binding.controller_generation != expected_controller_generation
+                || !binding
+                    .carrier
+                    .production_auto_resume_available(self.mcp_app_resume_mode)
+            {
+                return false;
+            }
+            (binding.endpoint_id.clone(), binding.controller_generation)
+        };
+        self.state
+            .db
+            .verify_current_agent_endpoint(principal, agent_id, &endpoint_id, controller_generation)
+            .ok()
+            .is_some_and(|endpoint| endpoint.wake_capable)
     }
 
     pub(crate) fn mcp_app_binding_observation(

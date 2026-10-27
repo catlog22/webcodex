@@ -8,20 +8,25 @@ use crate::client_window::ClientWindow;
 use crate::runner_http::RunnerTransport;
 use crate::runner_protocol::{
     RunnerBuildInfo, RunnerCapabilities, RunnerHostContext, RunnerProtocolGenerationNumber,
-    RunnerRegisterRequest, ShellJobOpRequest, RUNNER_PROTOCOL_GENERATION_V2,
+    RunnerRegisterRequest, RUNNER_PROTOCOL_GENERATION_V2,
 };
+use crate::tool_runtime::dispatch::DispatchContext;
 use crate::tool_runtime::observations::ToolCallObservation;
 use crate::tool_runtime::tool_inputs::{SessionMode, StartupDetail};
 use crate::tool_runtime::{ToolCall, ToolRuntime};
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::Notify;
+use webcodex_runner_registry::JobStartRequest;
 
 fn persisted_session_authority_fingerprint(
     ledger: &std::path::Path,
     session_id: &str,
 ) -> Option<String> {
-    let value: Value = serde_json::from_str(&std::fs::read_to_string(ledger).unwrap()).unwrap();
+    let value: Value = serde_json::from_str(
+        &webcodex_workflow_session::root_test_support::read_ledger(ledger).unwrap(),
+    )
+    .unwrap();
     value["sessions"]
         .as_array()
         .unwrap()
@@ -32,7 +37,10 @@ fn persisted_session_authority_fingerprint(
 }
 
 fn rewrite_persisted_session_with_malformed_authority(ledger: &std::path::Path, session_id: &str) {
-    let mut value: Value = serde_json::from_str(&std::fs::read_to_string(ledger).unwrap()).unwrap();
+    let mut value: Value = serde_json::from_str(
+        &webcodex_workflow_session::root_test_support::read_ledger(ledger).unwrap(),
+    )
+    .unwrap();
     let session = value["sessions"]
         .as_array_mut()
         .unwrap()
@@ -49,32 +57,24 @@ fn register_request(
     process_started_at: Option<i64>,
     build: Option<RunnerBuildInfo>,
 ) -> RunnerRegisterRequest {
-    crate::test_support::current_runner_registration(RunnerRegisterRequest {
-        client_id: client_id.to_string(),
-        runner_instance_id: instance.to_string(),
-        runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-        display_name: None,
-        owner: None,
-        hostname: None,
-        host_context: None,
-        capabilities: RunnerCapabilities {
-            shell: true,
-            git: true,
-            file_read: true,
-            file_write: true,
-            jobs: true,
-            async_jobs: true,
-            async_shell_jobs: true,
-            ..Default::default()
-        },
-        policy: None,
+    RunnerRegisterRequest {
         process_started_at,
         build,
-        job_concurrency_limit: None,
-        job_inventory: None,
-        coding_agent_providers: None,
-        coding_agent_inventory: None,
-    })
+        ..crate::test_support::runner_registration(
+            client_id,
+            instance,
+            RunnerCapabilities {
+                shell: true,
+                git: true,
+                file_read: true,
+                file_write: true,
+                jobs: true,
+                async_jobs: true,
+                async_shell_jobs: true,
+                ..Default::default()
+            },
+        )
+    }
 }
 
 async fn register_with_project(
@@ -137,7 +137,6 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
         "server_transport",
         "server_registration",
         "project_registry",
-        "connector_endpoint",
         "last_successful_tool_call",
     ] {
         assert_layer_contract(&connected[name], name);
@@ -155,12 +154,6 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
     );
     assert_eq!(connected["server_registration"]["status"], "registered");
     assert_eq!(connected["project_registry"]["status"], "registered");
-    // Connector runtime is not configured in this process.
-    assert_eq!(connected["connector_endpoint"]["status"], "not_configured");
-    assert_eq!(
-        connected["connector_endpoint"]["reason_code"],
-        "connector_runtime_disabled"
-    );
 
     // Disconnect: layers change independently; stale registration is not ready.
     runtime
@@ -213,10 +206,12 @@ async fn runner_disconnect_and_reconnect_change_layers_independently() {
             runtime
                 .dispatch_with_auth(
                     ToolCall::RunShell {
+                        login: false,
                         project,
                         command: "echo back".to_string(),
                         session_id: None,
                         timeout_secs: Some(5),
+                        sync_wait_secs: None,
                         cwd: None,
                         purpose: None,
                         shell: None,
@@ -469,7 +464,7 @@ async fn canonical_project_session_explicit_resume_survives_restart() {
     );
 }
 #[tokio::test]
-async fn malformed_persisted_authority_is_discarded_fail_closed() {
+async fn malformed_persisted_authority_aborts_session_import_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
     let ledger = dir.path().join("sessions.json");
     let project_root = dir.path().join("proj");
@@ -500,13 +495,27 @@ async fn malformed_persisted_authority_is_discarded_fail_closed() {
     drop(runtime1);
     rewrite_persisted_session_with_malformed_authority(&ledger, &session_id);
 
-    let runtime2 = ToolRuntime::new_for_tests().with_session_ledger(&ledger);
-    assert_eq!(runtime2.sessions.status().restored_sessions, 0);
-    assert!(runtime2.sessions.summary(&session_id, None).is_none());
-    assert!(runtime2
-        .sessions
-        .session_target_authority(&session_id)
-        .is_none());
+    let original = std::fs::read(&ledger).unwrap();
+    let database = dir.path().join("rejected-import.db");
+    assert!(ToolRuntime::new_for_tests()
+        .with_session_database(&database, &ledger)
+        .is_err());
+    assert_eq!(std::fs::read(&ledger).unwrap(), original);
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let published: i64 = connection
+        .query_row("SELECT count(*) FROM workflow_sessions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    let imported: bool = connection
+        .query_row(
+            "SELECT imported FROM workflow_session_storage WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(published, 0);
+    assert!(!imported);
 }
 #[tokio::test]
 async fn agent_job_lost_on_disconnect_stays_terminal_after_reconnect() {
@@ -517,20 +526,10 @@ async fn agent_job_lost_on_disconnect_stays_terminal_after_reconnect() {
     let job = runtime
         .runner_registry
         .start_job(
-            ShellJobOpRequest {
-                op: "start".to_string(),
-                client_id: Some("job-agent".to_string()),
-                cwd: None,
-                command: Some("sleep 60".to_string()),
-                timeout_secs: Some(120),
-                job_id: None,
-                since_stdout_line: None,
-                since_stderr_line: None,
-                tail_lines: None,
-                limit: None,
-                codex: None,
-            },
+            JobStartRequest::shell("job-agent".to_string(), "sleep 60".to_string()),
             "reconnect-test".to_string(),
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -601,14 +600,14 @@ async fn runtime_status_keeps_generation_independent_from_transport() {
     let runners = status.output["version_compatibility"]["runners"]
         .as_array()
         .unwrap();
-    let clients = status.output["agents"]["clients"].as_array().unwrap();
+    let clients = status.output["runners"]["clients"].as_array().unwrap();
     for (client_id, _, transport) in cases {
         let runner = runners
             .iter()
             .find(|runner| runner["client_id"] == client_id)
             .unwrap_or_else(|| panic!("runner {client_id} missing"));
         assert_eq!(
-            runner["agent_protocol_generation"],
+            runner["runner_protocol_generation"],
             RUNNER_PROTOCOL_GENERATION_V2.get()
         );
         assert_eq!(runner["status"], "compatible");
@@ -619,7 +618,7 @@ async fn runtime_status_keeps_generation_independent_from_transport() {
             .unwrap_or_else(|| panic!("client {client_id} missing"));
         assert_eq!(client["transport"], transport);
         assert_eq!(
-            client["agent_protocol_generation"],
+            client["runner_protocol_generation"],
             RUNNER_PROTOCOL_GENERATION_V2.get()
         );
         assert_eq!(client["project_inventory"]["sync_state"], "pending");
@@ -634,6 +633,14 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
     // Same package version + supported protocol remains compatible even when
     // exact source differs. Source alignment is a separate diagnostic axis.
     let server_build = crate::build_info::runtime_build_info();
+    let expected_old_build_alignment = webcodex_core::desktop_runtime_contract::build_alignment(
+        Some("0.0.1"),
+        None,
+        None,
+        Some(server_version),
+        server_build.git_commit,
+        server_build.git_dirty,
+    );
     let different_commit = format!(
         "{}-different",
         server_build.git_commit.unwrap_or("server-source")
@@ -648,11 +655,14 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
                 version: Some(server_version.to_string()),
                 git_commit: Some(different_commit),
                 git_dirty: Some(false),
+                built_at: None,
+                target: None,
+                architecture: None,
             }),
         ))
         .await
         .unwrap();
-    // Different build version → version_mismatch (connected ≠ compatible).
+    // Different package version remains protocol-compatible; build alignment is advisory.
     runtime
         .runner_registry
         .register(register_request(
@@ -663,6 +673,9 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
                 version: Some("0.0.1".to_string()),
                 git_commit: None,
                 git_dirty: None,
+                built_at: None,
+                target: None,
+                architecture: None,
             }),
         ))
         .await
@@ -681,7 +694,8 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
     let status = runtime.runtime_status(None).await;
     assert!(status.success);
     let compat = &status.output["version_compatibility"];
-    assert_eq!(compat["status"], "version_mismatch");
+    assert_eq!(compat["status"], "compatible");
+    assert_eq!(compat["protocol_compatibility"], "compatible");
     assert_eq!(compat["server"]["version"], server_version);
     let runners = compat["runners"].as_array().unwrap();
     let by_id = |id: &str| {
@@ -701,29 +715,18 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
     assert_eq!(compat["source_alignment"]["status"], "different");
     assert!(different_source.get("build_matches_server").is_none());
 
-    assert_eq!(by_id("old-build")["status"], "version_mismatch");
+    assert_eq!(by_id("old-build")["status"], "compatible");
+    assert_eq!(by_id("old-build")["protocol_compatibility"], "compatible");
     assert_eq!(
-        by_id("old-build")["reason_code"],
-        "runner_version_differs_from_server"
+        by_id("old-build")["build_alignment"],
+        serde_json::json!(expected_old_build_alignment)
     );
-    assert!(by_id("old-build")["action"]
-        .as_str()
-        .unwrap()
-        .contains("align"));
+    assert_eq!(by_id("old-build")["version_matches_server"], false);
+    assert!(by_id("old-build")["reason_code"].is_null());
+    assert!(by_id("old-build")["action"].is_null());
     let compact = crate::tool_runtime::runtime_info::compact_runtime_status(&status.output);
-    let compact_runner = compact["agents"]["clients"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|runner| runner["client_id"] == "same-version-different-source")
-        .unwrap();
-    assert_eq!(compact_runner["version_matches_server"], true);
-    assert_eq!(compact_runner["source_alignment"]["status"], "different");
-    assert!(compact_runner.get("build_matches_server").is_none());
-    assert_eq!(
-        compact["version_compatibility"]["source_alignment"]["status"],
-        "different"
-    );
+    assert!(compact["runners"].get("clients").is_none());
+    assert_eq!(compact["compatibility"]["source_alignment"], "different");
 
     // No secrets/paths in the diagnostics.
     let text = compat.to_string().to_lowercase();
@@ -732,7 +735,7 @@ async fn version_compatibility_reports_stable_mismatch_facts() {
 }
 
 #[tokio::test]
-async fn runner_host_context_projects_to_full_list_and_compact_runtime() {
+async fn runner_host_context_is_diagnostic_only() {
     let runtime = test_runtime();
     let mut request = register_request("sf", "inst-host-context", None, None);
     request.host_context = Some(RunnerHostContext {
@@ -746,7 +749,7 @@ async fn runner_host_context_projects_to_full_list_and_compact_runtime() {
 
     let status = runtime.runtime_status(None).await;
     assert!(status.success);
-    let full = status.output["agents"]["clients"]
+    let full = status.output["runners"]["clients"]
         .as_array()
         .unwrap()
         .iter()
@@ -760,20 +763,12 @@ async fn runner_host_context_projects_to_full_list_and_compact_runtime() {
     );
 
     let compact = crate::tool_runtime::runtime_info::compact_runtime_status(&status.output);
-    let compact_sf = compact["agents"]["clients"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|client| client["client_id"] == "sf")
-        .unwrap();
-    assert_eq!(compact_sf["agent_instance_id"], "inst-host-context");
-    assert_eq!(compact_sf["host_context"]["role"], "server_host");
-    assert!(compact_sf.get("capabilities").is_none());
-    assert!(compact_sf.get("policy").is_none());
+    assert!(compact["runners"].get("clients").is_none());
+    assert!(!compact.to_string().contains("host_context"));
 
     let listed = runtime.list_runners(None).await;
     assert!(listed.success);
-    let listed_sf = listed.output["agents"]
+    let listed_sf = listed.output["runners"]
         .as_array()
         .unwrap()
         .iter()
@@ -792,7 +787,7 @@ async fn runner_host_context_projects_to_full_list_and_compact_runtime() {
     });
     runtime.runner_registry.register(reconnect).await.unwrap();
     let after_reconnect = runtime.runtime_status(None).await;
-    let sf = after_reconnect.output["agents"]["clients"]
+    let sf = after_reconnect.output["runners"]["clients"]
         .as_array()
         .unwrap()
         .iter()
@@ -854,21 +849,18 @@ async fn dispatch_coding_call_in_window_with_transport(
         async move {
             let window = ClientWindow::for_test(&window_id);
             runtime
-                .dispatch_with_auth_transport_options_and_metadata_with_window(
+                .dispatch_with_context(
                     call,
-                    auth.as_ref(),
-                    transport,
-                    Default::default(),
-                    Some(&window),
+                    DispatchContext::internal(auth.as_ref(), transport, Some(&window)),
                 )
                 .await
         }
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + CODING_WORKFLOW_FIXTURE_TIMEOUT;
     while !task.is_finished() {
         assert!(
             std::time::Instant::now() < deadline,
-            "coding workflow did not finish within the 10-second test deadline"
+            "coding workflow did not finish within the {CODING_WORKFLOW_FIXTURE_TIMEOUT:?} test deadline"
         );
         if let Some(req) = runtime
             .runner_registry
@@ -905,8 +897,7 @@ fn coding_start_call(project: &str, instruction: &str) -> ToolCall {
         base_ref: None,
         instruction: instruction.to_string(),
         session_id: None,
-        include_project_instructions: true,
-        include_workflow_guidance: true,
+        guidance_profile: Default::default(),
         include_extension_catalog: false,
     }
 }
@@ -920,8 +911,7 @@ fn coding_resume_call(project: &str, instruction: &str, session_id: &str) -> Too
         base_ref: None,
         instruction: instruction.to_string(),
         session_id: Some(session_id.to_string()),
-        include_project_instructions: true,
-        include_workflow_guidance: true,
+        guidance_profile: Default::default(),
         include_extension_catalog: false,
     }
 }
@@ -1185,6 +1175,7 @@ async fn coding_workflow_read_only_upgrade_is_atomic_and_permission_checked() {
                 path: "src/inspect.rs".to_string(),
                 start_line: None,
                 limit: None,
+                expected_read_revision: None,
             }],
             session_id: Some(session_id.clone()),
             with_line_numbers: None,
@@ -1234,7 +1225,9 @@ async fn coding_workflow_read_only_upgrade_is_atomic_and_permission_checked() {
     assert_eq!(upgraded.output["session_id"], session_id);
     assert_eq!(upgraded.output["continuation"], "resumed_explicitly");
     assert_eq!(upgraded.output["instructions"]["status"], "reused");
-    assert_eq!(upgraded.output["instructions"]["content_included"], true);
+    assert!(upgraded.output["instructions"]
+        .get("content_included")
+        .is_none());
     assert!(upgraded.output.get("continuation_feedback").is_none());
     let summary = runtime.sessions.summary(&session_id, Some(20)).unwrap();
     assert!(!summary.guards.deny_write_tools);
@@ -1261,4 +1254,75 @@ async fn coding_workflow_read_only_upgrade_is_atomic_and_permission_checked() {
         1,
         "coding workflow must not reread ordinary explored source files"
     );
+}
+
+#[tokio::test]
+async fn runtime_status_serialization_budget() {
+    let runtime = test_runtime();
+    for count in [0, 1, 8] {
+        for index in if count == 8 { 1..8 } else { 0..count } {
+            register_with_project(
+                &runtime,
+                &format!("status-{index}"),
+                &format!("instance-{index}"),
+                Some(1),
+                Some(RunnerBuildInfo {
+                    version: Some(
+                        if index == 0 {
+                            env!("CARGO_PKG_VERSION")
+                        } else {
+                            "0.0.1"
+                        }
+                        .into(),
+                    ),
+                    git_commit: Some(format!("{index:040x}")),
+                    git_dirty: Some(false),
+                    built_at: Some("1234567890".into()),
+                    target: Some("x86_64-unknown-linux-gnu".into()),
+                    architecture: Some("x86_64".into()),
+                }),
+            )
+            .await;
+        }
+        let full = runtime.runtime_status(None).await;
+        let sparse = runtime
+            .runtime_status_with_options(None, true, false, None)
+            .await;
+        assert!(full.success && sparse.success);
+        let full_bytes = serde_json::to_vec(&full.output).unwrap().len();
+        let sparse_bytes = serde_json::to_vec(&sparse.output).unwrap().len();
+        eprintln!("STATUS_SIZE runners={count} full={full_bytes} sparse={sparse_bytes}");
+        assert!(full_bytes <= 26_000, "full diagnostics grew: {full_bytes}");
+        assert!(sparse_bytes <= 900, "sparse fleet grew: {sparse_bytes}");
+        assert_eq!(sparse.output["runners"]["count"], count);
+        assert_eq!(sparse.output["jobs"]["recovering_count"], 0);
+        assert_eq!(sparse.output["jobs"]["lost_after_reconcile_count"], 0);
+        assert!(sparse.output["runners"].get("clients").is_none());
+        assert_eq!(
+            sparse.output["compatibility"]["protocol"],
+            full.output["protocol_compatibility"]
+        );
+        assert_eq!(
+            sparse.output["compatibility"]["build_alignment"],
+            full.output["build_alignment"]
+        );
+        if count > 1 {
+            assert_eq!(sparse.output["compatibility"]["mixed_builds_present"], true);
+        }
+        assert!(full.output.get("authority").is_some());
+        assert!(full.output.get("session_store").is_some());
+        if count > 0 {
+            let focused = runtime
+                .runtime_status_with_options(None, true, false, Some("status-0".into()))
+                .await;
+            assert!(focused.success);
+            let bytes = serde_json::to_vec(&focused.output).unwrap().len();
+            eprintln!("STATUS_SIZE runners={count} focused={bytes}");
+            assert!(bytes <= 1_050, "focused grew: {bytes}");
+            assert_eq!(focused.output["focus"]["client_id"], "status-0");
+            assert_eq!(focused.output["focus"]["runner_protocol_generation"], 2);
+            assert!(focused.output["focus"].get("capabilities").is_none());
+            assert!(!focused.output.to_string().contains("status-1"));
+        }
+    }
 }

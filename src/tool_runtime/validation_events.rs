@@ -6,29 +6,31 @@
 
 use serde_json::{json, Value};
 use webcodex_core::runner_job_lifecycle::RunnerJobLifecycle;
+use webcodex_core::validation_source::{ValidationFreshness, ValidationSourceState};
 use webcodex_tool_runtime_contracts::tool_audit::{
     assertion_validation_identity, is_structured_validation_target_identity,
     is_validation_execution_identity,
 };
-use webcodex_validation::{
-    event_is_job_acceptance_only, validation_adapter_for_tool,
-    validation_summary_for_session_events,
-};
+#[cfg(test)]
+use webcodex_validation::validation_summary_for_session_events;
+use webcodex_validation::{event_is_job_acceptance_only, validation_evidence_profile_for_tool};
 use webcodex_workflow_session::{
     canonical_tool_call_finished_events, safe_model_facing_assertion_name, SessionEvent,
     SessionSummary,
 };
 
 use super::session_context::{
-    session_project_mismatch_result, unknown_session_result, SessionProjectMismatch,
+    absent_workflow_session_result, session_project_mismatch_result, SessionProjectMismatch,
 };
 use super::{ToolResult, ToolRuntime};
 use crate::auth::AuthContext;
 
+#[cfg(test)]
 pub(crate) use webcodex_validation::{
-    current_validation_evidence_for_session, event_observes_validation_activity,
-    skipped_validation_summary, validation_summary_from_events,
-    CurrentValidationEvidenceProjection,
+    current_validation_evidence_for_session, CurrentValidationEvidenceProjection,
+};
+pub(crate) use webcodex_validation::{
+    event_observes_validation_activity, validation_summary_from_events,
 };
 
 const DEFAULT_PUBLIC_VALIDATION_EVENT_LIMIT: usize = 20;
@@ -49,7 +51,7 @@ impl ToolRuntime {
         auth: Option<&AuthContext>,
     ) -> ToolResult {
         if let Err(result) = self
-            .authorize_session_target(&session_id, "validation_summary", auth)
+            .authorize_session_target(&session_id, "read_validation_summary", auth)
             .await
         {
             return result;
@@ -62,14 +64,18 @@ impl ToolRuntime {
             .sessions
             .summary(&session_id, Some(PUBLIC_VALIDATION_SESSION_EVENT_LIMIT))
         else {
-            return unknown_session_result(&session_id);
+            return absent_workflow_session_result(&self.sessions, &session_id, auth);
         };
         if summary.project.as_deref() != Some(resolved.resolved_id.as_str()) {
             let mismatch = SessionProjectMismatch {
                 session_project: summary.project.unwrap_or_else(|| "<unscoped>".to_string()),
                 request_project: resolved.resolved_id,
             };
-            return session_project_mismatch_result(&session_id, "validation_summary", &mismatch);
+            return session_project_mismatch_result(
+                &session_id,
+                "read_validation_summary",
+                &mismatch,
+            );
         }
         let limit = limit
             .unwrap_or(DEFAULT_PUBLIC_VALIDATION_EVENT_LIMIT)
@@ -97,6 +103,17 @@ impl ToolRuntime {
         limit: usize,
         auth: Option<&AuthContext>,
     ) -> Value {
+        self.validation_report_for_session_with_jobs(summary, limit, auth)
+            .await
+            .to_value()
+    }
+
+    pub(crate) async fn validation_report_for_session_with_jobs(
+        &self,
+        summary: &SessionSummary,
+        limit: usize,
+        auth: Option<&AuthContext>,
+    ) -> webcodex_validation::ValidationReport {
         self.materialize_session_validation_job_terminals(summary, auth)
             .await;
         let refreshed = self
@@ -109,13 +126,52 @@ impl ToolRuntime {
         let mut events = refreshed.events.clone();
         self.append_terminal_generic_job_validation_events(&refreshed, &mut events, auth)
             .await;
+        self.refresh_validation_source_states(&mut events);
         events.sort_by_key(|event| {
             (
                 event.timestamp,
                 event.finished_at.unwrap_or(event.timestamp),
             )
         });
-        validation_summary_for_session_events(&refreshed, &events, limit)
+        let refreshed = self.refresh_validation_source_summary(&refreshed);
+        webcodex_validation::ValidationReport::from_events(&refreshed, &events, limit)
+    }
+
+    /// Refresh only the in-memory validation-source projection. This never
+    /// materializes Jobs, appends Session events, or rewrites durable execution
+    /// facts, so read-only presentation surfaces may safely use it too.
+    pub(crate) fn refresh_validation_source_states(&self, events: &mut [SessionEvent]) {
+        // This also sees canonical writes from other Sessions on this Project.
+        for event in events {
+            let project = event
+                .resolved_project
+                .as_deref()
+                .or(event.project.as_deref());
+            if let (Some(project), Some(output)) =
+                (project, event.validation_output_summary.as_mut())
+            {
+                let source = output
+                    .get("source_state")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<ValidationSourceState>(value).ok());
+                if let Some(source) = source {
+                    if source.freshness != ValidationFreshness::Stale {
+                        output["source_state"] = json!(self
+                            .validation_sources
+                            .observe(project, source.start_fence.as_ref()));
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) fn refresh_validation_source_summary(
+        &self,
+        summary: &SessionSummary,
+    ) -> SessionSummary {
+        let mut refreshed = summary.clone();
+        self.refresh_validation_source_states(&mut refreshed.events);
+        refreshed
     }
 
     /// Preserve generic `run_job` and promoted `run_shell` validation evidence without mixing
@@ -345,10 +401,26 @@ impl ToolRuntime {
                 validation_passed,
                 assertion_name,
             ) = if let Some(validation) = validation {
-                let Some(tool_name) = validation
-                    .get("tool")
-                    .and_then(Value::as_str)
-                    .filter(|tool| validation_adapter_for_tool(tool).is_some())
+                let Some(tool_name) =
+                    validation
+                        .get("tool")
+                        .and_then(Value::as_str)
+                        .filter(|tool| {
+                            *tool == "project_validate"
+                                || validation_evidence_profile_for_tool(tool).is_some()
+                        })
+                else {
+                    continue;
+                };
+                // Portable validation retains its wrapper tool identity; the
+                // verified Job metadata supplies its read-only adapter separately.
+                let adapter = if tool_name == "project_validate" {
+                    validation.get("adapter").and_then(Value::as_str)
+                } else {
+                    Some(tool_name)
+                };
+                let Some(adapter) = adapter
+                    .filter(|adapter| validation_evidence_profile_for_tool(adapter).is_some())
                 else {
                     continue;
                 };
@@ -362,7 +434,7 @@ impl ToolRuntime {
                 (
                     tool_name,
                     identity,
-                    Some(tool_name),
+                    Some(adapter),
                     validation.get("passed").and_then(Value::as_bool),
                     None,
                 )
@@ -387,7 +459,7 @@ impl ToolRuntime {
                 let validation_tool = metadata
                     .get("validation_tool")
                     .and_then(Value::as_str)
-                    .filter(|tool| validation_adapter_for_tool(tool).is_some());
+                    .filter(|tool| validation_evidence_profile_for_tool(tool).is_some());
                 let assertion_name = metadata
                     .get("assertion_name")
                     .and_then(Value::as_str)
@@ -410,6 +482,9 @@ impl ToolRuntime {
             };
             if let Some(validation) = validation {
                 for field in [
+                    "adapter",
+                    "backend",
+                    "action",
                     "passed",
                     "warnings_count",
                     "errors_count",
@@ -422,8 +497,14 @@ impl ToolRuntime {
                     "no_run",
                     "test_count_assertion",
                     "diagnostics",
+                    "source_state",
                 ] {
-                    if let Some(value) = validation.get(field) {
+                    // A structured terminal count can be independently proven
+                    // even when bounded-log component diagnostics are absent.
+                    // Do not persist JSON nulls as explicit contradictory test
+                    // metadata; absence remains fail-closed in the ledger while
+                    // a non-null authoritative tests_run_count stays usable.
+                    if let Some(value) = validation.get(field).filter(|value| !value.is_null()) {
                         output[field] = value.clone();
                     }
                 }

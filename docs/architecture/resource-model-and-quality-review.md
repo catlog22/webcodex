@@ -50,8 +50,8 @@ Runner 因此从面向用户的资源 scope 降为 **placement / provider host**
 
 | 资源 | 当前存放与作用域 | 读取/使用方式 | 生命周期 |
 |---|---|---|---|
-| Project Memory | Product scope=`project`；Control DB 持久化，scope identity 仍由现有 Project runtime/Runner/root facts 派生 | memory_search / memory_read；读取继续受现有 project 与 Memory scopes 约束 | 现有实现保留；在缺少真实使用反馈前冻结新的 read-through / user scope / sharing 扩张 |
-| Project Skill | Product scope=`project`；source=`repository`，项目 `.agents/skills` | skill_list / skill_read_file；正文需显式读取 | 仓库活文件，definition revision |
+| Project Memory | Product scope=`project`；Control DB 持久化，scope identity 仍由现有 Project runtime/Runner/root facts 派生 | search_memory / read_memory；读取继续受现有 project 与 Memory scopes 约束 | 现有实现保留；在缺少真实使用反馈前冻结新的 read-through / user scope / sharing 扩张 |
+| Project Skill | Product scope=`project`；source=`repository`，项目 `.agents/skills` | list_skills / read_skill_file；正文需显式读取 | 仓库活文件，definition revision |
 | Runner configured Skill | 产品上逐步解释为 scope=`user`、source=`configured`、placement=`runner`；当前 wire / descriptor 名称暂不要求兼容性重写 | 同一 Skill 发现入口，Runner 解析 opaque id | 活目录；不等于已安装不可变包 |
 | Runner managed Skill | 产品上逐步解释为 scope=`user`、source=`managed`、placement=`runner` | 同一发现入口；安装/版本/激活/删除由管理操作负责 | 包 revision、active pointer、state revision、幂等记录 |
 | Native Plugin | scope=`user`、placement=`runner` 的 executable provider；当前 Project applicability 由 provider cwd 与 exact Project root 匹配产生 | plugin_tool list / describe / call；binding 固定 exact Runner/provider instance 与 schema | 进程实例、冻结 catalog、check/reload、结果不确定性；现有 execution authority 不由资源目录替代 |
@@ -94,7 +94,7 @@ Memory provider    Skill providers    Plugin provider
 
 最初探索时，Skill/Memory 的 runtime/management 分类分别由实现模块中的 `is_*_tool_name` helpers 持有，Kernel、发现 surface、MCP adapter 与 registry 又各自消费或重复维护这些名字集合。这不是已证明的权限漏洞，而是“新增工具时容易改漏一处”的结构风险。
 
-后续 consolidation 已将这一个静态事实收敛到 canonical `ToolDefinition`：`ToolOperatorExtensionFamily` 只描述 `SkillRuntime / SkillManagement / MemoryRuntime / MemoryManagement / TraceDiagnostics` 的 Stateless Operator protocol admission family，各定义在 Skill、Memory、diagnostic 的 ToolDefinition 旁显式声明。Registry、Kernel capability gate、tool manifest surface 和 MCP Full Operator projection 统一通过 `runtime_tool_operator_extension_family` 消费；旧 Skill/Memory classifier 和 registry 中对应的硬编码 family name sets 已从 live code 删除。
+后续 consolidation 已将这一个静态事实收敛到 canonical `ToolDefinition`：`ToolOperatorExtensionFamily` 只描述 `SkillRuntime / SkillManagement / MemoryRuntime / MemoryManagement / TraceDiagnostics` 的 Stateless Operator protocol admission family，各定义在 Skill、Memory、diagnostic 的 ToolDefinition 旁显式声明。Registry、Kernel capability gate、tool manifest 与 MCP Stateless protocol-extension projection 统一通过 `runtime_tool_operator_extension_family` 消费；旧 Skill/Memory classifier 和 registry 中对应的硬编码 family name sets 已从 live code 删除。
 
 证据：[tool_definition.rs](../../crates/webcodex-tool-contracts/src/tool_definition.rs)、[tool_policy.rs](../../crates/webcodex-tool-contracts/src/tool_policy.rs)、[tool_specs.rs](../../crates/webcodex-tool-contracts/src/registry/tool_specs.rs)、[kernel.rs](../../src/tool_runtime/kernel.rs)、[surface.rs](../../src/tool_runtime/surface.rs)、[mcp/tools.rs](../../src/mcp/tools.rs)。
 
@@ -102,7 +102,7 @@ Memory provider    Skill providers    Plugin provider
 
 ### B. Skill 目录观察与精确读取（P1 风险已进入 observer/resolver split）
 
-#420 建立 baseline 时，`discover_project_skills` 会逐个读取包定义，`discover_skills` 依次观察 Project、configured、managed 来源，而 `skill_read_file` 也先重建完整目录再按 id 定位。Stage 2 后续实现已把 known-id read 从这个完整 catalog observer 中分离；`skill_list`、startup/context catalog 仍保留完整 `discover_skills` 语义。证据：[skills.rs](../../src/tool_runtime/skills.rs)、[configured_skills.rs](../../crates/webcodex-runner/src/webcodex_runner/configured_skills.rs)。
+#420 建立 baseline 时，`discover_project_skills` 会逐个读取包定义，`discover_skills` 依次观察 Project、configured、managed 来源，而 `read_skill_file` 也先重建完整目录再按 id 定位。Stage 2 后续实现已把 known-id read 从这个完整 catalog observer 中分离；`list_skills`、startup/context catalog 仍保留完整 `discover_skills` 语义。证据：[skills.rs](../../src/tool_runtime/skills.rs)、[configured_skills.rs](../../crates/webcodex-runner/src/webcodex_runner/configured_skills.rs)。
 
 注意：启动层的 Skill 和 Plugin 已经并行等待，见 [coding_task.rs](../../src/tool_runtime/coding_task.rs)，1232–1269；不能把它描述为整个启动串行。
 
@@ -112,7 +112,7 @@ Memory provider    Skill providers    Plugin provider
 
 #### B.1 2026-09-13 follow-up：Skill source fanout 基线与观测边界
 
-#420/#421 用现有 fake/local Runner recorder 固定了优化前后的 request fanout。Project authority 仍独立：空 Project catalog 的 `skill_list` 是 1 次 `file_skill_list_packages`；若 Project 有 `N` 个 Skill，完整 Project catalog 仍是 `1` 次 package list + `N` 次 `SKILL.md` definition read。known-id Project exact resolver 则只枚举 package identities并读取 target definition；普通 Project resource read继续在 resource I/O 后 recheck definition revision。lexical invalid resource path仍在任何 Runner request前 fail closed，因此保持 0 request。
+#420/#421 用现有 fake/local Runner recorder 固定了优化前后的 request fanout。Project authority 仍独立：空 Project catalog 的 `list_skills` 是 1 次 `file_skill_list_packages`；若 Project 有 `N` 个 Skill，完整 Project catalog 仍是 `1` 次 package list + `N` 次 `SKILL.md` definition read。known-id Project exact resolver 则只枚举 package identities并读取 target definition；普通 Project resource read继续在 resource I/O 后 recheck definition revision。lexical invalid resource path仍在任何 Runner request前 fail closed，因此保持 0 request。
 
 Runner-local 侧在 Stage 2 前有两套跨进程 read family：configured `List/Read` 与 managed `ListActive/Read`。完整 catalog 的跨 Runner sequence 是 `Project catalog -> Configured List -> Managed ListActive`；mixed Runner target exact read是 `Project package list -> Configured Read probe -> Managed Read probe -> target Read`，即 4 个跨 Runner requests。这个 baseline说明真实 storage边界虽然不同，但 cross-process ownership 被拆得比领域边界更碎。
 
@@ -193,7 +193,7 @@ Stage 4A1 因此保留为 **managed-worktree source lineage foundation**：它�
 
 旧 configured/managed enqueue wrapper和compatibility alias没有保留。这个收敛只改变内部protocol/admission shape：authorization、Project authority、Runner instance fencing、management outcome-unknown、ToolResult schema与模型可见Skill工具名称/参数仍由原边界保持。
 
-同理，内容 revision、catalog revision、状态 CAS、Job observation token、Session context ACK 虽然都长得像字符串，不应共用“版本号”的业务语义。只在误传风险高、已有具体消费者的接口引入 typed boundary 或 newtype，不要求每个字符串都包装。
+同理，内容 revision、catalog revision、状态 CAS、Job observation token、Session message ACK 虽然都长得像字符串，不应共用“版本号”的业务语义。只在误传风险高、已有具体消费者的接口引入 typed boundary 或 newtype，不要求每个字符串都包装。
 
 ## 5. 可以类推到其他领域的设计
 
@@ -217,7 +217,7 @@ Plugin 已有 `NotStarted / OutcomeUnknown / Completed`，见 [plugin.rs](../../
 
 ### 5.4 将模型上下文视为按需查询的投影
 
-当前 context sidecar 明确 `post_tool` 与 `applies_to_current_effect=false`，见 [context_projection.rs](../../src/tool_runtime/context_projection.rs)，120–126。这是好的读模型边界。
+当前 context sidecar 的 contract 明确它只在主 effect/observation 之后投影，且不追溯授权或治理当前 effect；该静态语义保留在 `context_request` / `context_projection` 描述中，不再作为每次结果重复字段。见 [context_projection.rs](../../src/tool_runtime/context_projection.rs)。
 
 可逐步增加按需刷新与来源版本说明，避免每次重复大段目录；但要保留请求级 ACK 对模型上下文保留状态的意义，不能用 session id、窗口身份或服务器缓存命中替代。summary、read body、execute schema 应分别预算。
 
@@ -264,7 +264,7 @@ Plugin 已有 `NotStarted / OutcomeUnknown / Completed`，见 [plugin.rs](../../
 
 这条路线不否认未来可能出现多用户/private sharing需求，而是拒绝现在预付其复杂度。当前 self-hosted 产品里，Runner access已经是关键用户执行 authority；`user` resource scope是产品可见性/归属词汇，不是新的 bearer capability或 ACL namespace。若未来 SaaS、多租户或资源分享成为真实需求，应以当时的principal模型、部署方式和用户故事重新设计，而不是让今天的 `AuthContext.user_id` 决定永久资源 schema。
 
-阶段 2 已按这些前置条件落地：`skill_read_file` 不再调用完整 `discover_skills`。Project exact probe继续使用 bounded package identities；Runner-local exact probe只发一个 canonical `RunnerSkillRequest::Resolve`，由 Runner内部同时判断 configured/managed membership，再用 source-pinned `Read`读取实际资源。所有 applicable authority source都参与 target uniqueness证明；unsupported `skill_runtime`时Project-only target仍可工作，capability适用但source uncertainty或target ambiguity时继续fail closed。Configured resolver不为unrelated packages读取定义；Managed仍通过 `list_skill_keys()`做 O(N) opaque-id scan，尚未声称O(1)。完整 catalog observer继续独立承担Project+Runner duplicate-id、name conflict、catalog revision、diagnostics/truncation；Runner-local List内部再承担Configured+Managed duplicate-id fail-close。后续若实测需要优化managed key scan，应另行设计与store lifecycle一致的reverse mapping，而不是在本阶段偷加cache/index。
+阶段 2 已按这些前置条件落地：`read_skill_file` 不再调用完整 `discover_skills`。Project exact probe继续使用 bounded package identities；Runner-local exact probe只发一个 canonical `RunnerSkillRequest::Resolve`，由 Runner内部同时判断 configured/managed membership，再用 source-pinned `Read`读取实际资源。所有 applicable authority source都参与 target uniqueness证明；unsupported `skill_runtime`时Project-only target仍可工作，capability适用但source uncertainty或target ambiguity时继续fail closed。Configured resolver不为unrelated packages读取定义；Managed仍通过 `list_skill_keys()`做 O(N) opaque-id scan，尚未声称O(1)。完整 catalog observer继续独立承担Project+Runner duplicate-id、name conflict、catalog revision、diagnostics/truncation；Runner-local List内部再承担Configured+Managed duplicate-id fail-close。后续若实测需要优化managed key scan，应另行设计与store lifecycle一致的reverse mapping，而不是在本阶段偷加cache/index。
 
 资源模型不应长期占据主线。如果 R1-R3 能用很薄的描述层解释 Skill/Plugin，就应停止继续抽象，把主要工程投入重新转回**工具层**：模型可见 schema 成本、direct/gateway 发现一致性、错误恢复提示、批量/组合调用、Job handoff 和常用工具 ergonomics。已有 [tool-composition-research.md](tool-composition-research.md) 可作为下一轮重新评估起点，但同样必须由真实调用成本和 dogfood 证据筛选，而不是按文档逐项实现。
 
@@ -276,7 +276,7 @@ Plugin 已有 `NotStarted / OutcomeUnknown / Completed`，见 [plugin.rs](../../
 
 - `work_on_project(mode=worktree)` 完成精确基线解析、隔离、项目注册和指导材料加载，降低了手工 git worktree 与授权注册串联的成本。
 - `read_files` 的编号、SHA 与显式 continuation 支撑可追溯分析和受保护修改；`search_project_texts` 一个子查询失败不影响其他查询。
-- 本轮 `show_changes(max_hunk_lines=200)` 顶层正确报告 `diff_hunk_line_limit` 并给出恢复调用，但对应 hunk 同时带有 `truncated=false`，文本又在函数中途结束。按提示使用 `git_diff_hunks`、更窄路径与 400 行上限后取得完整 diff。建议对顶层/条目级完整性元数据增加一致性测试；本轮只记录，不修改该工具。
+- 本轮 `read_workspace_changes(max_hunk_lines=200)` 顶层正确报告 `diff_hunk_line_limit` 并给出恢复调用，但对应 hunk 同时带有 `truncated=false`，文本又在函数中途结束。按提示使用 `read_git_diff_hunks`、更窄路径与 400 行上限后取得完整 diff。建议对顶层/条目级完整性元数据增加一致性测试；本轮只记录，不修改该工具。
 - 对不存在的 `src/tool_runtime/context_material.rs` 发起搜索，得到 `search_execution_failed / backend_process_failed / exit_code=2`。重新定位后实际文件是 `context_projection.rs`。相比之下，read_files 对不存在的文件明确返回 `not_found`。建议搜索入口也区分缺失路径与真正后端故障。
 - 一个拟进行只读源码计数的 Python 命令被宿主以“无法确定请求的安全状态”拦截；没有 Runner 执行结果。没有改换通道重试。此事不能归因于 WebCodex 权限策略，报告也不使用该计数结果。产品诊断应区分 host pre-dispatch rejection 与 Runner business error；Runner 未收到请求时不能声称观察到执行状态。
 - `cargo_test` 能把同一执行交给 Job，再与独立阅读重叠，保留了执行身份。其当前结构化 schema 有 package/filter 等参数，却没有 `--lib` 选择项。可评估增加常见 target selector，减少为了精准验证退回 raw Cargo 的需要；不要求默认扩大运行范围。

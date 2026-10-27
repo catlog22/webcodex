@@ -1,6 +1,166 @@
 use super::*;
 
 #[tokio::test]
+async fn computer_letter_shortcuts_require_both_capabilities_before_enqueue() {
+    for (base, letters) in [(false, false), (true, false), (false, true), (true, true)] {
+        let registry = RunnerRegistry::default();
+        let mut registration = runner_registration("letters", "instance", Vec::new());
+        registration.owner = Some("alice".into());
+        registration.capabilities.computer_key_input = base;
+        registration.capabilities.computer_letter_shortcuts = letters;
+        registry
+            .register(current_runner_registration(registration))
+            .await
+            .unwrap();
+        let access = auth_context(Some("alice"), false);
+        let payload = r#"{"surface_id":"surface_test","key":"p","modifiers":["control"]}"#;
+        let result = registry
+            .enqueue_computer(
+                "letters".into(),
+                "computer_key_input",
+                payload.into(),
+                "alice".into(),
+                Some(&access),
+                5,
+            )
+            .await;
+        assert_eq!(result.is_ok(), base && letters);
+        let request = registry
+            .poll(RunnerPollRequest {
+                client_id: "letters".into(),
+                runner_instance_id: "instance".into(),
+            })
+            .await
+            .unwrap();
+        if base && letters {
+            let request = request.expect("accepted letter chord");
+            assert_eq!(request.kind, "computer_key_input");
+            assert_eq!(request.stdin.as_deref(), Some(payload));
+        } else {
+            assert!(request.is_none());
+            assert!(result.unwrap_err().contains(if base {
+                "computer_letter_shortcuts"
+            } else {
+                "computer_key_input"
+            }));
+        }
+    }
+}
+
+#[tokio::test]
+async fn computer_letter_shortcuts_recheck_access_and_capabilities_at_dequeue() {
+    for change in ["owner", "key_input", "letters", "instance"] {
+        let registry = RunnerRegistry::default();
+        let mut registration = runner_registration("letters", "instance", Vec::new());
+        registration.owner = Some("alice".into());
+        registration.capabilities.computer_key_input = true;
+        registration.capabilities.computer_letter_shortcuts = true;
+        registry
+            .register(current_runner_registration(registration.clone()))
+            .await
+            .unwrap();
+        let access = auth_context(Some("alice"), false);
+        let (_, rx) = registry
+            .enqueue_computer(
+                "letters".into(),
+                "computer_key_input",
+                r#"{"surface_id":"surface_test","key":"j","modifiers":["control"]}"#.into(),
+                "alice".into(),
+                Some(&access),
+                5,
+            )
+            .await
+            .unwrap();
+        match change {
+            "owner" => registration.owner = Some("bob".into()),
+            "key_input" => registration.capabilities.computer_key_input = false,
+            "instance" => registration.runner_instance_id = "replacement".into(),
+            _ => registration.capabilities.computer_letter_shortcuts = false,
+        }
+        registry
+            .register(current_runner_registration(registration))
+            .await
+            .unwrap();
+        assert!(registry
+            .poll(RunnerPollRequest {
+                client_id: "letters".into(),
+                runner_instance_id: if change == "instance" {
+                    "replacement"
+                } else {
+                    "instance"
+                }
+                .into()
+            })
+            .await
+            .unwrap()
+            .is_none());
+        let response = rx.await.unwrap();
+        assert_eq!(response.request_dispatched, Some(false));
+        assert!(response.error.unwrap().starts_with(match change {
+            "owner" => "client_access_denied:",
+            "instance" => "runner instance was replaced before the request completed; the request was not handed to the replacement instance",
+            _ => "capability_unavailable:",
+        }));
+    }
+}
+
+#[tokio::test]
+async fn computer_letter_shortcuts_reject_stale_instances_and_invalid_chords() {
+    let registry = RunnerRegistry::default();
+    let mut registration = runner_registration("letters", "new-instance", Vec::new());
+    registration.owner = Some("alice".into());
+    registration.capabilities.computer_key_input = true;
+    registration.capabilities.computer_letter_shortcuts = true;
+    registry
+        .register(current_runner_registration(registration))
+        .await
+        .unwrap();
+    let access = auth_context(Some("alice"), false);
+    let error = registry
+        .enqueue_computer_for_instance(
+            "letters".into(),
+            "computer_key_input",
+            r#"{"surface_id":"surface_test","key":"p","modifiers":["control"]}"#.into(),
+            "alice".into(),
+            Some(&access),
+            5,
+            "old-instance",
+        )
+        .await
+        .unwrap_err();
+    assert!(error.starts_with("runner_replaced:"));
+    for modifiers in [
+        serde_json::json!([]),
+        serde_json::json!(["option"]),
+        serde_json::json!(["control", "shift"]),
+        serde_json::Value::Null,
+    ] {
+        let payload =
+            serde_json::json!({"surface_id":"surface_test", "key":"p", "modifiers":modifiers})
+                .to_string();
+        assert!(registry
+            .enqueue_computer(
+                "letters".into(),
+                "computer_key_input",
+                payload,
+                "alice".into(),
+                Some(&access),
+                5
+            )
+            .await
+            .is_err());
+    }
+    assert!(registry
+        .poll(RunnerPollRequest {
+            client_id: "letters".into(),
+            runner_instance_id: "new-instance".into()
+        })
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn computer_control_enqueue_requires_independent_capability() {
     // CU-AX2 control remains independently fenced from CU-AX3 text input.
     let registry = RunnerRegistry::default();
@@ -95,25 +255,17 @@ async fn computer_scroll_to_element_requires_independent_capability() {
 
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "computer-scroll-capable".to_string(),
-            runner_instance_id: "computer-scroll-inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
             capabilities: RunnerCapabilities {
                 computer_control: true,
                 computer_scroll_to_element: true,
                 ..Default::default()
             },
-            policy: None,
+            ..runner_registration(
+                "computer-scroll-capable",
+                "computer-scroll-inst",
+                Vec::new(),
+            )
         }))
         .await
         .unwrap();
@@ -173,25 +325,13 @@ async fn computer_key_input_requires_independent_capability() {
 
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "computer-key-capable".to_string(),
-            runner_instance_id: "computer-key-inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
             capabilities: RunnerCapabilities {
                 computer_control: true,
                 computer_key_input: true,
                 ..Default::default()
             },
-            policy: None,
+            ..runner_registration("computer-key-capable", "computer-key-inst", Vec::new())
         }))
         .await
         .unwrap();
@@ -225,29 +365,18 @@ async fn computer_key_input_requires_independent_capability() {
 async fn computer_pointer_enqueue_requires_independent_capability_and_typed_envelope() {
     let registry = RunnerRegistry::default();
     let alice = auth_context(Some("alice"), false);
-    let payload = r#"{"display_id":"display_0123456789abcdef0123456789abcdef","snapshot_generation":7,"x":123,"y":456}"#;
+    let payload =
+        r#"{"display_id":"display_iavN7wEjRWeJq83v","snapshot_generation":7,"x":123,"y":456}"#;
 
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "computer-pointer-old".to_string(),
-            runner_instance_id: "pointer-old-inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
             capabilities: RunnerCapabilities {
                 computer_control: true,
                 computer_display_observe: true,
                 ..Default::default()
             },
-            policy: None,
+            ..runner_registration("computer-pointer-old", "pointer-old-inst", Vec::new())
         }))
         .await
         .unwrap();
@@ -271,24 +400,12 @@ async fn computer_pointer_enqueue_requires_independent_capability_and_typed_enve
 
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "computer-pointer-capable".to_string(),
-            runner_instance_id: "pointer-inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
             capabilities: RunnerCapabilities {
                 computer_pointer_control: true,
                 ..Default::default()
             },
-            policy: None,
+            ..runner_registration("computer-pointer-capable", "pointer-inst", Vec::new())
         }))
         .await
         .unwrap();
@@ -326,26 +443,14 @@ async fn computer_clipboard_enqueue_requires_independent_capabilities_and_typed_
 
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "computer-clipboard-old".to_string(),
-            runner_instance_id: "clipboard-old-inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
             capabilities: RunnerCapabilities {
                 computer_observe: true,
                 computer_control: true,
                 computer_text_input: true,
                 ..Default::default()
             },
-            policy: None,
+            ..runner_registration("computer-clipboard-old", "clipboard-old-inst", Vec::new())
         }))
         .await
         .unwrap();
@@ -376,24 +481,12 @@ async fn computer_clipboard_enqueue_requires_independent_capabilities_and_typed_
 
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "computer-clipboard-read".to_string(),
-            runner_instance_id: "clipboard-read-inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
             capabilities: RunnerCapabilities {
                 computer_clipboard_read: true,
                 ..Default::default()
             },
-            policy: None,
+            ..runner_registration("computer-clipboard-read", "clipboard-read-inst", Vec::new())
         }))
         .await
         .unwrap();
@@ -438,24 +531,16 @@ async fn computer_clipboard_enqueue_requires_independent_capabilities_and_typed_
 
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "computer-clipboard-write".to_string(),
-            runner_instance_id: "clipboard-write-inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
             capabilities: RunnerCapabilities {
                 computer_clipboard_write: true,
                 ..Default::default()
             },
-            policy: None,
+            ..runner_registration(
+                "computer-clipboard-write",
+                "clipboard-write-inst",
+                Vec::new(),
+            )
         }))
         .await
         .unwrap();
@@ -529,19 +614,7 @@ async fn computer_window_activation_requires_its_own_additive_capability() {
 
     registry
         .register(current_runner_registration(RunnerRegisterRequest {
-            process_started_at: None,
-            build: None,
-            job_concurrency_limit: None,
-            job_inventory: None,
-            coding_agent_providers: None,
-            coding_agent_inventory: None,
-            client_id: "computer-activate".to_string(),
-            runner_instance_id: "computer-inst".to_string(),
-            runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
-            display_name: None,
             owner: Some("alice".to_string()),
-            hostname: None,
-            host_context: None,
             capabilities: RunnerCapabilities {
                 shell: true,
                 file_read: true,
@@ -551,7 +624,7 @@ async fn computer_window_activation_requires_its_own_additive_capability() {
                 computer_window_activate: true,
                 ..Default::default()
             },
-            policy: None,
+            ..runner_registration("computer-activate", "computer-inst", Vec::new())
         }))
         .await
         .unwrap();

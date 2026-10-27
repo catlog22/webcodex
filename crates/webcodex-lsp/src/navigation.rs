@@ -23,24 +23,21 @@ use webcodex_core::lsp_bridge::{
     bound_error_message, error_codes, redact_absolute_paths, validate_call_hierarchy_bounds,
     CallHierarchyDirection, CallHierarchyEdgeDirection, CallHierarchyResult,
     DocumentDiagnosticsResult, DocumentDiagnosticsStatus, DocumentSymbolsResult, HoverResult,
-    LocationsResult, LspAvailabilityStatus, LspServerStatusEntry, LspStatusResult,
-    PublicCallHierarchyEdge, PublicCallHierarchySymbol, PublicDiagnostic, PublicHover,
-    PublicLocation, PublicPosition, PublicRange, PublicSymbol, PublicWorkspaceSymbol,
-    RunnerLspPayload, RunnerLspRequest, RunnerLspResultEnvelope, WorkspaceSymbolsResult,
+    LocationsResult, LspAvailabilityStatus, LspIndexReadiness, LspServerStatusEntry,
+    LspStatusResult, PublicCallHierarchyEdge, PublicCallHierarchySymbol, PublicDiagnostic,
+    PublicDiagnosticSeverity, PublicDiagnosticTag, PublicHover, PublicHoverKind, PublicLocation,
+    PublicPosition, PublicRange, PublicSymbol, PublicWorkspaceSymbol, RunnerLspPayload,
+    RunnerLspRequest, RunnerLspResultEnvelope, WorkspaceSymbolsResult,
     MAX_CALL_HIERARCHY_CALL_ENTRIES_INSPECTED_PER_RPC, MAX_CALL_HIERARCHY_CALL_SITES_PER_EDGE,
     MAX_CALL_HIERARCHY_PREPARE_ITEMS_INSPECTED,
     MAX_CALL_HIERARCHY_RAW_CALL_SITE_RANGES_INSPECTED_PER_ENTRY, MAX_CALL_HIERARCHY_ROOTS,
+    MAX_PUBLIC_DIAGNOSTIC_CODE_CHARS, MAX_PUBLIC_DIAGNOSTIC_MESSAGE_CHARS,
+    MAX_PUBLIC_DIAGNOSTIC_SOURCE_CHARS, MAX_PUBLIC_DIAGNOSTIC_TOTAL_TEXT_CHARS,
+    MAX_PUBLIC_HOVER_VALUE_CHARS, MAX_PUBLIC_SYMBOL_DETAIL_CHARS, MAX_PUBLIC_SYMBOL_NAME_CHARS,
+    MAX_PUBLIC_WORKSPACE_SYMBOL_FIELD_CHARS,
 };
 
-const MAX_SYMBOL_NAME_CHARS: usize = 256;
-const MAX_SYMBOL_DETAIL_CHARS: usize = 512;
-const MAX_DIAGNOSTIC_MESSAGE_CHARS: usize = 4096;
-const MAX_DIAGNOSTIC_SOURCE_CHARS: usize = 128;
-const MAX_DIAGNOSTIC_CODE_CHARS: usize = 128;
-const MAX_DIAGNOSTIC_TOTAL_TEXT_CHARS: usize = 64 * 1024;
 const DIAGNOSTICS_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
-const MAX_HOVER_VALUE_CHARS: usize = 16 * 1024;
-const MAX_WORKSPACE_SYMBOL_FIELD_CHARS: usize = 256;
 pub fn execute_lsp_operation(
     project_root: PathBuf,
     supervisor: &LspSupervisor,
@@ -65,13 +62,25 @@ fn execute_lsp(
             supervisor,
         ))),
         RunnerLspRequest::DocumentSymbols { path, limit } => {
-            let result =
-                document_symbols(&payload.project_id, &project_root, supervisor, path, *limit)?;
+            let result = document_symbols(
+                &payload.project_id,
+                &project_root,
+                supervisor,
+                path,
+                *limit,
+                operation_deadline,
+            )?;
             Ok(RunnerLspResultEnvelope::ok(result))
         }
         RunnerLspRequest::DocumentDiagnostics { path, limit } => {
-            let result =
-                document_diagnostics(&payload.project_id, &project_root, supervisor, path, *limit)?;
+            let result = document_diagnostics(
+                &payload.project_id,
+                &project_root,
+                supervisor,
+                path,
+                *limit,
+                operation_deadline,
+            )?;
             Ok(RunnerLspResultEnvelope::ok(result))
         }
         RunnerLspRequest::Hover { path, line, column } => {
@@ -82,6 +91,7 @@ fn execute_lsp(
                 path,
                 *line,
                 *column,
+                operation_deadline,
             )?;
             Ok(RunnerLspResultEnvelope::ok(result))
         }
@@ -110,6 +120,7 @@ fn execute_lsp(
                 *line,
                 *column,
                 *limit,
+                operation_deadline,
             )?;
             Ok(RunnerLspResultEnvelope::ok(result))
         }
@@ -129,6 +140,7 @@ fn execute_lsp(
                 *column,
                 *include_declaration,
                 *limit,
+                operation_deadline,
             )?;
             Ok(RunnerLspResultEnvelope::ok(result))
         }
@@ -186,22 +198,35 @@ fn lsp_server_status_entry(
     let info = supervisor.resolve_command_info(profile.kind);
     let available = info.as_ref().map(|entry| entry.available).unwrap_or(false);
     let slot = supervisor.project_server_status(project_root, profile.kind);
-    let (running, status, position_encoding) = match slot {
-        Some(LspServerStatus::Running) => {
-            let encoding = supervisor
-                .project_position_encoding(project_root, profile.kind)
-                .map(|encoding| encoding.as_public_label().to_string());
-            (true, LspAvailabilityStatus::Running, encoding)
-        }
-        Some(LspServerStatus::Initializing) => (false, LspAvailabilityStatus::Initializing, None),
-        Some(LspServerStatus::Crashed) => (false, LspAvailabilityStatus::Crashed, None),
-        None => {
+    let (running, status, position_encoding, index_readiness) = match slot {
+        Some((LspServerStatus::Running, encoding, readiness)) => (
+            true,
+            LspAvailabilityStatus::Running,
+            encoding.map(|encoding| encoding.as_public_label().to_string()),
+            readiness,
+        ),
+        Some((LspServerStatus::Initializing, _, _)) => (
+            false,
+            LspAvailabilityStatus::Initializing,
+            None,
+            LspIndexReadiness::Unknown,
+        ),
+        Some((LspServerStatus::Crashed, _, _)) => (
+            false,
+            LspAvailabilityStatus::Crashed,
+            None,
+            LspIndexReadiness::Unknown,
+        ),
+        None => (
+            false,
             if available {
-                (false, LspAvailabilityStatus::Available, None)
+                LspAvailabilityStatus::Available
             } else {
-                (false, LspAvailabilityStatus::Unavailable, None)
-            }
-        }
+                LspAvailabilityStatus::Unavailable
+            },
+            None,
+            LspIndexReadiness::Unknown,
+        ),
     };
     let source = info.as_ref().map(|entry| entry.source);
     LspServerStatusEntry {
@@ -212,6 +237,7 @@ fn lsp_server_status_entry(
         status,
         source,
         position_encoding,
+        index_readiness,
     }
 }
 
@@ -242,6 +268,7 @@ fn document_symbols(
     supervisor: &LspSupervisor,
     relative_path: &str,
     limit: usize,
+    operation_deadline: Instant,
 ) -> Result<DocumentSymbolsResult, RunnerLspResultEnvelope> {
     let limit = limit.clamp(1, 500);
     let ResolvedSourceFile {
@@ -251,14 +278,8 @@ fn document_symbols(
     } = resolve_source_file(project_root, relative_path)?;
     let uri = file_uri(&file)?;
     let text = read_document_text(&file)?;
-    // Take the encoding from prepare_document like goto/references do: the
-    // post-request slot lookup could race a slot transition and silently fall
-    // back to UTF-16 while the server negotiated another encoding.
-    let encoding = supervisor
-        .prepare_document(project_root, profile.kind, &uri, language_id, &text)
-        .map_err(map_lsp_error)?;
-    let value = supervisor
-        .request_with_document(
+    let (value, encoding) = supervisor
+        .request_with_document_until(
             project_root,
             profile.kind,
             &uri,
@@ -266,6 +287,7 @@ fn document_symbols(
             &text,
             "textDocument/documentSymbol",
             json!({ "textDocument": { "uri": uri } }),
+            operation_deadline,
         )
         .map_err(map_lsp_error)?;
     let mut cache = LineCache::new();
@@ -304,6 +326,7 @@ fn document_diagnostics(
     supervisor: &LspSupervisor,
     relative_path: &str,
     limit: usize,
+    operation_deadline: Instant,
 ) -> Result<DocumentDiagnosticsResult, RunnerLspResultEnvelope> {
     let limit = limit.clamp(1, 200);
     let ResolvedSourceFile {
@@ -313,7 +336,7 @@ fn document_diagnostics(
     } = resolve_source_file(project_root, relative_path)?;
     let uri = file_uri(&file)?;
     let text = read_document_text(&file)?;
-    let deadline = Instant::now() + DIAGNOSTICS_WAIT_TIMEOUT;
+    let deadline = operation_deadline.min(Instant::now() + DIAGNOSTICS_WAIT_TIMEOUT);
     let snapshot = supervisor
         .document_diagnostics(
             project_root,
@@ -379,7 +402,7 @@ fn document_diagnostics(
                 .as_deref()
                 .map(|value| value.chars().count())
                 .unwrap_or(0);
-        if text_chars.saturating_add(diagnostic_chars) > MAX_DIAGNOSTIC_TOTAL_TEXT_CHARS {
+        if text_chars.saturating_add(diagnostic_chars) > MAX_PUBLIC_DIAGNOSTIC_TOTAL_TEXT_CHARS {
             text_budget_count = index;
             break;
         }
@@ -423,6 +446,7 @@ fn hover(
     relative_path: &str,
     line: usize,
     column: usize,
+    operation_deadline: Instant,
 ) -> Result<HoverResult, RunnerLspResultEnvelope> {
     let ResolvedSourceFile {
         path: file,
@@ -432,12 +456,19 @@ fn hover(
     let uri = file_uri(&file)?;
     let text = read_document_text(&file)?;
     let encoding = supervisor
-        .prepare_document(project_root, profile.kind, &uri, language_id, &text)
+        .prepare_document_until(
+            project_root,
+            profile.kind,
+            &uri,
+            language_id,
+            &text,
+            operation_deadline,
+        )
         .map_err(map_lsp_error)?;
     let (lsp_line, lsp_character) = public_to_lsp(&text, line, column, encoding)
         .map_err(|message| RunnerLspResultEnvelope::err(error_codes::INVALID_ARGUMENTS, message))?;
-    let value = supervisor
-        .request_with_document(
+    let (value, encoding) = supervisor
+        .request_with_document_until(
             project_root,
             profile.kind,
             &uri,
@@ -448,6 +479,7 @@ fn hover(
                 "textDocument": {"uri": uri},
                 "position": {"line": lsp_line, "character": lsp_character}
             }),
+            operation_deadline,
         )
         .map_err(map_lsp_error)?;
     let (hover, truncated, range_omitted) = normalize_hover(&value, &text, encoding)?;
@@ -523,6 +555,7 @@ fn goto_definition(
     line: usize,
     column: usize,
     limit: usize,
+    operation_deadline: Instant,
 ) -> Result<LocationsResult, RunnerLspResultEnvelope> {
     let limit = limit.clamp(1, 100);
     let ResolvedSourceFile {
@@ -533,12 +566,19 @@ fn goto_definition(
     let uri = file_uri(&file)?;
     let text = read_document_text(&file)?;
     let encoding = supervisor
-        .prepare_document(project_root, profile.kind, &uri, language_id, &text)
+        .prepare_document_until(
+            project_root,
+            profile.kind,
+            &uri,
+            language_id,
+            &text,
+            operation_deadline,
+        )
         .map_err(map_lsp_error)?;
     let (lsp_line, lsp_character) = public_to_lsp(&text, line, column, encoding)
         .map_err(|msg| RunnerLspResultEnvelope::err(error_codes::INVALID_ARGUMENTS, msg))?;
-    let value = supervisor
-        .request_with_document(
+    let (value, encoding) = supervisor
+        .request_with_document_until(
             project_root,
             profile.kind,
             &uri,
@@ -549,6 +589,7 @@ fn goto_definition(
                 "textDocument": { "uri": uri },
                 "position": { "line": lsp_line, "character": lsp_character }
             }),
+            operation_deadline,
         )
         .map_err(map_lsp_error)?;
     let mut cache = LineCache::new();
@@ -577,6 +618,7 @@ fn find_references(
     column: usize,
     include_declaration: bool,
     limit: usize,
+    operation_deadline: Instant,
 ) -> Result<LocationsResult, RunnerLspResultEnvelope> {
     let limit = limit.clamp(1, 200);
     let ResolvedSourceFile {
@@ -587,12 +629,19 @@ fn find_references(
     let uri = file_uri(&file)?;
     let text = read_document_text(&file)?;
     let encoding = supervisor
-        .prepare_document(project_root, profile.kind, &uri, language_id, &text)
+        .prepare_document_until(
+            project_root,
+            profile.kind,
+            &uri,
+            language_id,
+            &text,
+            operation_deadline,
+        )
         .map_err(map_lsp_error)?;
     let (lsp_line, lsp_character) = public_to_lsp(&text, line, column, encoding)
         .map_err(|msg| RunnerLspResultEnvelope::err(error_codes::INVALID_ARGUMENTS, msg))?;
-    let value = supervisor
-        .request_with_document(
+    let (value, encoding) = supervisor
+        .request_with_document_until(
             project_root,
             profile.kind,
             &uri,
@@ -604,6 +653,7 @@ fn find_references(
                 "position": { "line": lsp_line, "character": lsp_character },
                 "context": { "includeDeclaration": include_declaration }
             }),
+            operation_deadline,
         )
         .map_err(map_lsp_error)?;
     let mut cache = LineCache::new();
@@ -1080,12 +1130,12 @@ fn bound_call_hierarchy_name(name: &str) -> String {
         })
         .collect::<String>();
     let sanitized = sanitized.trim();
-    if sanitized.chars().count() <= MAX_SYMBOL_NAME_CHARS {
+    if sanitized.chars().count() <= MAX_PUBLIC_SYMBOL_NAME_CHARS {
         return sanitized.to_string();
     }
     sanitized
         .chars()
-        .take(MAX_SYMBOL_NAME_CHARS.saturating_sub(1))
+        .take(MAX_PUBLIC_SYMBOL_NAME_CHARS.saturating_sub(1))
         .collect::<String>()
         + "…"
 }
@@ -1330,21 +1380,23 @@ fn normalize_hover(
     ))
 }
 
-fn normalize_hover_contents(contents: &Value) -> Option<(String, String)> {
+fn normalize_hover_contents(contents: &Value) -> Option<(PublicHoverKind, String)> {
     match contents {
-        Value::String(value) => Some(("markdown".to_string(), value.clone())),
+        Value::String(value) => Some((PublicHoverKind::Markdown, value.clone())),
         Value::Object(object) => {
             let value = object.get("value")?.as_str()?;
             if let Some(kind) = object.get("kind") {
                 let kind = kind.as_str()?;
-                if !matches!(kind, "markdown" | "plaintext") {
-                    return None;
-                }
-                return Some((kind.to_string(), value.to_string()));
+                let kind = match kind {
+                    "markdown" => PublicHoverKind::Markdown,
+                    "plaintext" => PublicHoverKind::Plaintext,
+                    _ => return None,
+                };
+                return Some((kind, value.to_string()));
             }
             let language = object.get("language")?.as_str()?;
             Some((
-                "markdown".to_string(),
+                PublicHoverKind::Markdown,
                 fenced_marked_string(language, value),
             ))
         }
@@ -1361,7 +1413,7 @@ fn normalize_hover_contents(contents: &Value) -> Option<(String, String)> {
                     _ => return None,
                 }
             }
-            Some(("markdown".to_string(), values.join("\n\n")))
+            Some((PublicHoverKind::Markdown, values.join("\n\n")))
         }
         _ => None,
     }
@@ -1404,13 +1456,13 @@ fn bound_hover_value(value: &str) -> (String, bool) {
             character => character,
         })
         .collect::<String>();
-    if sanitized.chars().count() <= MAX_HOVER_VALUE_CHARS {
+    if sanitized.chars().count() <= MAX_PUBLIC_HOVER_VALUE_CHARS {
         return (sanitized, false);
     }
     (
         sanitized
             .chars()
-            .take(MAX_HOVER_VALUE_CHARS.saturating_sub(1))
+            .take(MAX_PUBLIC_HOVER_VALUE_CHARS.saturating_sub(1))
             .collect::<String>()
             + "…",
         true,
@@ -1462,7 +1514,7 @@ fn normalize_workspace_symbol(
     let Some(name) = object.get("name").and_then(Value::as_str) else {
         return WorkspaceSymbolNormalize::Invalid;
     };
-    let name = bound_diagnostic_field(name, MAX_WORKSPACE_SYMBOL_FIELD_CHARS);
+    let name = bound_diagnostic_field(name, MAX_PUBLIC_WORKSPACE_SYMBOL_FIELD_CHARS);
     if name.is_empty() {
         return WorkspaceSymbolNormalize::Invalid;
     }
@@ -1500,7 +1552,7 @@ fn normalize_workspace_symbol(
     let container_name = object
         .get("containerName")
         .and_then(Value::as_str)
-        .map(|value| bound_diagnostic_field(value, MAX_WORKSPACE_SYMBOL_FIELD_CHARS))
+        .map(|value| bound_diagnostic_field(value, MAX_PUBLIC_WORKSPACE_SYMBOL_FIELD_CHARS))
         .filter(|value| !value.is_empty());
     WorkspaceSymbolNormalize::Ok(PublicWorkspaceSymbol {
         name,
@@ -1548,22 +1600,24 @@ fn normalize_diagnostic(
     let message = value.get("message")?.as_str()?;
     let severity_code = value.get("severity").and_then(Value::as_i64);
     let severity = match severity_code {
-        Some(1) => "error",
-        Some(2) => "warning",
-        Some(3) => "information",
-        Some(4) => "hint",
-        _ => "unknown",
-    }
-    .to_string();
+        Some(1) => PublicDiagnosticSeverity::Error,
+        Some(2) => PublicDiagnosticSeverity::Warning,
+        Some(3) => PublicDiagnosticSeverity::Information,
+        Some(4) => PublicDiagnosticSeverity::Hint,
+        _ => PublicDiagnosticSeverity::Unknown,
+    };
     let code = value.get("code").and_then(|code| match code {
-        Value::String(code) => Some(bound_diagnostic_field(code, MAX_DIAGNOSTIC_CODE_CHARS)),
+        Value::String(code) => Some(bound_diagnostic_field(
+            code,
+            MAX_PUBLIC_DIAGNOSTIC_CODE_CHARS,
+        )),
         Value::Number(code) => Some(code.to_string()),
         _ => None,
     });
     let source = value
         .get("source")
         .and_then(Value::as_str)
-        .map(|source| bound_diagnostic_field(source, MAX_DIAGNOSTIC_SOURCE_CHARS))
+        .map(|source| bound_diagnostic_field(source, MAX_PUBLIC_DIAGNOSTIC_SOURCE_CHARS))
         .filter(|source| !source.is_empty());
     let mut unnecessary = false;
     let mut deprecated = false;
@@ -1583,13 +1637,13 @@ fn normalize_diagnostic(
     }
     let mut tags = Vec::new();
     if unnecessary {
-        tags.push("unnecessary".to_string());
+        tags.push(PublicDiagnosticTag::Unnecessary);
     }
     if deprecated {
-        tags.push("deprecated".to_string());
+        tags.push(PublicDiagnosticTag::Deprecated);
     }
     if unknown {
-        tags.push("unknown".to_string());
+        tags.push(PublicDiagnosticTag::Unknown);
     }
     Some(PublicDiagnostic {
         range,
@@ -1597,7 +1651,7 @@ fn normalize_diagnostic(
         severity_code,
         code,
         source,
-        message: bound_diagnostic_field(message, MAX_DIAGNOSTIC_MESSAGE_CHARS),
+        message: bound_diagnostic_field(message, MAX_PUBLIC_DIAGNOSTIC_MESSAGE_CHARS),
         tags,
     })
 }
@@ -1605,12 +1659,12 @@ fn normalize_diagnostic(
 fn diagnostic_sort_key(
     diagnostic: &PublicDiagnostic,
 ) -> (u8, usize, usize, usize, usize, Option<&str>, &str) {
-    let severity = match diagnostic.severity.as_str() {
-        "error" => 0,
-        "warning" => 1,
-        "information" => 2,
-        "hint" => 3,
-        _ => 4,
+    let severity = match diagnostic.severity {
+        PublicDiagnosticSeverity::Error => 0,
+        PublicDiagnosticSeverity::Warning => 1,
+        PublicDiagnosticSeverity::Information => 2,
+        PublicDiagnosticSeverity::Hint => 3,
+        PublicDiagnosticSeverity::Unknown => 4,
     };
     (
         severity,
@@ -1914,11 +1968,11 @@ fn normalize_symbol_information(
 }
 
 fn bound_symbol_name(name: &str) -> String {
-    bound_symbol_field(name, MAX_SYMBOL_NAME_CHARS)
+    bound_symbol_field(name, MAX_PUBLIC_SYMBOL_NAME_CHARS)
 }
 
 fn bound_symbol_detail(detail: &str) -> String {
-    bound_symbol_field(detail, MAX_SYMBOL_DETAIL_CHARS)
+    bound_symbol_field(detail, MAX_PUBLIC_SYMBOL_DETAIL_CHARS)
 }
 
 fn bound_symbol_field(value: &str, max_chars: usize) -> String {
@@ -2013,6 +2067,14 @@ fn map_lsp_error(error: LspError) -> RunnerLspResultEnvelope {
         LspError::ServerUnavailable => (
             error_codes::LSP_SERVER_UNAVAILABLE,
             "language server is unavailable".to_string(),
+        ),
+        LspError::WorkspaceReadinessTimeout { .. } => (
+            error_codes::LSP_REQUEST_TIMEOUT,
+            format!("{error}; no navigation result; inspect get_lsp_status; use search_project_texts while waiting for readiness"),
+        ),
+        LspError::WorkspaceNotReady(reason) => (
+            error_codes::LSP_SERVER_FAILED,
+            format!("language server workspace index is not ready ({reason}); no navigation result; inspect get_lsp_status; use search_project_texts until readiness is restored"),
         ),
         LspError::RequestTimeout { .. } => (
             error_codes::LSP_REQUEST_TIMEOUT,

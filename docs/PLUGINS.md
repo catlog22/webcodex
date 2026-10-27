@@ -15,7 +15,17 @@ contain, sign, or otherwise make an untrusted executable safe. A Plugin has the
 same practical local-process trust implications as launching that executable
 directly with the prepared Runner environment.
 
+> **Terminology:** ChatGPT may call a developer MCP/custom app a “plugin”. That
+> Host-side MCP connection is different from a WebCodex **Native Tool Plugin**.
+> A ChatGPT error such as `FORBIDDEN: This conversation does not support
+> developer MCPs` happens before `plugin_tool` when the Host refuses the MCP
+> connection; it is not a Native Tool Plugin health result. Use
+> [Troubleshooting](TROUBLESHOOTING.md) for that case. Use the `plugin_tool`
+> diagnostics in this document only after the request reaches WebCodex.
+
 ## Configure a Plugin
+
+Desktop exposes **Extensions → Native Plugins** separately from MCP servers. Add a trusted executable with **Add a native Tool Plugin**. Saved registrations are shown independently of live availability; select a Project in the lower preview to inspect the tools exposed by its Runner. The preview shows the Runner’s reported provider loading state; a failed Plugin includes recovery guidance and its safe diagnostic code. It does not imply a Project-affine tool catalog or invent tool counts that the provider-list response does not supply. Saving does not launch the Plugin. Apply the saved registration by explicitly restarting the owned Runner; reload operates only on the selected Project’s authorized Plugin.
 
 Plugins have their own `runner.toml` section; they are not MCP providers:
 
@@ -79,23 +89,21 @@ shell semantics; configure the native runtime executable instead.
 
 Native Plugins are Runner-owned capabilities. Provider tools never join the
 Server-global WebCodex tool namespace and are never appended to outer MCP
-`tools/list`. A Plugin may define `safe_delete`, `runtime_status`, or any other
+`tools/list`. A Plugin may define `safe_delete`, `get_runtime_status`, or any other
 valid provider-local name without colliding with WebCodex built-ins or Plugin
 tools on another Runner/provider.
 
 The stable model-facing entry is the first-class WebCodex tool `plugin_tool`.
 Its ToolSpec is static and registered in the same canonical tool metadata path
 as other WebCodex tools; its schema does not depend on Runner availability or
-Plugin inventory. `tool_manifest(tool_name="plugin_tool")` therefore describes
+Plugin inventory. `read_tool_manifest(tool_name="plugin_tool")` therefore describes
 the exact gateway contract even when no Plugin-capable Runner is online.
 `work_on_project` may additionally surface a bounded project-affine Plugin selection catalog at startup. That catalog is metadata only: it includes tools from ready committed providers whose configured `cwd` resolves to the authoritative Project root, omits providers for other directories, and never exposes provider paths, command/argv/environment, schemas, provider-instance identity, or an invocation binding. Catalogs are truncated by serialized byte size both at the Runner gateway and in the model projection; `total_count` and `catalog_revision` still describe the complete catalog. Selecting an entry still requires the canonical `plugin_tool describe -> call` path. The same project-affine metadata can be requested explicitly as `plugins.catalog` through the supported context sidecar when the caller has both `project:read` and `plugin:inspect`.
 
-The same canonical `plugin_tool` request parser and action-aware gateway executor
-serve MCP and the generic Tool Runtime used by OpenAPI/GPT Actions. A surface
-that advertises `plugin_tool` can therefore call it; MCP does not have a separate
-Plugin implementation. On the current generic GPT Actions surface, `plugin_tool`
-is a direct canonical operation, so pass its normal business arguments directly:
-
+The canonical `plugin_tool` parser and action-aware executor serve MCP and the
+Runtime API. There is no per-client Plugin implementation or alternate tool-name
+registry. Follow current `read_tool_manifest` routing and pass the normal business
+arguments to the admitted gateway:
 ```json
 {"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}
 {"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}
@@ -181,10 +189,26 @@ disposable `check` candidate; this local projection is not part of the Plugin
 gateway response.
 
 `call` has one dispatch identity: the opaque `binding` returned by that exact
-`describe`. It does not accept `runner`, `plugin`, or `tool` as call-time
+`describe`. It does not accept `runner`, `plugin`, `tool`, or `project` as call-time
 routing fields. Each describe creates an independent binding for the exact
 Runner instance, provider instance, tool name, and schema observation seen at
 that moment. The handle does not encode or expose those internal identities.
+
+For a `projectBound` tool, put the intended authorized `project` on `describe`.
+If it is missing, the error reports `plugin_project_required` with a recovery
+instruction to describe the same Runner/provider/tool with that explicit Project;
+no provider tool call has started and no binding is issued. WebCodex-generated
+gateway failures also project their existing recovery into the bounded MCP error
+text for Hosts that expose only text; structured error fields remain authoritative.
+Recovery comes first so a long error message cannot crowd it out of the existing
+1,024-byte text limit. Provider-authored tool results remain unchanged. A malformed Project
+selector and a Project supplied on `call` have different argument errors.
+For the same intended Project, reuse a retained schema/binding and send only
+`binding` and schema-matching `arguments`. For another Project, obtain a new
+binding by describing that target; simply dropping a conflicting call-time
+Project can leave the old target selected. Session or recorder metadata never
+supplies the business Project. Repairing arguments or re-describing does not
+authorize replay of an earlier uncertain effect; reconcile its outcome first.
 
 `reload` is the cross-platform authoritative reload path on Windows, macOS, and
 Linux. The Runner rereads its own `runner.toml`; the Server does not upload an
@@ -219,14 +243,14 @@ Running `check` before reload never replaces the current provider set and never
 creates a binding. The successful check candidate is disposed instead of being
 reused by a later reload.
 
-`runner_config_reload` and `plugin_tool reload` share the same Plugin candidate
+`reload_runner_config` and `plugin_tool reload` share the same Plugin candidate
 admission/commit primitive. Editing `[plugins]` does not require a Runner restart:
 generic Runner config reload live-applies the Plugin candidate as part of the
 same activation, while `plugin_tool reload` provides the narrower
 `plugin:manage`-scoped operation. Plugin management authority never grants
 authority to change unrelated Runner configuration.
 
-`runner_config_check` remains a structural Runner-config check: it reads/parses
+`check_runner_config` remains a structural Runner-config check: it reads/parses
 the startup-bound `runner.toml`, validates configuration bounds, and classifies
 restart-only fields without starting disposable Plugin processes. Use
 `plugin_tool check(runner, plugin)` when you need executable resolution plus the
@@ -359,9 +383,11 @@ external dependency contract. That prerequisite is now satisfied:
 `@yyjeqhc/webcodex-plugin-sdk@0.1.0` is publicly distributed through npm, and Phase 3
 adds the local scaffold using that exact compatibility pin. A generated project
 therefore works independently of a WebCodex source checkout. Repository first-party
-dogfood such as `plugins/safe-delete` and [`plugins/repo-info`](../plugins/repo-info/README.md)
-intentionally continues to use the local SDK source so it tests the checkout under
-development; external projects created by `plugin init` use the published package.
+dogfood such as `plugins/safe-delete`, [`plugins/repo-info`](../plugins/repo-info/README.md),
+[`plugins/campus-application`](../plugins/campus-application/README.md), and
+[`plugins/agent-browser`](../plugins/agent-browser/README.md) intentionally continues
+to use the local SDK source so it tests the checkout under development;
+external projects created by `plugin init` use the published package.
 
 ## TypeScript Plugin SDK
 
@@ -469,13 +495,44 @@ forms of `additionalProperties`, union `type`, `anyOf`, `oneOf`, `allOf`, `not`,
 or arbitrary draft-specific keywords.
 
 See [`examples/native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs) for
-a minimal no-dependency Node example. The repository also ships two first-party
-SDK dogfood Plugins: [`plugins/safe-delete`](../plugins/safe-delete/README.md) is an
-optional project-root-fenced Plugin that moves one file or directory to the operating
-system Trash/Recycle Bin without adding permanent deletion to WebCodex's built-in
-tool surface; [`plugins/repo-info`](../plugins/repo-info/README.md) is a read-only
-authoring example whose single `git_summary` tool observes only the provider's
-configured repository `cwd`.
+a minimal no-dependency Node example. A standard-library-only
+[Python raw-protocol example](../plugins/examples/python-raw/README.md) demonstrates
+bounded stdio, argument validation, and a deterministic echo tool without the
+TypeScript SDK. The repository also ships first-party SDK
+dogfood Plugins: [`plugins/safe-delete`](../plugins/safe-delete/README.md) is an optional
+project-root-fenced Plugin that moves one file or directory to the operating system
+Trash/Recycle Bin without adding permanent deletion to WebCodex's built-in tool
+surface; [`plugins/repo-info`](../plugins/repo-info/README.md) is a read-only authoring
+example whose single `git_summary` tool observes only the provider's configured
+repository `cwd`; [`plugins/campus-application`](../plugins/campus-application/README.md)
+turns bounded Browser semantic snapshots into structured resume-form plans, supports
+repeated and multi-step application flows, and deliberately stops before final
+submission; and [`plugins/agent-browser`](../plugins/agent-browser/README.md) uses an
+operator-installed local Agent Browser to inherit native profiles/configuration or
+attach to an explicitly authorized running Chrome while keeping opaque page/snapshot
+identities, tab ownership, and uncertain-effect handling inside the Plugin boundary.
+
+The optional standard-library-only Python
+[`Project Knowledge Plugin`](../plugins/project-knowledge/README.md) indexes bounded
+Git-tracked text/code under one configured repository root into a private SQLite
+FTS5 cache outside the Project. Its `index`, `status`, `search`, and `read` tools
+use the same native protocol and `plugin_tool` binding path; search verifies
+current source hashes and reports index coverage. It requires Python 3.10+, FTS5,
+Git, and descriptor-relative no-follow file access, and never writes core Memory
+or guidance files or calls an embedding/model service.
+
+## Community Native Plugins (third-party)
+
+The following plugin is maintained outside the WebCodex repository and is **not an
+officially maintained or audited integration**. Native Plugins run as trusted local
+executables; review their source and Runner permissions before installing.
+
+- [WebCodex × Orca Native Plugin](https://github.com/LonelyHerbivore/webcodex-orca-plugin)
+  (Node.js 18+, integration candidate): wraps Orca CLI multi-agent runs, Worker
+  lifecycle, message delivery, guarded recovery after unknown outcomes, and
+  provenance-aware transcript paging. As of v0.3.1, automated tests pass, but
+  full Claude Code + two Antigravity completion/release remains unverified.
+  See the third-party repository for setup instructions and limitations.
 
 ## Calling and failure semantics
 

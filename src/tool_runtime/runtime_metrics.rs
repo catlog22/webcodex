@@ -4,6 +4,7 @@
 //! authorization, admission, retry, Job, Session, or Window truth and must
 //! never affect a tool result.
 
+use super::model_ergonomics_telemetry::invocation::InstructionReadTarget;
 use super::model_ergonomics_telemetry::ModelErgonomicsRecord;
 use super::window_activity::WindowLoopTransition;
 
@@ -13,6 +14,23 @@ pub(crate) struct McpCallMetricObservation {
     pub(crate) outcome_class: &'static str,
     pub(crate) meaningful: bool,
     pub(crate) streaming: bool,
+}
+
+/// A bounded Job-observation batch summary. No Job ids, project ids, paths,
+/// output text or other high-cardinality user content is recorded.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JobObservationMetricObservation {
+    pub(crate) elapsed_ms: u64,
+    /// Wait budget after Host/runtime normalization, not the original request.
+    pub(crate) effective_wait_secs: Option<u64>,
+    pub(crate) wake_on: &'static str,
+    pub(crate) wake_reason: &'static str,
+    pub(crate) item_count: u64,
+    pub(crate) changed_count: u64,
+    pub(crate) meaningful_changed_count: u64,
+    pub(crate) heartbeat_changed_count: u64,
+    pub(crate) terminal_count: u64,
+    pub(crate) returned_bytes: u64,
 }
 
 impl McpCallMetricObservation {
@@ -92,8 +110,15 @@ pub(crate) struct SkillSourceMetricObservation {
 pub(crate) trait RuntimeMetrics: std::fmt::Debug + Send + Sync {
     fn observe_tool_call(&self, record: &ModelErgonomicsRecord);
     fn observe_mcp_call(&self, observation: McpCallMetricObservation);
+    fn observe_job_observation(&self, _observation: JobObservationMetricObservation) {}
     fn observe_skill_source(&self, observation: SkillSourceMetricObservation);
+    fn observe_instruction_read_after_complete_bootstrap(&self, target: InstructionReadTarget);
     fn observe_window_transition(&self, transition: WindowLoopTransition);
+    #[cfg(feature = "experimental-code-mode")]
+    fn observe_code_mode_composition(
+        &self,
+        observation: &super::code_mode::CodeModeCompositionSummary,
+    );
 }
 
 fn observe_fail_open(operation: &'static str, observe: impl FnOnce()) {
@@ -117,11 +142,29 @@ pub(crate) fn observe_mcp_call(
     observe_fail_open("mcp_call", || metrics.observe_mcp_call(observation));
 }
 
+pub(crate) fn observe_job_observation(
+    metrics: &dyn RuntimeMetrics,
+    observation: JobObservationMetricObservation,
+) {
+    observe_fail_open("job_observation", || {
+        metrics.observe_job_observation(observation)
+    });
+}
+
 pub(crate) fn observe_skill_source(
     metrics: &dyn RuntimeMetrics,
     observation: SkillSourceMetricObservation,
 ) {
     observe_fail_open("skill_source", || metrics.observe_skill_source(observation));
+}
+
+pub(crate) fn observe_instruction_read_after_complete_bootstrap(
+    metrics: &dyn RuntimeMetrics,
+    target: InstructionReadTarget,
+) {
+    observe_fail_open("instruction_bootstrap_reuse", || {
+        metrics.observe_instruction_read_after_complete_bootstrap(target)
+    });
 }
 
 pub(crate) fn observe_window_transition(
@@ -130,6 +173,16 @@ pub(crate) fn observe_window_transition(
 ) {
     observe_fail_open("window_transition", || {
         metrics.observe_window_transition(transition)
+    });
+}
+
+#[cfg(feature = "experimental-code-mode")]
+pub(crate) fn observe_code_mode_composition(
+    metrics: &dyn RuntimeMetrics,
+    observation: &super::code_mode::CodeModeCompositionSummary,
+) {
+    observe_fail_open("code_mode_composition", || {
+        metrics.observe_code_mode_composition(observation)
     });
 }
 
@@ -199,6 +252,36 @@ impl RuntimeMetrics for TracingRuntimeMetrics {
         }
     }
 
+    fn observe_job_observation(&self, observation: JobObservationMetricObservation) {
+        tracing::info!(
+            metric = "job_observation_wait_seconds",
+            value = observation.elapsed_ms as f64 / 1000.0,
+            wake_on = observation.wake_on,
+            wake_reason = observation.wake_reason,
+            effective_wait_secs = ?observation.effective_wait_secs,
+            "runtime_metric"
+        );
+        tracing::info!(
+            metric = "job_observation_wakes_total",
+            value = 1_u64,
+            wake_on = observation.wake_on,
+            wake_reason = observation.wake_reason,
+            "runtime_metric"
+        );
+        tracing::info!(
+            metric = "job_observation_items_total",
+            value = observation.item_count,
+            wake_on = observation.wake_on,
+            wake_reason = observation.wake_reason,
+            changed = observation.changed_count,
+            meaningful_changed = observation.meaningful_changed_count,
+            heartbeat_changed = observation.heartbeat_changed_count,
+            terminal = observation.terminal_count,
+            returned_bytes = observation.returned_bytes,
+            "runtime_metric"
+        );
+    }
+
     fn observe_skill_source(&self, observation: SkillSourceMetricObservation) {
         let source = observation.source.as_str();
         let operation = observation.operation.as_str();
@@ -251,6 +334,17 @@ impl RuntimeMetrics for TracingRuntimeMetrics {
         }
     }
 
+    fn observe_instruction_read_after_complete_bootstrap(&self, target: InstructionReadTarget) {
+        tracing::info!(
+            metric = "instruction_read_after_complete_bootstrap_total",
+            value = 1_u64,
+            target = target.as_str(),
+            classification = "candidate_redundant",
+            transport = "mcp",
+            "runtime_metric"
+        );
+    }
+
     fn observe_window_transition(&self, transition: WindowLoopTransition) {
         match transition {
             WindowLoopTransition::Serial { gap_ms } => tracing::info!(
@@ -272,6 +366,78 @@ impl RuntimeMetrics for TracingRuntimeMetrics {
             WindowLoopTransition::Unavailable => {}
         }
     }
+
+    #[cfg(feature = "experimental-code-mode")]
+    fn observe_code_mode_composition(
+        &self,
+        observation: &super::code_mode::CodeModeCompositionSummary,
+    ) {
+        for (metric, value) in [
+            (
+                "code_mode_nested_calls_total",
+                observation.nested_calls as u64,
+            ),
+            (
+                "code_mode_nested_successes_total",
+                observation.nested_successes as u64,
+            ),
+            (
+                "code_mode_nested_failures_total",
+                observation.nested_failures as u64,
+            ),
+            (
+                "code_mode_max_nested_in_flight",
+                observation.max_in_flight as u64,
+            ),
+            (
+                "code_mode_returned_bytes",
+                observation.returned_bytes as u64,
+            ),
+            (
+                "code_mode_nested_raw_result_bytes_total",
+                observation.nested_raw_result_bytes_total as u64,
+            ),
+        ] {
+            tracing::info!(
+                metric,
+                value,
+                tool = "execute_code_mode",
+                surface = "runtime",
+                "runtime_metric"
+            );
+        }
+        tracing::info!(
+            metric = "code_mode_runtime_duration_seconds",
+            value = observation.duration_ms as f64 / 1000.0,
+            tool = "execute_code_mode",
+            surface = "runtime",
+            "runtime_metric"
+        );
+        tracing::info!(
+            metric = "code_mode_slot_wait_seconds",
+            value = observation.slot_wait_ms as f64 / 1000.0,
+            tool = "execute_code_mode",
+            surface = "runtime",
+            "runtime_metric"
+        );
+        tracing::info!(
+            metric = "code_mode_input_bytes",
+            value = observation.input_bytes as u64,
+            tool = "execute_code_mode",
+            surface = "runtime",
+            "runtime_metric"
+        );
+        for (nested_tool, value) in &observation.nested_tool_counts {
+            tracing::info!(
+                metric = "code_mode_nested_tool_calls_total",
+                value = *value as u64,
+                tool = "execute_code_mode",
+                nested_tool,
+                surface = "runtime",
+                "runtime_metric"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -290,11 +456,30 @@ mod tests {
             panic!("test metrics sink failure");
         }
 
+        fn observe_job_observation(&self, _observation: JobObservationMetricObservation) {
+            panic!("test metrics sink failure");
+        }
+
         fn observe_skill_source(&self, _observation: SkillSourceMetricObservation) {
             panic!("test metrics sink failure");
         }
 
+        fn observe_instruction_read_after_complete_bootstrap(
+            &self,
+            _target: InstructionReadTarget,
+        ) {
+            panic!("test metrics sink failure");
+        }
+
         fn observe_window_transition(&self, _transition: WindowLoopTransition) {
+            panic!("test metrics sink failure");
+        }
+
+        #[cfg(feature = "experimental-code-mode")]
+        fn observe_code_mode_composition(
+            &self,
+            _observation: &super::super::code_mode::CodeModeCompositionSummary,
+        ) {
             panic!("test metrics sink failure");
         }
     }
@@ -308,6 +493,30 @@ mod tests {
             streaming: true,
         };
         assert!(!observation.ordinary_completed_response());
+    }
+
+    #[cfg(feature = "experimental-code-mode")]
+    #[test]
+    fn code_mode_metrics_sink_failure_is_fail_open() {
+        let observation = super::super::code_mode::CodeModeCompositionSummary {
+            nested_calls: 1,
+            nested_successes: 1,
+            nested_failures: 0,
+            max_in_flight: 1,
+            duration_ms: 7,
+            slot_wait_ms: 2,
+            input_bytes: 11,
+            returned_bytes: 3,
+            nested_raw_result_bytes_total: 9,
+            nested_tool_counts: std::collections::BTreeMap::from([("read_files".to_string(), 1)]),
+            consequential_calls: 0,
+            known_results: 0,
+            job_handoffs: 0,
+            outcome_unknown: 0,
+            mutation_state_changed: 0,
+            mutation_no_change: 0,
+        };
+        observe_code_mode_composition(&PanicMetrics, &observation);
     }
 
     #[test]
@@ -364,6 +573,21 @@ mod tests {
                 outcome_class: "success",
                 meaningful: true,
                 streaming: false,
+            },
+        );
+        observe_job_observation(
+            &sink,
+            JobObservationMetricObservation {
+                elapsed_ms: 15,
+                effective_wait_secs: Some(5),
+                wake_on: "meaningful_change",
+                wake_reason: "updated",
+                item_count: 2,
+                changed_count: 1,
+                meaningful_changed_count: 0,
+                heartbeat_changed_count: 1,
+                terminal_count: 0,
+                returned_bytes: 0,
             },
         );
         observe_skill_source(

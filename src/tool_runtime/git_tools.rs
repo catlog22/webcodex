@@ -1,9 +1,14 @@
 //! Runtime dispatch adapters for git-oriented tool calls.
 
 use super::{ToolCall, ToolResult, ToolRuntime};
+use crate::auth::AuthContext;
 
 impl ToolRuntime {
-    pub(crate) async fn dispatch_git_tool(&self, call: ToolCall) -> ToolResult {
+    pub(crate) async fn dispatch_git_tool(
+        &self,
+        call: ToolCall,
+        auth: Option<&AuthContext>,
+    ) -> ToolResult {
         match call {
             ToolCall::GitRestorePaths {
                 project,
@@ -56,10 +61,14 @@ impl ToolRuntime {
             }
             ToolCall::GitLog {
                 project,
+                head_commit,
                 limit,
                 skip,
-                session_id: _,
-            } => self.git_log(project, limit, skip).await,
+                session_id,
+            } => {
+                self.git_log(project, head_commit, limit, skip, session_id)
+                    .await
+            }
             ToolCall::GitReviewSummary {
                 project,
                 base_commit,
@@ -68,6 +77,29 @@ impl ToolRuntime {
             } => {
                 self.git_review_summary(project, base_commit, head_commit)
                     .await
+            }
+            ToolCall::ReviewChanges {
+                project,
+                scope,
+                session_id,
+                paths,
+                max_hunks,
+                max_hunk_lines,
+                max_page_bytes,
+                continuation,
+            } => {
+                self.review_changes(
+                    project,
+                    scope,
+                    session_id,
+                    paths,
+                    max_hunks,
+                    max_hunk_lines,
+                    max_page_bytes,
+                    continuation,
+                    auth,
+                )
+                .await
             }
             ToolCall::ShowChanges {
                 project,

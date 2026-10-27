@@ -1,6 +1,7 @@
 use crate::{
     current_validation_evidence_for_session, parse_cargo_test_run_metadata,
-    validation_kind_for_tool, validation_summary_for_session_events,
+    validation_kind_for_tool, validation_summary_for_session_events, ValidationReport,
+    ValidationStatus,
 };
 use serde_json::{json, Value};
 use webcodex_core::validation_evidence::{
@@ -11,23 +12,23 @@ use webcodex_core::{
     runner_protocol::JOB_INVENTORY_MAX_TERMINAL_JOBS, workflow_session_contract::is_safe_job_id,
 };
 use webcodex_tool_contracts::{
-    runtime_tool_accepts_context_ack, runtime_tool_advances_context_checkpoint,
     runtime_tool_is_change_summary_like, runtime_tool_is_git_like, runtime_tool_is_read_like,
     runtime_tool_is_shell_like, runtime_tool_is_write_like, runtime_tool_metadata,
-    runtime_tool_session_risk_class, ToolPathHint, ToolRisk, ToolValidationIdentityKind,
+    runtime_tool_session_risk_class, SessionMode, ToolPathHint, ToolRisk,
+    ToolValidationIdentityKind,
 };
-use webcodex_tool_runtime_contracts::{
-    tool_audit::{
-        assertion_validation_identity, session_log_arguments_for_tool_request,
-        structured_validation_target_identity,
-    },
-    SessionMode,
+use webcodex_tool_runtime_contracts::tool_audit::{
+    assertion_validation_identity, session_log_arguments_for_tool_request,
+    structured_validation_target_identity,
 };
 use webcodex_workflow_session as sessions;
 use webcodex_workflow_session::root_test_support::MAX_VALIDATION_EXCERPT_CHARS;
 use webcodex_workflow_session::{
     SessionGuards, SessionPathHint, SessionStore, SessionToolContract, SessionTransport,
 };
+
+#[path = "source_evidence_tests.rs"]
+mod source_evidence;
 
 fn validation_summary_for_session(summary: &sessions::SessionSummary) -> Value {
     validation_summary_for_session_events(summary, &summary.events, 10)
@@ -50,8 +51,6 @@ fn session_tool_contract(tool_name: &str) -> SessionToolContract {
             ToolPathHint::Patch => SessionPathHint::Patch,
             ToolPathHint::Artifact => SessionPathHint::Artifact,
         },
-        accepts_context_ack: runtime_tool_accepts_context_ack(tool_name),
-        advances_context_checkpoint: runtime_tool_advances_context_checkpoint(tool_name),
     }
 }
 
@@ -154,12 +153,19 @@ fn cargo_check_success_produces_validation_event() {
     assert_eq!(event["validation_kind"], "check");
     assert_eq!(event["success"], true);
     assert_eq!(event["exit_code"], 0);
-    assert_eq!(event["summary"], "cargo_check succeeded");
+    for redundant in [
+        "execution_success",
+        "failure_category",
+        "execution_source",
+        "summary",
+        "session_id",
+    ] {
+        assert!(event.get(redundant).is_none(), "{redundant}: {event}");
+    }
     assert!(event.get("input_summary").is_none());
     assert!(event["identity"]
         .as_str()
         .is_some_and(|identity| identity.starts_with("target:")));
-    assert_eq!(event["execution_source"], "cargo_check");
     assert_eq!(event["purpose"], "validation");
     assert_eq!(validation["parser"]["available"], false);
     assert_eq!(
@@ -525,7 +531,7 @@ fn cargo_test_run_metadata_counts_only_executed_tests() {
     assert!(metadata.tests_detected);
     assert_eq!(metadata.tests_run_count, Some(1));
     assert_eq!(metadata.zero_tests_run, Some(false));
-    assert_eq!(metadata.count_evidence_reason, "complete_summary");
+    assert_eq!(metadata.count_evidence_reason(), "complete_summary");
 
     let measured_only = parse_cargo_test_run_metadata(
         "running 2 tests\n\
@@ -588,7 +594,7 @@ fn cargo_test_run_metadata_keeps_positive_aggregate_when_last_harness_is_zero() 
     assert_eq!(metadata.tests_failed, Some(0));
     assert_eq!(metadata.tests_run_count, Some(2788));
     assert_eq!(metadata.zero_tests_run, Some(false));
-    assert_eq!(metadata.count_evidence_reason, "complete_summary");
+    assert_eq!(metadata.count_evidence_reason(), "complete_summary");
 }
 
 #[test]
@@ -598,7 +604,7 @@ fn cargo_test_run_metadata_reports_precise_unproven_reason() {
          test result: ok. 224 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n",
     );
     assert_eq!(real_success.tests_run_count, Some(224));
-    assert_eq!(real_success.count_evidence_reason, "complete_summary");
+    assert_eq!(real_success.count_evidence_reason(), "complete_summary");
 
     let partial_after_success = parse_cargo_test_run_metadata(
         "running 224 tests\n\
@@ -607,13 +613,13 @@ fn cargo_test_run_metadata_reports_precise_unproven_reason() {
     );
     assert_eq!(partial_after_success.tests_run_count, None);
     assert_eq!(
-        partial_after_success.count_evidence_reason,
+        partial_after_success.count_evidence_reason(),
         "partial_harness_summary"
     );
 
     let no_complete = parse_cargo_test_run_metadata("running 224 tests\n");
     assert_eq!(no_complete.tests_run_count, None);
-    assert_eq!(no_complete.count_evidence_reason, "no_complete_summary");
+    assert_eq!(no_complete.count_evidence_reason(), "no_complete_summary");
 }
 
 #[test]
@@ -698,7 +704,7 @@ fn legacy_persisted_cargo_test_metadata_absence_uses_diagnostics_fallback() {
     drop(store);
 
     let mut ledger_json: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        serde_json::from_str(&sessions::root_test_support::read_ledger(&ledger).unwrap()).unwrap();
     let events = ledger_json["sessions"][0]["events"].as_array_mut().unwrap();
     let finished = events
         .iter_mut()
@@ -711,7 +717,8 @@ fn legacy_persisted_cargo_test_metadata_absence_uses_diagnostics_fallback() {
     output_summary.remove("zero_tests_run");
     std::fs::write(&ledger, serde_json::to_vec(&ledger_json).unwrap()).unwrap();
 
-    let restored = SessionStore::with_persistence(&ledger, 10, 10);
+    // This fixture deliberately imports a modified pre-cutover JSON ledger.
+    let restored = sessions::root_test_support::import_ledger(&ledger, 10, 10);
     let session = restored.summary(&session.session_id, Some(50)).unwrap();
     let validation = validation_summary_for_session(&session);
     let event = &validation["latest"];
@@ -746,7 +753,18 @@ fn validation_summary_exposes_cargo_test_zero_tests_metadata() {
     );
 
     let session = store.summary(&session.session_id, Some(50)).unwrap();
-    let validation = validation_summary_for_session(&session);
+    let report = ValidationReport::from_events(&session, &session.events, 10);
+    let facts = report.facts();
+    assert_eq!(facts.status, Some(ValidationStatus::Inconclusive));
+    assert_eq!(
+        facts.current_evidence_status,
+        Some(ValidationStatus::Inconclusive)
+    );
+    assert!(facts.cargo_test_zero_tests);
+    assert_eq!(facts.successes, 0);
+    assert_eq!(facts.evidence_gap_count, 1);
+    assert_eq!(facts.current_unresolved_failure_count, 0);
+    let validation = report.to_value();
     let event = &validation["latest"];
 
     assert_eq!(validation["status"], "inconclusive");
@@ -797,7 +815,7 @@ fn successful_cargo_test_with_executed_tests_is_proven_validation() {
     assert_eq!(validation["successes"], 1);
     assert_eq!(validation["latest_status"], "passed");
     assert_eq!(validation["latest_success"]["tests_run_count"], 2);
-    assert_eq!(validation["current_evidence"]["status"], "passed");
+    assert_eq!(validation["current_evidence"]["status"], "unproven");
 }
 
 #[test]
@@ -831,7 +849,7 @@ fn explicit_require_tests_false_accepts_zero_test_validation_proof() {
     assert_eq!(validation["latest_status"], "passed");
     assert_eq!(validation["latest_success"]["require_tests"], false);
     assert_eq!(validation["latest_success"]["zero_tests_run"], true);
-    assert_eq!(validation["current_evidence"]["status"], "passed");
+    assert_eq!(validation["current_evidence"]["status"], "unproven");
 }
 
 #[test]
@@ -948,12 +966,12 @@ fn later_zero_test_event_does_not_replace_previous_real_validation_proof() {
     assert_eq!(validation["latest_status"], "inconclusive");
     assert_eq!(validation["latest"]["zero_tests_run"], true);
     assert_eq!(validation["latest_success"]["tests_run_count"], 2);
-    assert_eq!(validation["current_evidence"]["status"], "passed");
+    assert_eq!(validation["current_evidence"]["status"], "unproven");
     assert_eq!(
         validation["current_evidence"]["latest_status"],
         "inconclusive"
     );
-    assert_eq!(validation["current_evidence"]["successes"], 1);
+    assert_eq!(validation["current_evidence"]["successes"], 0);
 }
 
 #[test]
@@ -1290,7 +1308,37 @@ fn same_validation_identity_success_resolves_failure_without_deleting_history() 
     );
 
     let session = store.summary(&session.session_id, Some(50)).unwrap();
-    let validation = validation_summary_for_session(&session);
+    let report = ValidationReport::from_events(&session, &session.events, 10);
+    let facts = report.facts();
+    assert_eq!(facts.status, Some(ValidationStatus::Mixed));
+    assert_eq!(
+        facts.current_evidence_status,
+        Some(ValidationStatus::Unproven)
+    );
+    assert_eq!(facts.successes, 1);
+    assert_eq!(facts.failures, 1);
+    assert_eq!(facts.resolved_failure_count, 1);
+    assert_eq!(facts.unresolved_failure_count, 0);
+    assert_eq!(facts.current_unresolved_failure_count, 0);
+    assert!(facts.historical_failures_resolved);
+    assert!(!facts.historical_failures_unresolved);
+    let validation = report.to_value();
+    let mut bounded = report.bounded_value(1);
+    assert_eq!(bounded["events"].as_array().unwrap().len(), 1);
+    assert_eq!(bounded["events_total"], 2);
+    assert_eq!(
+        bounded["resolved_failures"],
+        validation["resolved_failures"]
+    );
+    assert_eq!(bounded["current_evidence"], validation["current_evidence"]);
+    // A consumer may trim or decorate its display; neither changes policy facts.
+    bounded["failures"] = json!(0);
+    bounded["current_evidence"]["status"] = json!("passed");
+    assert_eq!(report.facts(), facts);
+    let continuation = report.continuation_snapshot(true);
+    assert_eq!(continuation.status, "unproven");
+    assert_eq!(continuation.resolved_failure_count, 1);
+    assert_eq!(continuation.unresolved_failure_count, 0);
 
     assert_eq!(validation["historical_failures"]["count"], 1);
     assert_eq!(validation["resolved_failures"]["count"], 1);
@@ -1300,6 +1348,91 @@ fn same_validation_identity_success_resolves_failure_without_deleting_history() 
         false
     );
     assert_eq!(validation["events_total"], 2);
+}
+
+#[test]
+fn ambient_go_test_success_does_not_resolve_single_module_gateway_failure() {
+    use webcodex_core::validation_identity::{
+        contextualize_structured_validation_target_identity, StructuredValidationExecutionContext,
+    };
+
+    let store = SessionStore::default();
+    let project = "agent:eval:demo";
+    let session = store.start_session(Some(project.to_string()), None);
+    let direct_target = structured_validation_target_identity(
+        ToolValidationIdentityKind::GoTest,
+        &json!({"cwd": ".", "packages": ["./..."]}),
+    )
+    .unwrap();
+    let gateway_target = contextualize_structured_validation_target_identity(
+        &direct_target,
+        StructuredValidationExecutionContext::GoProjectSingleModuleV1,
+    )
+    .unwrap();
+    assert_ne!(gateway_target, direct_target);
+
+    let job_id = "job_go_project_single_module_failure";
+    assert!(store.record_validation_job_terminal(
+        &session.session_id,
+        job_id,
+        &[job_id],
+        "project_validate",
+        session_tool_contract("project_validate"),
+        Some(project.to_string()),
+        &gateway_target,
+        None,
+        "failed",
+        Some(1),
+        Some(false),
+        Some(100),
+        Some(110),
+        Some(10_000),
+        Some(json!({
+            "action": "test",
+            "adapter": "go_test",
+            "backend": "go",
+            "validation_tool": "go_test"
+        })),
+    ));
+    let failed =
+        validation_summary_for_session(&store.summary(&session.session_id, Some(50)).unwrap());
+    assert_eq!(failed["unresolved_failures"]["count"], 1);
+    assert_eq!(failed["latest_failure"]["identity"], gateway_target);
+
+    record_finished_tool(
+        &store,
+        &session.session_id,
+        "go_test",
+        json!({"project": project, "cwd": ".", "packages": ["./..."]}),
+        true,
+        json!({
+            "exit_code": 0,
+            "execution_state": "completed",
+            "stdout_tail": r#"{"Action":"start","Package":"example.test/demo"}
+{"Action":"pass","Package":"example.test/demo","Test":"TestPass"}
+{"Action":"pass","Package":"example.test/demo"}
+"#,
+            "stderr_tail": "",
+            "stdout_truncated": false,
+            "stderr_truncated": false,
+            "tests_detected": true,
+            "tests_run_count": 1,
+            "tests_passed": 1,
+            "tests_failed": 0,
+            "zero_tests_run": false
+        }),
+    );
+
+    let validation =
+        validation_summary_for_session(&store.summary(&session.session_id, Some(50)).unwrap());
+    assert_eq!(validation["historical_failures"]["count"], 1);
+    assert_eq!(validation["resolved_failures"]["count"], 0);
+    assert_eq!(validation["unresolved_failures"]["count"], 1);
+    assert_eq!(
+        validation["unresolved_failures"]["events"][0]["identity"],
+        gateway_target
+    );
+    assert_eq!(validation["latest_success"]["identity"], direct_target);
 }
 
 #[test]
@@ -1489,7 +1622,8 @@ fn generic_test_success_without_structured_counts_resolves_same_identity_failure
     assert_eq!(validation["historical_failures"]["unresolved"], false);
     assert_eq!(validation["resolved_failures"]["count"], 1);
     assert_eq!(validation["unresolved_failures"]["count"], 0);
-    assert_eq!(validation["latest"]["execution_source"], "run_process");
+    assert!(validation["latest"].get("execution_source").is_none());
+    assert_eq!(validation["latest"]["tool_name"], "run_process");
     assert_eq!(validation["latest"]["validation_kind"], "test");
     assert_eq!(validation["latest"]["identity"], identity);
     assert!(validation["latest"]["tests_run_count"].is_null());
@@ -1983,12 +2117,12 @@ fn persisted_validation_job_materialization_ids_are_additive_sanitized_and_bound
     drop(store);
 
     let mut ledger_json: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+        serde_json::from_str(&sessions::root_test_support::read_ledger(&ledger).unwrap()).unwrap();
     let record = ledger_json["sessions"][0].as_object_mut().unwrap();
     // Missing field remains valid for pre-feature ledgers.
     record.remove("materialized_validation_job_ids");
     std::fs::write(&ledger, serde_json::to_vec(&ledger_json).unwrap()).unwrap();
-    let legacy = SessionStore::with_persistence(&ledger, 10, 10);
+    let legacy = sessions::root_test_support::import_ledger(&ledger, 10, 10);
     assert!(legacy.summary(&session.session_id, None).is_some());
     legacy.flush_persistence();
     drop(legacy);
@@ -2011,7 +2145,14 @@ fn persisted_validation_job_materialization_ids_are_additive_sanitized_and_bound
     );
     std::fs::write(&ledger, serde_json::to_vec(&ledger_json).unwrap()).unwrap();
 
-    let restored = SessionStore::with_persistence(&ledger, 10, 10);
+    let restored_database = dir.path().join("sanitized.sqlite3");
+    let restored = SessionStore::open_database(
+        &restored_database,
+        Some(&ledger),
+        sessions::DEFAULT_SESSION_CACHE_BYTES,
+        10,
+    )
+    .unwrap();
     record_finished_tool(
         &restored,
         &session.session_id,
@@ -2022,8 +2163,11 @@ fn persisted_validation_job_materialization_ids_are_additive_sanitized_and_bound
     );
     restored.flush_persistence();
     drop(restored);
-    let canonical: Value =
-        serde_json::from_str(&std::fs::read_to_string(&ledger).unwrap()).unwrap();
+    // Verify the committed SQLite result, not the unchanged JSON import source.
+    let canonical: Value = serde_json::from_str(
+        &sessions::root_test_support::read_ledger(dir.path().join("sanitized.json")).unwrap(),
+    )
+    .unwrap();
     let ids = canonical["sessions"][0]["materialized_validation_job_ids"]
         .as_array()
         .unwrap();
@@ -2285,8 +2429,8 @@ fn cargo_test_request_scoped_assertion_failures_are_evidence_gaps_not_correctnes
         );
         assert_eq!(validation["evidence_gaps"]["count"], 1, "{}", case.label);
         assert_eq!(validation["latest"]["success"], false, "{}", case.label);
-        assert_eq!(
-            validation["latest"]["execution_success"], true,
+        assert!(
+            validation["latest"].get("execution_success").is_none(),
             "{}",
             case.label
         );
@@ -2449,7 +2593,7 @@ fn later_sufficient_same_target_evidence_closes_prior_minimum_not_met_without_re
         validation["events"][0]["identity"],
         validation["events"][1]["identity"]
     );
-    assert_eq!(validation["current_evidence"]["status"], "passed");
+    assert_eq!(validation["current_evidence"]["status"], "unproven");
     assert_eq!(
         validation["current_evidence"]["unresolved_failure_count"],
         0
@@ -2696,7 +2840,8 @@ fn materialized_run_script_terminal_preserves_recoverable_assertion_label() {
     let validation =
         validation_summary_for_session(&store.summary(&session.session_id, Some(20)).unwrap());
     let latest = &validation["latest"];
-    assert_eq!(latest["execution_source"], "run_script");
+    assert!(latest.get("execution_source").is_none());
+    assert_eq!(latest["tool_name"], "run_script");
     assert_eq!(latest["identity"], identity);
     assert_eq!(latest["assertion_name"], assertion_name);
 }
@@ -2738,7 +2883,7 @@ fn successful_validation_followed_by_failure_marks_historical_failure_unresolved
 }
 
 #[test]
-fn current_evidence_failure_then_content_change_then_different_success_passes() {
+fn current_evidence_failure_then_change_then_success_retains_history_without_source_proof() {
     let store = SessionStore::default();
     let session = store.start_session(Some("agent:eval:demo".to_string()), None);
     record_validation_failure(&store, &session.session_id, "cargo_test");
@@ -2750,7 +2895,7 @@ fn current_evidence_failure_then_content_change_then_different_success_passes() 
     assert_eq!(validation["status"], "mixed");
     assert_eq!(validation["historical_failures"]["count"], 1);
     assert_eq!(validation["unresolved_failures"]["count"], 1);
-    assert_eq!(validation["current_evidence"]["status"], "passed");
+    assert_eq!(validation["current_evidence"]["status"], "unproven");
     assert_eq!(
         validation["current_evidence"]["unresolved_failure_count"],
         0
@@ -2820,7 +2965,7 @@ fn current_evidence_validation_started_before_content_change_then_fail_is_stale(
 }
 
 #[test]
-fn current_evidence_validation_started_after_content_change_can_pass() {
+fn current_evidence_validation_started_after_content_change_is_still_source_unproven() {
     let store = SessionStore::default();
     let session = store.start_session(Some("agent:eval:demo".to_string()), None);
     record_content_mutation(&store, &session.session_id, true);
@@ -2828,7 +2973,7 @@ fn current_evidence_validation_started_after_content_change_can_pass() {
 
     let summary = store.summary(&session.session_id, Some(50)).unwrap();
     let validation = validation_summary_for_session(&summary);
-    assert_eq!(validation["current_evidence"]["status"], "passed");
+    assert_eq!(validation["current_evidence"]["status"], "unproven");
     assert_eq!(validation["current_evidence"]["events_total"], 1);
     assert_eq!(
         validation["current_evidence"]["evidence_after_latest_content_change"],
@@ -2855,6 +3000,102 @@ fn current_evidence_validation_started_before_new_attempt_does_not_enter_new_att
     assert_eq!(validation["status"], "passed");
     assert_eq!(validation["current_evidence"]["status"], "not_run");
     assert_eq!(validation["current_evidence"]["events_total"], 0);
+}
+
+#[test]
+fn unknown_job_handoff_reconciles_only_authoritative_same_execution() {
+    for same_execution in [false, true] {
+        let store = SessionStore::default();
+        let project = "agent:fixture:repo";
+        let session = store.start_session(Some(project.to_string()), None);
+        let target = "target:aaaaaaaaaaaaaaaaaaaaaaaa";
+        let job_id = "job_handoff_original";
+        record_finished_tool(
+            &store,
+            &session.session_id,
+            "cargo_check",
+            json!({"project": project, "validation_target_id": target}),
+            false,
+            json!({"job_id": job_id, "execution_state": "outcome_unknown",
+                "command_started": true, "command_completed": false, "terminal": false,
+                "failure_kind": "outcome_unknown"}),
+        );
+        let pending = store.summary(&session.session_id, Some(50)).unwrap();
+        assert_eq!(
+            validation_summary_for_session(&pending)["unresolved_failures"]["count"],
+            1
+        );
+        let terminal_id = if same_execution {
+            job_id
+        } else {
+            "job_unrelated_replacement"
+        };
+        assert!(store.record_validation_job_terminal(
+            &session.session_id,
+            terminal_id,
+            &[terminal_id],
+            "cargo_check",
+            session_tool_contract("cargo_check"),
+            Some(project.to_string()),
+            target,
+            None,
+            "completed",
+            Some(0),
+            Some(true),
+            Some(pending.updated_at),
+            Some(pending.updated_at),
+            Some(1),
+            None
+        ));
+        let reconciled = store.summary(&session.session_id, Some(50)).unwrap();
+        let result = validation_summary_for_session(&reconciled);
+        assert_eq!(
+            result["unresolved_failures"]["count"],
+            if same_execution { 0 } else { 1 },
+            "{result}"
+        );
+        assert!(
+            reconciled.events.iter().any(|event| event
+                .validation_output_summary
+                .as_ref()
+                .is_some_and(|summary| summary["execution_state"] == "outcome_unknown")),
+            "immutable ledger must retain original uncertainty"
+        );
+        if same_execution {
+            assert_eq!(result["status"], "passed");
+            assert_eq!(result["current_evidence"]["status"], "unproven");
+            for mismatch in ["project", "session", "tool", "target"] {
+                let mut mismatched = reconciled.clone();
+                let terminal = mismatched
+                    .events
+                    .iter_mut()
+                    .find(|event| event.kind == "validation_job_terminal")
+                    .unwrap();
+                match mismatch {
+                    "project" => {
+                        terminal.project = Some("agent:fixture:other".into());
+                        terminal.resolved_project = terminal.project.clone();
+                    }
+                    "session" => terminal.session_id = "other-session".into(),
+                    "tool" => terminal.tool_name = "cargo_test".into(),
+                    "target" => {
+                        let input = terminal
+                            .input_summary
+                            .as_mut()
+                            .expect("terminal validation input summary");
+                        input["execution_identity"] = json!("target:bbbbbbbbbbbbbbbbbbbbbbbb");
+                        input["validation_target_id"] = json!("target:bbbbbbbbbbbbbbbbbbbbbbbb");
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    validation_summary_for_session(&mismatched)["unresolved_failures"]["count"],
+                    1,
+                    "{mismatch} cannot resolve another execution"
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -2932,7 +3173,8 @@ fn validation_job_terminal_inherits_public_failure_expectation() {
     assert_eq!(validation["status"], "expected");
     assert_eq!(validation["latest_status"], "expected");
     assert_eq!(validation["latest"]["success"], false);
-    assert_eq!(validation["latest"]["execution_success"], false);
+    assert!(validation["latest"].get("execution_success").is_none());
+    assert_eq!(validation["latest"]["validation_passed"], false);
     assert_eq!(validation["latest"]["expectation_satisfied"], true);
     assert_eq!(validation["expected_results"], 1);
     assert_eq!(validation["latest"]["exit_code"], 101);
@@ -3024,7 +3266,8 @@ fn validation_job_terminal_inherits_expectation_beyond_default_summary_window() 
     assert_eq!(validation["status"], "expected");
     assert_eq!(validation["latest_status"], "expected");
     assert_eq!(validation["latest"]["success"], false);
-    assert_eq!(validation["latest"]["execution_success"], false);
+    assert!(validation["latest"].get("execution_success").is_none());
+    assert_eq!(validation["latest"]["validation_passed"], false);
     assert_eq!(validation["latest"]["expectation_satisfied"], true);
     assert_eq!(validation["expected_results"], 1);
     assert_eq!(validation["unresolved_failures"]["count"], 0);
@@ -3089,7 +3332,8 @@ fn expected_observation_failure_does_not_resolve_prior_same_identity_validation_
         1
     );
     assert_eq!(validation["latest"]["success"], false);
-    assert_eq!(validation["latest"]["execution_success"], false);
+    assert!(validation["latest"].get("execution_success").is_none());
+    assert_eq!(validation["latest"]["validation_passed"], false);
     assert_eq!(validation["latest"]["expectation_satisfied"], true);
 }
 
@@ -3178,6 +3422,61 @@ fn current_evidence_different_success_without_mutation_keeps_failure_open() {
 }
 
 #[test]
+fn current_evidence_boundary_unavailable_preserves_historical_validation() {
+    let store = SessionStore::new(16, 6);
+    let session = store.start_session(Some("agent:eval:demo".to_string()), None);
+    store
+        .ensure_coding_session(sessions::CodingSessionRequest {
+            project: "agent:eval:demo".to_string(),
+            authority_fingerprint: sessions::TEST_ONLY_PROJECT_SESSION_AUTHORITY_FINGERPRINT
+                .to_string(),
+            resume_session_id: Some(session.session_id.clone()),
+            instruction: Some("validate the retained tail".to_string()),
+            mode: SessionMode::Normal,
+            guards: SessionGuards::default(),
+            execution_context: None,
+            project_instructions: None,
+            transport: SessionTransport::Api,
+            context_refreshed: true,
+            write_scope_verified: true,
+        })
+        .unwrap();
+    for path in ["src/a.rs", "src/b.rs"] {
+        record_finished_tool(
+            &store,
+            &session.session_id,
+            "read_files",
+            json!({"project": "agent:eval:demo", "items": [{"path": path}]}),
+            true,
+            json!({"items": []}),
+        );
+    }
+    record_validation_success(&store, &session.session_id, "cargo_check");
+
+    let summary = store.summary(&session.session_id, Some(50)).unwrap();
+    assert!(summary.events_truncated);
+    assert!(!summary
+        .events
+        .iter()
+        .any(|event| event.kind == "task_instruction"));
+    let validation = validation_summary_for_session(&summary);
+
+    assert_eq!(validation["available"], true);
+    assert_eq!(validation["status"], "passed");
+    assert_eq!(validation["latest_status"], "passed");
+    assert_eq!(validation["events_total"], 1);
+    assert_eq!(validation["successes"], 1);
+    assert_eq!(validation["current_evidence"]["status"], "unknown");
+    assert_eq!(
+        validation["current_evidence"]["reason"],
+        "attempt_boundary_unavailable"
+    );
+    assert_eq!(validation["current_evidence"]["latest_status"], "unknown");
+    assert_eq!(validation["current_evidence"]["events_total"], 0);
+    assert_eq!(validation["current_evidence"]["successes"], 0);
+}
+
+#[test]
 fn current_evidence_same_identity_failure_success_resolves_inside_window() {
     let store = SessionStore::default();
     let session = store.start_session(Some("agent:eval:demo".to_string()), None);
@@ -3189,7 +3488,7 @@ fn current_evidence_same_identity_failure_success_resolves_inside_window() {
     assert_eq!(validation["status"], "mixed");
     assert_eq!(validation["resolved_failures"]["count"], 1);
     assert_eq!(validation["unresolved_failures"]["count"], 0);
-    assert_eq!(validation["current_evidence"]["status"], "passed");
+    assert_eq!(validation["current_evidence"]["status"], "unproven");
     assert_eq!(validation["current_evidence"]["resolved_failure_count"], 1);
     assert_eq!(
         validation["current_evidence"]["unresolved_failure_count"],
@@ -3242,7 +3541,7 @@ fn current_evidence_failed_noop_mutation_does_not_reset() {
     record_finished_tool(
         &store,
         &session.session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({"project": "agent:eval:demo", "changes": [{"kind": "edit", "path": "src/lib.rs"}]}),
         false,
         json!({"state_changed": false, "failure_kind": "stale_precondition"}),
@@ -3378,7 +3677,7 @@ fn record_content_mutation(store: &SessionStore, session_id: &str, proven: bool)
     record_finished_tool(
         store,
         session_id,
-        "apply_text_edits",
+        "edit_project_files",
         json!({"project": "agent:eval:demo", "changes": [{"kind": "edit", "path": "src/lib.rs"}]}),
         true,
         if proven {
@@ -3452,4 +3751,90 @@ fn assert_no_raw_validation_output_fields(value: &Value, context: &str) {
             "{context} must not include {key}: {value}"
         );
     }
+}
+
+#[test]
+fn complete_failure_identity_ignores_log_timing_but_keeps_actual_failure_changes() {
+    let store = SessionStore::default();
+    let session = store.start_session(Some("agent:eval:demo".into()), None);
+    for (name, elapsed, extra, truncated) in [
+        ("tests::same", "0.01", "temporary build /tmp/first", false),
+        ("tests::same", "9.99", "temporary build /tmp/second", false),
+        ("tests::different", "0.01", "different failure", false),
+        ("tests::same", "0.01", "cut output", true),
+    ] {
+        record_finished_tool(
+            &store,
+            &session.session_id,
+            "cargo_test",
+            json!({"project":"agent:eval:demo","execution_identity":"target:aaaaaaaaaaaaaaaaaaaaaaaa"}),
+            false,
+            json!({"exit_code":101,"stdout_tail":format!("{extra}\ntest {name} ... FAILED\ntest result: FAILED. 0 passed; 1 failed; 0 ignored; finished in {elapsed}s\n"),
+                "stderr_tail":"","stdout_truncated":truncated,"stderr_truncated":false}),
+        );
+    }
+    let summary = store.summary(&session.session_id, Some(200)).unwrap();
+    let events = sessions::canonical_tool_call_finished_events(&summary.events);
+    let identities = events
+        .iter()
+        .map(|event| crate::complete_failure_identity_for_session_event(event))
+        .collect::<Vec<_>>();
+    assert!(identities[0].is_some());
+    assert_eq!(identities[0], identities[1]);
+    assert_ne!(identities[1], identities[2]);
+    assert!(identities[3].is_none());
+    let encoded = identities[0].as_ref().unwrap().to_string();
+    assert!(
+        !encoded.contains("temporary")
+            && !encoded.contains("/tmp/")
+            && !encoded.contains("elapsed")
+    );
+    let mut lossy = events[0].clone();
+    lossy.validation_output_summary = Some(
+        json!({"stdout_tail_excerpt":"error with no structured identity","stderr_tail_excerpt":""}),
+    );
+    assert!(crate::complete_failure_identity_for_session_event(&lossy).is_none());
+}
+
+#[test]
+fn typed_validation_skipped_is_unavailable_in_facts_and_projection() {
+    let report = ValidationReport::skipped();
+    let facts = report.facts();
+    assert_eq!(facts.status, Some(ValidationStatus::Unknown));
+    assert_eq!(
+        facts.current_evidence_status,
+        Some(ValidationStatus::Unknown)
+    );
+    assert!(facts.validation_skipped());
+    assert_eq!(facts.successes, 0);
+    assert_eq!(facts.failures, 0);
+    let projection = report.to_value();
+    assert_eq!(projection, crate::skipped_validation_summary());
+    assert_eq!(projection["reason"], "validation_summary_not_requested");
+    assert_eq!(
+        projection["current_evidence"]["reason"],
+        "validation_summary_not_requested"
+    );
+    assert!(projection["events"].as_array().unwrap().is_empty());
+    assert!(!report.continuation_snapshot(false).requested);
+}
+
+#[test]
+fn typed_validation_blockers_do_not_depend_on_display_event_limit() {
+    let store = SessionStore::default();
+    let session = store.start_session(Some("agent:eval:demo".to_string()), None);
+    record_validation_failure(&store, &session.session_id, "cargo_check");
+    let summary = store.summary(&session.session_id, Some(50)).unwrap();
+    let report = ValidationReport::from_events(&summary, &summary.events, 0);
+    let facts = report.facts();
+    assert_eq!(facts.current_status(), Some(ValidationStatus::Failed));
+    assert_eq!(facts.failures, 1);
+    assert_eq!(facts.unresolved_failure_count, 1);
+    assert_eq!(facts.current_unresolved_failure_count, 1);
+    let display = report.to_value();
+    assert!(display["events"].as_array().unwrap().is_empty());
+    assert_eq!(display["events_total"], 1);
+    let continuation = report.continuation_snapshot(true);
+    assert_eq!(continuation.status, "failed");
+    assert_eq!(continuation.unresolved_failure_count, 1);
 }

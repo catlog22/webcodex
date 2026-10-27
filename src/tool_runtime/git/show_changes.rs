@@ -14,20 +14,19 @@ use super::super::helpers::{
 use super::super::tool_result::{SuggestedToolCall, ToolResult};
 use super::super::ToolRuntime;
 use super::diff_hunks::{
-    git_diff_file_hunk_count, git_diff_files_have_omitted_lines, parse_git_diff_hunks,
-    sparsify_complete_diff_files, DEFAULT_MAX_HUNKS, DEFAULT_MAX_HUNK_LINES, MAX_MAX_HUNK_LINES,
+    git_diff_file_hunk_count, git_diff_files_have_omitted_lines,
+    git_diff_hunks_files_include_secret, parse_git_diff_hunks, sparsify_complete_diff_files,
+    DEFAULT_MAX_HUNKS, DEFAULT_MAX_HUNK_LINES, MAX_MAX_HUNK_LINES,
 };
 use super::shared::{
-    parse_fixed_decimal, parse_optional_bool, parse_optional_usize, parse_status_result_field,
-    strip_wire_lf,
+    parse_optional_bool, parse_optional_usize, parse_status_result_field, strip_wire_lf,
+    take_wire_block,
 };
 use crate::runner_protocol::ShellRunRequest;
 use crate::tool_runtime::sessions::{SessionEvent, SessionSummary};
 
 #[cfg(test)]
 pub(crate) const SHOW_CHANGES_SENTINEL: &str = "@@WEBCODEX_SHOW_CHANGES_SEP@@";
-const SHOW_CHANGES_BLOCK_TRAILER_BYTES: usize = 30;
-const SHOW_CHANGES_BLOCK_MAGIC: &[u8; 6] = b"WCSF1:";
 
 const SHOW_CHANGES_DEFAULT_MAX_HUNKS: usize = 20;
 const SHOW_CHANGES_MAX_HUNKS: usize = 100;
@@ -38,12 +37,12 @@ const SHOW_CHANGES_MAX_HUNK_LINES: usize = 240;
 const SHOW_CHANGES_DIFF_CONTEXT_LINES: usize = 20;
 const SHOW_CHANGES_SESSION_SIGNAL_EVENT_LIMIT: usize = 30;
 const SHOW_CHANGES_MAX_SESSION_EVENT_LIMIT: usize = 200;
-/// Maximum number of changed-file records `show_changes` emits on the
+/// Maximum number of changed-file records `read_workspace_changes` emits on the
 /// production side. The total count stays exact (all entries are counted); only
 /// the returned records are bounded so a multi-thousand-file status never
 /// overflows ordinary Runner result-retention headroom.
 pub(crate) const SHOW_CHANGES_MAX_STATUS_FILES: usize = 200;
-/// Production-side stdout budget for the whole `show_changes` command. The
+/// Production-side stdout budget for the whole `read_workspace_changes` command. The
 /// command is constructed so its worst-case raw stdout stays under this value,
 /// which is itself below the ordinary Runner per-stream result-retention default
 /// of 256 KiB, with room for protocol framing and error text. That retention
@@ -238,7 +237,7 @@ pub(crate) fn parse_show_changes_status_observation(
     }
 }
 
-/// Build the graceful-degradation payload returned by `show_changes` when the
+/// Build the graceful-degradation payload returned by `read_workspace_changes` when the
 /// project is not a git repository. Git-backed status/diff is reported as
 /// unavailable without dumping git's noisy stderr/usage; the session
 /// sub-summary is still layered on by the caller via
@@ -275,7 +274,7 @@ fn non_git_show_changes_payload_with_observation(
         "git_error": "not a git repository; git-backed diff unavailable",
         "branch": null,
         "upstream_status": "unobserved",
-        "upstream_reason_code": "git_unavailable",
+        "upstream_reason_code": "non_git_project",
         "upstream": null,
         "ahead": null,
         "behind": null,
@@ -316,7 +315,7 @@ fn non_git_show_changes_payload_with_observation(
         "head_exit": null,
         "warnings": [],
         "suggested_next_actions": [
-            "git-backed status/diff unavailable; project is not a git repository",
+            "git-backed status/diff is not applicable; project is not a git repository",
         ],
         "session": null,
         "exit_code": observation.exit_code,
@@ -330,7 +329,55 @@ fn non_git_show_changes_payload_with_observation(
     payload
 }
 
-/// Build the read-only, production-bounded `show_changes` command.
+/// Project the canonical component rules into the POSIX producer. Git quotes
+/// control characters and backslashes; decode those before applying the policy.
+fn diff_path_policy_function() -> String {
+    use webcodex_core::sensitive_paths::{
+        PUBLIC_DOTENV_TEMPLATE_COMPONENTS, SECRET_COMPONENTS, SECRET_PREFIXES, SECRET_SUFFIXES,
+    };
+    let patterns = SECRET_COMPONENTS
+        .iter()
+        .map(|value| value.to_string())
+        .chain(SECRET_PREFIXES.iter().map(|value| format!("{value}*")))
+        .chain(SECRET_SUFFIXES.iter().map(|value| format!("*{value}")))
+        .collect::<Vec<_>>()
+        .join("|");
+    // Rust's Unicode lowercase folds the Kelvin sign to ASCII k. C-locale
+    // tr handles ASCII only, so the producer also preserves this policy fold.
+    // The header and ---/+++ lines repeat the same path. Cache one exact
+    // decoded, prefix-free path, including refusals, without sharing a decision
+    // between distinct rename sides or changing normalization and policy rules.
+    r#"path_policy_key=; path_policy_status=; tab=$(printf '\t');
+    diff_path_allowed() {
+      gp=$1;
+      gp=${gp%%"$tab"*};
+      case "$gp" in '"'*'"') gp=${gp#'"'}; gp=${gp%'"'}; gp=$(printf '%b.' "$gp"); gp=${gp%.} ;; esac;
+      case "$gp" in /dev/null) return 0 ;; a/*|b/*) gp=${gp#??} ;; *) return 1 ;; esac;
+      if [ -n "$path_policy_status" ] && [ "$gp" = "$path_policy_key" ]; then return "$path_policy_status"; fi;
+      path_policy_key=$gp; path_policy_status=1;
+      gp=$(printf '%s.' "$gp" | tr '\\' '/' | tr '[:upper:]' '[:lower:]' | sed 's/K/k/g'); gp=${gp%.};
+      while [ -n "$gp" ]; do
+        case "$gp" in */*) pc=${gp%%/*}; gp=${gp#*/}; last=0 ;; *) pc=$gp; gp=; last=1 ;; esac;
+        if [ "$last" = 1 ]; then case "$pc" in __PUBLIC__) continue ;; esac; fi;
+        case "$pc" in __SECRET__) return 1 ;; esac;
+      done;
+      path_policy_status=0; return 0;
+    }
+    # Binary or metadata-only patches lack ---/+++ headers. The fallback
+    # accepts an unambiguous same-path header only when both paths are allowed.
+    diff_header_allowed() {
+      dh=${1#diff --git };
+      case "$dh" in a/*' b/'*) ;; *) return 1 ;; esac;
+      dh_old=${dh%% b/*}; dh_new=${dh#* b/};
+      case "$dh_old" in a/*) ;; *) return 1 ;; esac;
+      [ "${dh_old#a/}" = "$dh_new" ] || return 1;
+      diff_path_allowed "$dh_old" && diff_path_allowed "b/$dh_new";
+    }"#
+    .replace("__PUBLIC__", &PUBLIC_DOTENV_TEMPLATE_COMPONENTS.join("|"))
+    .replace("__SECRET__", &patterns)
+}
+
+/// Build the read-only, production-bounded `read_workspace_changes` command.
 ///
 /// Unlike an unbounded `git status` capture, the status is *streamed* line by
 /// line through a POSIX `while read` loop that:
@@ -361,7 +408,7 @@ fn non_git_show_changes_payload_with_observation(
 /// literal and never collide with Rust `format!` brace escaping.
 ///
 /// No Python/Node helper or external temp script is used; only POSIX `sh`,
-/// `git`, `printf`, and `grep`. No project worktree is mutated.
+/// `git`, `printf`, `grep`, `tr`, and `sed`. No project worktree is mutated.
 pub(crate) fn show_changes_command(
     include_diff: bool,
     max_hunks: usize,
@@ -370,15 +417,30 @@ pub(crate) fn show_changes_command(
     let status_files_limit = SHOW_CHANGES_MAX_STATUS_FILES;
     let diff_part = if include_diff {
         r#"; {
-               git diff --unified=__DIFF_CONTEXT_LINES__; printf 'diff_exit=%s\n' "$?";
+               git diff --no-ext-diff --no-textconv --no-color --src-prefix=a/ --dst-prefix=b/ --unified=__DIFF_CONTEXT_LINES__; printf 'diff_exit=%s\n' "$?";
              } | {
                hc=0; in_hunk=0; lc=0; diff_exit_raw=; diff_bytes=0; file_buf=; stop_emit=0;
                trunc_count=0; trunc_lines=0; trunc_bytes=0; trunc_bytes_in_hunk=0; have=0; pending=;
+               old_ok=0; new_ok=0; refused=0; policy_omitted=0; header_verified=0;
+               __PATH_POLICY__
                while IFS= read -r dl; do
                  next=$dl; dl=$pending; pending=$next;
                  if [ "$have" = 0 ]; then have=1; continue; fi;
                  case "$dl" in
+                   '--- '*|'+++ '*)
+                     if [ "$in_hunk" = 0 ]; then
+                       if diff_path_allowed "${dl#????}"; then
+                         case "$dl" in '--- '*) old_ok=1 ;; '+++ '*) new_ok=1 ;; esac;
+                       else
+                         if [ "$refused" = 0 ]; then policy_omitted=$((policy_omitted+1)); fi;
+                         refused=1; file_buf=;
+                       fi;
+                     fi ;;
+                 esac;
+                 case "$dl" in 'diff --git '*) ;; *) if [ "$refused" = 1 ]; then continue; fi ;; esac;
+                 case "$dl" in
                    '@@ '*)
+                     if [ "$old_ok" != 1 ] || [ "$new_ok" != 1 ]; then policy_omitted=$((policy_omitted+1)); refused=1; file_buf=; in_hunk=0; continue; fi;
                      if [ "$stop_emit" = 1 ]; then in_hunk=0; file_buf=; continue; fi;
                      if [ "$hc" -ge __HUNK_LIMIT__ ]; then trunc_count=1; stop_emit=1; in_hunk=0; file_buf=; continue; fi;
                      preamble_len=${#file_buf}; header_len=$((${#dl}+1)); candidate_len=$((preamble_len+header_len));
@@ -388,7 +450,16 @@ pub(crate) fn show_changes_command(
                    *)
                      case "$dl" in
                        'diff --git '*)
-                         in_hunk=0; file_buf=;
+                         # Handle previous no-hunk preamble before next file.
+                         if [ "$stop_emit" = 0 ] && [ "$refused" = 0 ] && [ -n "$file_buf" ]; then
+                           if [ "$header_verified" = 1 ] || { [ "$old_ok" = 1 ] && [ "$new_ok" = 1 ]; }; then
+                             printf '%s' "$file_buf"; diff_bytes=$((diff_bytes+${#file_buf}));
+                           else
+                             policy_omitted=$((policy_omitted+1));
+                           fi;
+                         fi;
+                         in_hunk=0; file_buf=; old_ok=0; new_ok=0; refused=0; header_verified=0;
+                         if diff_header_allowed "$dl"; then header_verified=1; fi;
                          if [ "$stop_emit" = 0 ]; then
                            line_len=$((${#dl}+1));
                            if [ "$((diff_bytes + line_len))" -gt __DIFF_BYTE_BUDGET__ ]; then trunc_bytes=1; stop_emit=1; else file_buf="$dl
@@ -413,11 +484,17 @@ pub(crate) fn show_changes_command(
                  esac;
                done;
                case "$pending" in diff_exit=*) diff_exit_raw=${pending#diff_exit=} ;; *) diff_exit_raw= ;; esac;
-               if [ "$stop_emit" = 0 ] && [ -n "$file_buf" ]; then printf '%s' "$file_buf"; diff_bytes=$((diff_bytes+${#file_buf})); fi;
+               if [ "$stop_emit" = 0 ] && [ "$refused" = 0 ] && [ -n "$file_buf" ]; then
+                 if [ "$header_verified" = 1 ] || { [ "$old_ok" = 1 ] && [ "$new_ok" = 1 ]; }; then
+                   printf '%s' "$file_buf"; diff_bytes=$((diff_bytes+${#file_buf}));
+                 else
+                   policy_omitted=$((policy_omitted+1));
+                 fi;
+               fi;
                diff_wire_bytes=$diff_bytes; diff_frame_bytes=$diff_wire_bytes;
                if [ "$diff_frame_bytes" -gt 0 ]; then diff_frame_bytes=$((diff_frame_bytes-1)); fi;
-               dm=$(printf 'diff_exit=%s\ndiff_hunks_returned=%s\ndiff_hunks_truncated=%s\ndiff_trunc_hunk_count=%s\ndiff_trunc_hunk_lines=%s\ndiff_trunc_bytes=%s\ndiff_trunc_bytes_in_hunk=%s\ndiff_bytes=%s' \
-                 "$diff_exit_raw" "$hc" "$((trunc_count || trunc_lines || trunc_bytes))" "$trunc_count" "$trunc_lines" "$trunc_bytes" "$trunc_bytes_in_hunk" "$diff_frame_bytes");
+               dm=$(printf 'diff_exit=%s\ndiff_hunks_returned=%s\ndiff_hunks_truncated=%s\ndiff_trunc_hunk_count=%s\ndiff_trunc_hunk_lines=%s\ndiff_trunc_bytes=%s\ndiff_trunc_bytes_in_hunk=%s\ndiff_bytes=%s\ndiff_policy_files_omitted=%s' \
+                 "$diff_exit_raw" "$hc" "$((trunc_count || trunc_lines || trunc_bytes))" "$trunc_count" "$trunc_lines" "$trunc_bytes" "$trunc_bytes_in_hunk" "$diff_frame_bytes" "$policy_omitted");
                printf '%s\n' "$dm"; printf 'WCSF1:D:%010d:%010d\n' "$diff_wire_bytes" "$(( ${#dm}+1 ))";
              }"#
         .replace("__HUNK_LIMIT__", &max_hunks.to_string())
@@ -427,6 +504,7 @@ pub(crate) fn show_changes_command(
             &SHOW_CHANGES_DIFF_CONTEXT_LINES.to_string(),
         )
         .replace("__DIFF_BYTE_BUDGET__", &SHOW_CHANGES_DIFF_BYTES.to_string())
+        .replace("__PATH_POLICY__", &diff_path_policy_function())
     } else {
         String::new()
     };
@@ -494,7 +572,7 @@ pub(crate) fn show_changes_command(
            fi;
            hm=$(printf 'head_exit=%s\nhead_truncated=%s\nhead_bytes=%s' "$head_exit_raw" "$he" "$head_frame_bytes");
            printf '%s\n' "$hm"; printf 'WCSF1:H:%010d:%010d\n' "$head_frame_bytes" "$(( ${#hm}+1 ))";
-           { git diff --stat 2>/dev/null; printf '__WEBCODEX_STAT_EXIT__=%s\n' "$?"; } | {
+           { git diff --no-ext-diff --no-textconv --stat 2>/dev/null; printf '__WEBCODEX_STAT_EXIT__=%s\n' "$?"; } | {
              sb=0; se=0; stat_exit_raw=; have=0; pending=;
              while IFS= read -r sline; do
                next=$sline; sline=$pending; pending=$next;
@@ -551,7 +629,7 @@ pub(crate) fn show_changes_command(
         .join("\n")
 }
 
-/// Parsed, production-bounded `show_changes` stdout frames. The status result
+/// Parsed, production-bounded `read_workspace_changes` stdout frames. The status result
 /// frame carries the authoritative `files_*` and per-category counts reported
 /// by the command's streaming loop, so totals stay exact even when the
 /// returned file records were truncated by the production-side limit.
@@ -607,6 +685,7 @@ pub(crate) struct ShowChangesStdout {
     /// trailing diff metadata frame. `None` when `include_diff` is false or the
     /// frame is absent.
     pub(crate) diff_hunks_returned: Option<usize>,
+    pub(crate) diff_policy_files_omitted: Option<usize>,
     /// Whether the production-side loop dropped any diff data.
     pub(crate) diff_hunks_truncated: Option<bool>,
     /// Independent production-side diff truncation flags.
@@ -622,31 +701,6 @@ pub(crate) struct ShowChangesStdout {
     /// Bytes emitted in the bounded diff segment, parsed from the diff metadata
     /// frame.
     pub(crate) diff_bytes: Option<usize>,
-}
-
-fn parse_show_changes_wire_block(
-    stdout: &str,
-    end: usize,
-    kind: u8,
-) -> Option<(&str, &str, usize)> {
-    let bytes = stdout.as_bytes();
-    let trailer_start = end.checked_sub(SHOW_CHANGES_BLOCK_TRAILER_BYTES)?;
-    let trailer = bytes.get(trailer_start..end)?;
-    if trailer.get(..6)? != SHOW_CHANGES_BLOCK_MAGIC
-        || trailer.get(6).copied()? != kind
-        || trailer.get(7).copied()? != b':'
-        || trailer.get(18).copied()? != b':'
-        || trailer.get(29).copied()? != b'\n'
-    {
-        return None;
-    }
-    let data_wire_bytes = parse_fixed_decimal(trailer.get(8..18)?)?;
-    let meta_wire_bytes = parse_fixed_decimal(trailer.get(19..29)?)?;
-    let meta_start = trailer_start.checked_sub(meta_wire_bytes)?;
-    let data_start = meta_start.checked_sub(data_wire_bytes)?;
-    let data = std::str::from_utf8(bytes.get(data_start..meta_start)?).ok()?;
-    let meta = std::str::from_utf8(bytes.get(meta_start..trailer_start)?).ok()?;
-    Some((data, meta, data_start))
 }
 
 #[cfg(test)]
@@ -696,22 +750,19 @@ pub(crate) fn framed_clean_show_changes_test_stdout(subject: &str, include_diff:
 }
 
 fn parse_framed_show_changes_stdout(stdout: &str, include_diff: bool) -> Option<ShowChangesStdout> {
-    let mut cursor = stdout.len();
+    let mut remaining = stdout;
+    let mut block = |kind| take_wire_block(&mut remaining, b"WCSF1:", kind);
     let (diff, diff_meta) = if include_diff {
-        let (body, meta, start) = parse_show_changes_wire_block(stdout, cursor, b'D')?;
-        cursor = start;
+        let (body, meta) = block(b'D')?;
         (strip_wire_lf(body)?, strip_wire_lf(meta)?)
     } else {
         (String::new(), String::new())
     };
-    let (numstat, numstat_meta, start) = parse_show_changes_wire_block(stdout, cursor, b'N')?;
-    cursor = start;
-    let (stat, stat_meta, start) = parse_show_changes_wire_block(stdout, cursor, b'T')?;
-    cursor = start;
-    let (head, head_meta, start) = parse_show_changes_wire_block(stdout, cursor, b'H')?;
-    cursor = start;
-    let (status, status_result, start) = parse_show_changes_wire_block(stdout, cursor, b'S')?;
-    if start != 0 {
+    let (numstat, numstat_meta) = block(b'N')?;
+    let (stat, stat_meta) = block(b'T')?;
+    let (head, head_meta) = block(b'H')?;
+    let (status, status_result) = block(b'S')?;
+    if !remaining.is_empty() {
         return None;
     }
     let status = strip_wire_lf(status)?;
@@ -754,6 +805,7 @@ fn parse_framed_show_changes_stdout(stdout: &str, include_diff: bool) -> Option<
         numstat_truncated: parse_optional_bool(&numstat_meta, "numstat_truncated"),
         numstat_bytes: parse_optional_usize(&numstat_meta, "numstat_bytes"),
         diff_hunks_returned: parse_optional_usize(&diff_meta, "diff_hunks_returned"),
+        diff_policy_files_omitted: parse_optional_usize(&diff_meta, "diff_policy_files_omitted"),
         diff_hunks_truncated: parse_optional_bool(&diff_meta, "diff_hunks_truncated"),
         diff_trunc_hunk_count: parse_optional_bool(&diff_meta, "diff_trunc_hunk_count"),
         diff_trunc_hunk_lines: parse_optional_bool(&diff_meta, "diff_trunc_hunk_lines"),
@@ -1161,7 +1213,7 @@ pub(crate) fn parse_show_changes_output(
 }
 
 /// Map a full `git diff` exit code to the structured `diff_status` object
-/// reported by `show_changes`. `observed` means the diff exit code was
+/// reported by `read_workspace_changes`. `observed` means the diff exit code was
 /// captured (0 = clean diff, non-zero = command failure); `command_failed`
 /// means a non-zero exit was observed; `output_unavailable` means the exit
 /// code could not be captured by the production-side loop.
@@ -1464,7 +1516,12 @@ pub(crate) fn parse_show_changes_output_with_observation(
         }
     }
 
-    let suggested_next_actions = if status_observed {
+    let suggested_next_actions = if observation.non_git() {
+        vec![
+            "git-backed status/diff is not applicable; continue with non-git review evidence"
+                .to_string(),
+        ]
+    } else if status_observed {
         suggested_next_actions_for(
             clean.unwrap_or(false),
             untracked > 0,
@@ -1483,6 +1540,34 @@ pub(crate) fn parse_show_changes_output_with_observation(
         Some(diff) => parse_git_diff_hunks(diff, max_hunks, max_hunk_lines),
         None => (Vec::new(), 0, false),
     };
+    let before_filter_count = diff_hunks.len();
+    let before_filter_hunks = git_diff_file_hunk_count(&diff_hunks).unwrap_or(0);
+    diff_hunks.retain(|file| {
+        !git_diff_hunks_files_include_secret(std::slice::from_ref(file))
+            && ["path", "old_path"]
+                .into_iter()
+                .all(|field| match file.get(field) {
+                    Some(Value::Null) => true,
+                    Some(Value::String(path)) => {
+                        !path.is_empty() && validate_project_relative_path(path).is_ok()
+                    }
+                    _ => false,
+                })
+            && ["path", "old_path"]
+                .into_iter()
+                .any(|field| file.get(field).is_some_and(Value::is_string))
+    });
+    let parser_policy_omitted = before_filter_count - diff_hunks.len();
+    let removed_hunks =
+        before_filter_hunks.saturating_sub(git_diff_file_hunk_count(&diff_hunks).unwrap_or(0));
+    let policy_omitted = frames.diff_policy_files_omitted.unwrap_or(0) + parser_policy_omitted;
+    if policy_omitted > 0 {
+        warnings.push(json!({
+            "kind": "diff_protected_paths_omitted",
+            "reason_code": "diff_protected_paths_omitted",
+            "message": "protected or unverifiable file diffs were omitted",
+        }));
+    }
 
     // Collect stable truncation reason codes from the per-segment metadata
     // frames the production-side command emits. Each reason corresponds to a
@@ -1517,6 +1602,9 @@ pub(crate) fn parse_show_changes_output_with_observation(
     }
     if frames.diff_trunc_bytes_in_hunk == Some(true) {
         truncation_reasons.push("diff_hunk_byte_budget");
+    }
+    if policy_omitted > 0 {
+        truncation_reasons.push("diff_protected_paths_omitted");
     }
     let output_truncated = !truncation_reasons.is_empty();
     // Every segment must fit its independent production budget and match its
@@ -1590,9 +1678,16 @@ pub(crate) fn parse_show_changes_output_with_observation(
         // transport. Its reported counts are authoritative for aggregate
         // dropped hunks/lines; per-hunk source completeness is carried by the
         // single authoritative `source_completeness` annotation above.
-        let hunk_count = frames.diff_hunks_returned.unwrap_or(parser_hunk_count);
-        let hunks_truncated =
-            frames.diff_hunks_truncated.unwrap_or(parser_truncated) || parser_truncated;
+        let hunk_count = frames
+            .diff_hunks_returned
+            .unwrap_or(parser_hunk_count)
+            .saturating_sub(removed_hunks);
+        let hunks_truncated = frames.diff_hunks_truncated.unwrap_or(parser_truncated)
+            || parser_truncated
+            || policy_omitted > 0;
+        if policy_omitted > 0 {
+            output["diff_policy_files_omitted"] = json!(policy_omitted);
+        }
         output["hunks"] = json!(diff_hunks);
         output["hunk_count"] = json!(hunk_count);
         output["hunks_truncated"] = json!(hunks_truncated);
@@ -1658,33 +1753,18 @@ fn untracked_preview_path_is_invalid(path: &str) -> bool {
 }
 
 fn untracked_preview_path_is_sensitive(path: &str) -> bool {
-    let normalized = path.replace('\\', "/").to_ascii_lowercase();
-    normalized
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != ".")
-        .any(|part| {
-            matches!(
-                part,
-                ".git"
-                    | "target"
-                    | "node_modules"
-                    | "project-registry"
-                    | "projects.d"
-                    | "runner.toml"
-                    | "agent.toml"
-                    | "webcodex.env"
-                    | ".env"
-                    | "secrets"
-                    | "tokens"
-                    | "id_rsa"
-                    | "id_ed25519"
-            ) || part.starts_with(".env")
-                || part.starts_with("runner.toml")
-                || part.starts_with("agent.toml")
-                || part.starts_with("webcodex.env")
-                || part.ends_with(".pem")
-                || part.ends_with(".key")
-        })
+    webcodex_core::sensitive_paths::is_secret_path(path)
+        || path
+            .replace('\\', "/")
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .map(str::to_ascii_lowercase)
+            .any(|part| {
+                matches!(
+                    part.as_str(),
+                    "target" | "node_modules" | "id_rsa" | "id_ed25519"
+                )
+            })
 }
 
 fn untracked_preview_from_bytes(
@@ -1914,7 +1994,10 @@ fn suggested_next_actions_for(
         push_unique_action(&mut actions, "commit or revert changes after review");
     }
     if session.failed {
-        push_unique_action(&mut actions, "review failed tool calls in session_summary");
+        push_unique_action(
+            &mut actions,
+            "review failed tool calls in read_session_summary",
+        );
     }
     if session.write_like {
         push_unique_action(&mut actions, "review changed paths from this session");
@@ -2012,7 +2095,10 @@ fn refresh_show_changes_suggestions(output: &mut Value, session: Option<SessionA
             "git status unavailable; inspect the status failure before relying on worktree cleanliness".to_string()
         }];
         if session.failed {
-            push_unique_action(&mut actions, "review failed tool calls in session_summary");
+            push_unique_action(
+                &mut actions,
+                "review failed tool calls in read_session_summary",
+            );
         }
         if session.write_like {
             push_unique_action(&mut actions, "review changed paths from this session");
@@ -2074,11 +2160,17 @@ fn set_show_changes_verdict(output: &mut Value) {
         }
         _ => {}
     }
-    if !git_available || non_git_project {
+    if non_git_project {
+        push_unique_reason(&mut warning_reasons, "non_git_project");
+        push_unique_action(
+            &mut actions,
+            "git-backed status/diff is not applicable; continue with non-git review evidence",
+        );
+    } else if !git_available {
         push_unique_reason(&mut warning_reasons, "git_unavailable");
         push_unique_action(
             &mut actions,
-            "git-backed status/diff unavailable; continue with non-git review evidence",
+            "git-backed status/diff unavailable; inspect Git availability before relying on worktree review",
         );
     }
 
@@ -2088,7 +2180,10 @@ fn set_show_changes_verdict(output: &mut Value) {
         .is_some_and(|clean| !clean)
     {
         push_unique_reason(&mut warning_reasons, "workspace_dirty");
-        push_unique_action(&mut actions, "review workspace changes with show_changes");
+        push_unique_action(
+            &mut actions,
+            "review workspace changes with read_workspace_changes",
+        );
     }
     if output
         .pointer("/counts/conflicted")
@@ -2109,7 +2204,7 @@ fn set_show_changes_verdict(output: &mut Value) {
         push_unique_reason(&mut blocking_reasons, "git_inspection_failed");
         push_unique_action(
             &mut actions,
-            "rerun show_changes or inspect git status directly",
+            "rerun read_workspace_changes or inspect git status directly",
         );
     }
 
@@ -2125,8 +2220,22 @@ fn set_show_changes_verdict(output: &mut Value) {
         .get("hunks_truncated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    if hunks_truncated {
-        actions.retain(|action| action != "review workspace changes with show_changes");
+    let policy_diff_omitted = output
+        .get("diff_policy_files_omitted")
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count > 0);
+    if policy_diff_omitted {
+        actions.retain(|action| action != "review workspace changes with read_workspace_changes");
+        push_unique_reason(&mut warning_reasons, "diff_protected_paths_omitted");
+        push_unique_action(
+            &mut actions,
+            "protected or unverifiable file diffs were omitted; if further review is needed, call read_git_diff_hunks with explicitly selected ordinary paths",
+        );
+    }
+    // A whole-worktree handoff would include the refused files again. Preserve
+    // the partial observation without proposing that uncallable recovery scope.
+    if hunks_truncated && !policy_diff_omitted {
+        actions.retain(|action| action != "review workspace changes with read_workspace_changes");
         let diff_truncation_reasons = output
             .get("truncation_reasons")
             .and_then(Value::as_array)
@@ -2143,13 +2252,7 @@ fn set_show_changes_verdict(output: &mut Value) {
         let page_truncated = diff_truncation_reasons
             .iter()
             .any(|reason| matches!(*reason, "diff_hunk_count_limit" | "diff_byte_budget"));
-        let hunk_line_truncated = diff_truncation_reasons
-            .iter()
-            .any(|reason| *reason == "diff_hunk_line_limit");
-        let current_hunk_omitted = hunk_line_truncated
-            || diff_truncation_reasons
-                .iter()
-                .any(|reason| *reason == "diff_hunk_byte_budget");
+        let hunk_line_truncated = diff_truncation_reasons.contains(&"diff_hunk_line_limit");
         // show_changes currently reports line truncation at the aggregate diff
         // level, not as authoritative per-hunk provenance. Keep whole-worktree
         // scope rather than guessing which returned path owns the omitted lines.
@@ -2163,14 +2266,8 @@ fn set_show_changes_verdict(output: &mut Value) {
             .get("project")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let recovery_kind = match (page_truncated, current_hunk_omitted) {
-            (true, true) => "mixed",
-            (true, false) => "page",
-            (false, true) => "hunk_lines",
-            (false, false) => unreachable!("truncated show_changes diff needs a recovery kind"),
-        };
-        let canonical_recovery_call = SuggestedToolCall::new(
-            "git_diff_hunks",
+        let canonical_recovery_call = SuggestedToolCall::mechanically_followable(
+            "read_git_diff_hunks",
             json!({
                 "project": project,
                 "cached": false,
@@ -2182,35 +2279,23 @@ fn set_show_changes_verdict(output: &mut Value) {
         )
         .to_value();
         output["diff_review_handoff"] = json!({
-            "scope": "worktree",
-            "reason": "show_changes_diff_truncated",
-            "truncation_reasons": diff_truncation_reasons,
-            "recovery": {
-                "kind": recovery_kind,
-                "tool": canonical_recovery_call["tool"].clone(),
-                "arguments": canonical_recovery_call["arguments"].clone(),
-                "safe_continuation_for_omitted_lines": if current_hunk_omitted {
-                    Value::Bool(false)
-                } else {
-                    Value::Null
-                },
-            },
+            "next_call": canonical_recovery_call,
         });
         push_unique_reason(&mut warning_reasons, "truncated_by_limit");
         push_unique_action(
             &mut actions,
-            "continue the diff review with git_diff_hunks; use paths to narrow scope when useful",
+            "continue the diff review with read_git_diff_hunks; use paths to narrow scope when useful",
         );
         if page_truncated {
             push_unique_action(
                 &mut actions,
-                "follow git_diff_hunks.next_continuation while has_more=true",
+                "follow read_git_diff_hunks recovery.later_hunks.next_call while has_more=true",
             );
         }
         if hunk_line_truncated {
             push_unique_action(
                 &mut actions,
-                "follow git_diff_hunks recovery.omitted_lines.next_call; after the fresh handoff observation it may use bounded refinement or an exact hunk-fragment continuation",
+                "follow read_git_diff_hunks recovery.current_hunk.next_call; after the fresh handoff observation it may use bounded refinement or an exact hunk-fragment continuation",
             );
         }
     } else if let Some(object) = output.as_object_mut() {
@@ -2222,7 +2307,7 @@ fn set_show_changes_verdict(output: &mut Value) {
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if untracked_previews_truncated {
-        actions.retain(|action| action != "review workspace changes with show_changes");
+        actions.retain(|action| action != "review workspace changes with read_workspace_changes");
         push_unique_reason(&mut warning_reasons, "truncated_by_limit");
         push_unique_action(
             &mut actions,
@@ -2459,6 +2544,7 @@ impl ToolRuntime {
             .runner_registry
             .enqueue_run(
                 ShellRunRequest {
+                    login: false,
                     client_id,
                     cwd: Some(proj.path.clone()),
                     command: "git status --porcelain".to_string(),
@@ -2490,6 +2576,63 @@ impl ToolRuntime {
         }
     }
 
+    /// Initial workspace review observes identity and metadata in one Runner hop.
+    /// The later frozen diff observation rechecks this identity before publication.
+    pub(crate) async fn workspace_review_metadata(
+        &self,
+        project: &str,
+        session_id: Option<&str>,
+    ) -> Result<
+        (
+            super::super::git_review_snapshot::GitReviewSourceIdentity,
+            ToolResult,
+        ),
+        ToolResult,
+    > {
+        const FRAME: &str = "WEBCODEX_REVIEW_METADATA_BEGIN";
+        let command = format!("(\n{}\n)\nwc_freeze_exit=$?\nif [ \"$wc_freeze_exit\" -ne 0 ]; then exit \"$wc_freeze_exit\"; fi\nprintf '{}\\n'\n{}",
+            super::super::changes::workspace_freeze_command(true), FRAME,
+            show_changes_command(false, SHOW_CHANGES_DEFAULT_MAX_HUNKS, SHOW_CHANGES_DEFAULT_MAX_HUNK_LINES));
+        let mut output = self
+            .run_project_internal_posix_script_capture(project, command, 60, None)
+            .await
+            .map_err(ToolResult::err)?;
+        if output.stdout_truncated || output.error.is_some() || output.exit_code != Some(0) {
+            return Err(ToolResult::err(
+                "workspace review metadata observation failed",
+            ));
+        }
+        let (identity, metadata) = output
+            .stdout
+            .split_once(&format!("{FRAME}\n"))
+            .ok_or_else(|| ToolResult::err("workspace review metadata frame missing"))?;
+        let (head_commit, frozen_tree, status) =
+            super::super::changes::parse_workspace_freeze(identity, true)?;
+        let source = super::super::git_review_snapshot::GitReviewSourceIdentity::Workspace {
+            head_commit,
+            frozen_tree,
+            status_fingerprint: status.expect("validated review status"),
+        };
+        output.stdout = metadata.to_owned();
+        let result = self
+            .show_changes_from_capture(
+                project,
+                session_id,
+                false,
+                SHOW_CHANGES_DEFAULT_MAX_HUNKS,
+                SHOW_CHANGES_DEFAULT_MAX_HUNK_LINES,
+                0,
+                SHOW_CHANGES_SESSION_SIGNAL_EVENT_LIMIT,
+                output,
+            )
+            .await;
+        if result.success {
+            Ok((source, result))
+        } else {
+            Err(result)
+        }
+    }
+
     pub(crate) async fn show_changes(
         &self,
         project: String,
@@ -2498,6 +2641,38 @@ impl ToolRuntime {
         max_hunks: Option<usize>,
         max_hunk_lines: Option<usize>,
         session_event_limit: Option<usize>,
+    ) -> ToolResult {
+        self.show_changes_observation(
+            project,
+            session_id,
+            include_diff,
+            max_hunks,
+            max_hunk_lines,
+            session_event_limit,
+            false,
+        )
+        .await
+    }
+
+    /// Passive card refresh is metadata-only; file content is explicitly lazy.
+    /// Keep the shared safe configuration and do not record a Session.
+    pub(in crate::tool_runtime) async fn workspace_metadata_for_presentation(
+        &self,
+        project: String,
+    ) -> ToolResult {
+        self.show_changes_observation(project, None, Some(false), None, None, None, true)
+            .await
+    }
+
+    async fn show_changes_observation(
+        &self,
+        project: String,
+        session_id: Option<String>,
+        include_diff: Option<bool>,
+        max_hunks: Option<usize>,
+        max_hunk_lines: Option<usize>,
+        session_event_limit: Option<usize>,
+        read_only_presentation: bool,
     ) -> ToolResult {
         let include_diff = include_diff.unwrap_or(false);
         let max_hunks = max_hunks
@@ -2514,7 +2689,30 @@ impl ToolRuntime {
         let session_summary_limit = recent_events_limit
             .max(SHOW_CHANGES_SESSION_SIGNAL_EVENT_LIMIT)
             .min(SHOW_CHANGES_MAX_SESSION_EVENT_LIMIT);
-        let command = show_changes_command(include_diff, max_hunks, max_hunk_lines);
+        let mut command = show_changes_command(include_diff, max_hunks, max_hunk_lines);
+        if read_only_presentation {
+            command = format!(
+                r#"set -eu
+umask 077
+GIT_OPTIONAL_LOCKS=0; export GIT_OPTIONAL_LOCKS
+{safe_config}
+git() {{
+  if [ "$1" = diff ]; then
+    shift
+    diff_base=HEAD
+    if ! command git -c include.path="$changes_git_overlay" -c core.fsmonitor=false rev-parse --verify HEAD >/dev/null 2>&1; then
+      diff_base=$(printf '' | command git -c include.path="$changes_git_overlay" -c core.fsmonitor=false hash-object -t tree --stdin)
+    fi
+    command git -c include.path="$changes_git_overlay" -c core.fsmonitor=false diff --no-ext-diff --no-textconv "$diff_base" "$@"
+  else
+    command git -c include.path="$changes_git_overlay" -c core.fsmonitor=false "$@"
+  fi
+}}
+set +e
+{command}"#,
+                safe_config = super::super::changes::CHANGES_GIT_SAFE_CONFIG_SETUP,
+            );
+        }
         let output = match self
             .run_project_internal_posix_script_capture(&project, command, 30, None)
             .await
@@ -2522,6 +2720,30 @@ impl ToolRuntime {
             Ok(output) => output,
             Err(e) => return ToolResult::err(e),
         };
+        self.show_changes_from_capture(
+            &project,
+            session_id.as_deref(),
+            include_diff,
+            max_hunks,
+            max_hunk_lines,
+            recent_events_limit,
+            session_summary_limit,
+            output,
+        )
+        .await
+    }
+
+    async fn show_changes_from_capture(
+        &self,
+        project: &str,
+        session_id: Option<&str>,
+        include_diff: bool,
+        max_hunks: usize,
+        max_hunk_lines: usize,
+        recent_events_limit: usize,
+        session_summary_limit: usize,
+        output: super::super::shell::ProjectCommandOutput,
+    ) -> ToolResult {
         let frames = split_show_changes_stdout(&output.stdout, include_diff);
         let status_observation = parse_show_changes_status_observation(
             &frames.status,
@@ -2542,12 +2764,11 @@ impl ToolRuntime {
                 include_diff,
                 status_observation,
             );
-            let session_summary = session_id
-                .as_deref()
-                .and_then(|id| self.sessions.summary(id, Some(session_summary_limit)));
+            let session_summary =
+                session_id.and_then(|id| self.sessions.summary(id, Some(session_summary_limit)));
             apply_show_changes_session(
                 &mut payload,
-                session_id.as_deref(),
+                session_id,
                 session_summary,
                 (recent_events_limit > 0).then_some(recent_events_limit),
             );
@@ -2575,12 +2796,11 @@ impl ToolRuntime {
             payload["untracked_previews"] = json!(previews);
             payload["untracked_previews_truncated"] = json!(truncated);
         }
-        let session_summary = session_id
-            .as_deref()
-            .and_then(|id| self.sessions.summary(id, Some(session_summary_limit)));
+        let session_summary =
+            session_id.and_then(|id| self.sessions.summary(id, Some(session_summary_limit)));
         apply_show_changes_session(
             &mut payload,
-            session_id.as_deref(),
+            session_id,
             session_summary,
             (recent_events_limit > 0).then_some(recent_events_limit),
         );
@@ -2601,23 +2821,23 @@ impl ToolRuntime {
             ToolResult::ok(payload)
         } else {
             let error = if !status_observed {
-                "show_changes git status unavailable".to_string()
+                "read_workspace_changes git status unavailable".to_string()
             } else if !diff_stat_ok {
                 match frames.diff_stat_exit {
                     Some(code) => format!(
-                        "show_changes git diff-stat inspection failed with exit code {code}"
+                        "read_workspace_changes git diff-stat inspection failed with exit code {code}"
                     ),
-                    None => "show_changes git diff-stat inspection unavailable".to_string(),
+                    None => "read_workspace_changes git diff-stat inspection unavailable".to_string(),
                 }
             } else if include_diff && !diff_ok {
                 match frames.diff_exit {
                     Some(code) => {
-                        format!("show_changes git diff inspection failed with exit code {code}")
+                        format!("read_workspace_changes git diff inspection failed with exit code {code}")
                     }
-                    None => "show_changes git diff inspection unavailable".to_string(),
+                    None => "read_workspace_changes git diff inspection unavailable".to_string(),
                 }
             } else {
-                "show_changes git inspection failed".to_string()
+                "read_workspace_changes git inspection failed".to_string()
             };
             ToolResult {
                 success: false,

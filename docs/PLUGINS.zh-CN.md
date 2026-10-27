@@ -13,7 +13,16 @@ Native Plugin 是**受信任的本地 executable**。WebCodex 不会 sandbox、�
 不可信 executable 自动变安全；启动 Plugin 与在 prepared Runner environment 下直接运行
 这个本地程序具有同等级别的本机信任含义。
 
+> **术语区分：** ChatGPT 有时把 developer MCP/custom app 也称为“插件”，但它与
+> WebCodex 的 **Native Tool Plugin** 不是同一层。若 ChatGPT 返回
+> `FORBIDDEN: This conversation does not support developer MCPs`，并且 Host 在
+> `plugin_tool` 到达 WebCodex 之前就拒绝 MCP connection，这不是 Native Tool Plugin
+> health result。此类问题先看[故障排查](TROUBLESHOOTING.zh-CN.md)；只有请求已经到达
+> WebCodex 后，才使用本文的 `plugin_tool` diagnostic 排查本地 provider。
+
 ## 配置 Plugin
+
+Desktop 在“扩展 → 原生 Plugin”提供独立分类，与 MCP 工具服务分开。添加可信程序后，上方显示已保存的注册项；下方选择项目，查看该项目 Runner 实际提供的工具。预览展示该 Runner 报告的插件加载状态，失败时给出处理建议和安全诊断码；它不是 Project-affine 工具目录，也不显示 provider-list 接口未提供的工具数量。保存不启动 Plugin，需要明确重启所管理的 Runner 才会应用；重新加载仅针对所选项目中获授权的 Plugin。
 
 Plugin 使用独立的 `runner.toml` 配置，不复用 MCP provider：
 
@@ -72,21 +81,18 @@ Windows 继续使用 Runner 已有的 `PATH` / `PATHEXT` native executable 规�
 
 Native Plugin 是 Runner-owned capability。provider 的具体 Tool 永远不会加入
 Server-global WebCodex tool namespace，也不会被追加到外层 MCP `tools/list`。Plugin
-可以定义 `safe_delete`、`runtime_status` 或其他合法 provider-local 名称；它们不需要
+可以定义 `safe_delete`、`get_runtime_status` 或其他合法 provider-local 名称；它们不需要
 和 WebCodex builtin、其他 Runner 或同一 Runner 的其他 provider 做全局避让。
 
 唯一稳定的 model-facing 入口是一等 WebCodex 工具 `plugin_tool`。它的 ToolSpec 走和
 其他 WebCodex 工具相同的 canonical metadata/registry 链路，schema 与 Runner 是否在线、
 安装了哪些 Plugin 无关。因此即使当前没有 Plugin-capable Runner，
-`tool_manifest(tool_name="plugin_tool")` 也能返回准确 gateway contract。
+`read_tool_manifest(tool_name="plugin_tool")` 也能返回准确 gateway contract。
 `work_on_project` 还可以在 startup 中提供一个有界、Project-affine 的 Plugin selection catalog。它只包含 configured `cwd` 解析后与 authoritative Project root 一致且当前 ready/committed 的 provider tool；其他目录的 provider 不会自动进入 catalog。该 projection 不会暴露 provider path、command/argv/environment、schema、provider instance identity 或 invocation binding。Runner gateway 和模型 projection 都按序列化后的字节数截断 catalog；`total_count` 与 `catalog_revision` 仍描述完整目录。模型选择后仍必须走 canonical `plugin_tool describe -> call`。在支持 context sidecar 的 surface 上，同时具备 `project:read` 与 `plugin:inspect` 的调用者也可以显式请求 `plugins.catalog` 获取同类 Project-affine metadata。
 
-MCP 与 OpenAPI/GPT Actions 使用的 generic Tool Runtime 都复用同一个 canonical
-`plugin_tool` parser 和 action-aware gateway executor；不存在 MCP Plugin 实现和 GPT
-Plugin 实现两套逻辑。任何声明暴露 `plugin_tool` 的 canonical model surface 都可以实际
-调用它。当前 generic GPT Actions surface 上，`plugin_tool` 是 canonical direct
-operation，因此直接传它自己的 business arguments：
-
+MCP 与 Runtime API 复用同一个 canonical `plugin_tool` parser 和 action-aware
+executor，不存在独立的客户端实现或工具名称兼容表。按照当前 `read_tool_manifest`
+返回的调用路径，向已获准的 gateway 传入正常 business arguments：
 ```json
 {"action":"describe","runner":"my-runner","plugin":"repo-tools","tool":"safe_delete"}
 {"action":"call","binding":"wc_pbind_...","arguments":{"path":"build/old.bin"}}
@@ -163,9 +169,21 @@ live provider 与最近一次 disposable `check` candidate 保留 bounded、cont
 本机 stderr ring；这个 local projection 不属于 Plugin gateway response。
 
 `call` 的 dispatch identity 只有这个 opaque `binding`；call 阶段不再接受
-`runner`、`plugin`、`tool` 作为路由字段。每次 describe 都会创建独立 binding，精确
+`runner`、`plugin`、`tool` 或 `project` 作为路由字段。每次 describe 都会创建独立 binding，精确
 记录当时观察到的 Runner instance、provider instance、tool name 和 schema；handle
 本身不会编码或暴露这些内部 identity。
+
+对 `projectBound` 工具，在 `describe` 时显式传入目标已授权 `project`。缺少它时，
+错误保留 `plugin_project_required`，并提示对同一 Runner/provider/tool 补充该 Project
+重新 describe；此时没有调用 provider 工具，也没有创建 binding。WebCodex 生成的
+gateway 错误还会将已有 recovery 投影到有界的 MCP 错误文本，供只展示文本的 Host
+使用；结构化错误字段仍为权威数据。恢复指导优先显示，避免长错误消息挤占原有
+1,024 字节文本上限。provider 自身返回的工具结果保持原样。Project selector
+内容非法与在 `call` 上传入 Project 会得到不同的参数提示。
+同一目标 Project 可复用已保留的 schema/binding，call 只传 `binding` 和符合 schema
+的 `arguments`。更换目标 Project 必须 describe 新目标并取得新 binding；仅删除
+call 上冲突的 Project 可能仍会选中旧目标。Session 或 recorder metadata 不能提供
+业务 Project。修正参数或重新 describe 不代表可以重放先前结果不明的操作；应先核对结果。
 
 `reload` 是 Windows、macOS、Linux 都可用的 authoritative reload 入口。Runner
 自己重新读取自己的 `runner.toml`；Server 不会上传 executable、env 或 raw Plugin
@@ -195,13 +213,13 @@ set 原样保留；全部成功后才原子替换。被删除的 provider 会立
 reload 前运行 `check` 不会替换当前 committed provider set，也不会创建 binding。成功的
 check candidate 会被销毁，不会偷偷复用成下一次 reload provider。
 
-`runner_config_reload` 与 `plugin_tool reload` 共用同一个 Plugin candidate
+`reload_runner_config` 与 `plugin_tool reload` 共用同一个 Plugin candidate
 admission/commit primitive。修改 `[plugins]` 不需要为了 Plugin 生效而重启 Runner：generic
 Runner config reload 会在同一次 activation 中 live apply Plugin candidate；`plugin_tool
 reload` 则提供更窄、只需要 `plugin:manage` 的专门入口。Plugin management authority 不会
 因此获得修改其他 Runner config 的权限。
 
-`runner_config_check` 仍然只是 Runner config 的结构性检查：读取/解析 startup-bound
+`check_runner_config` 仍然只是 Runner config 的结构性检查：读取/解析 startup-bound
 `runner.toml`、验证配置边界并分类 restart-only 字段，不会启动 disposable Plugin process。
 需要检查 executable resolution 以及 Plugin `initialize -> tools/list` protocol/admission 时，
 使用 `plugin_tool check(runner, plugin)`。
@@ -314,9 +332,12 @@ invocation path，并继续拥有原有 binding、effect、retry 和 `OutcomeUnk
 Phase 1 曾有意暂缓 `webcodex plugin init`，直到 SDK 建立真实 external dependency contract。
 这个前置条件现在已经满足：`@yyjeqhc/webcodex-plugin-sdk@0.1.0` 已通过 npm 公开分发，Phase 3
 因此加入使用该**精确兼容版本**的本地 scaffold。生成项目不依赖 WebCodex 源码 checkout。
-仓库内 first-party dogfood（例如 `plugins/safe-delete` 和
-[`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md)）仍有意使用同 checkout 的 local
-SDK source，以持续测试正在开发的 SDK；外部 `plugin init` 项目则使用 published package。
+仓库内 first-party dogfood（例如 `plugins/safe-delete`、
+[`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md)、
+[`plugins/campus-application`](../plugins/campus-application/README.zh-CN.md) 和
+[`plugins/agent-browser`](../plugins/agent-browser/README.zh-CN.md)）仍有意使用同 checkout
+的 local SDK source，以持续测试正在开发的 SDK；外部 `plugin init` 项目则使用
+published package。
 
 ## TypeScript Plugin SDK
 
@@ -412,12 +433,38 @@ keyword 会在 provider admission 时明确拒绝，不会 silently ignore。v1 
 `oneOf`、`allOf`、`not` 或任意 draft-specific keyword。
 
 最小无依赖 Node 示例见
-[`examples/native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs)。仓库还提供两个
+[`examples/native-tool-plugin.mjs`](../examples/native-tool-plugin.mjs)。另有仅使用标准库的
+[Python 原始协议示例](../plugins/examples/python-raw/README.md)，展示有界 stdio、参数校验
+和确定性的 echo 工具，无需 TypeScript SDK。仓库还提供多个
 first-party SDK dogfood Plugin：[`plugins/safe-delete`](../plugins/safe-delete/README.zh-CN.md)
 把删除权限限制在配置的项目根内，只把单个文件或目录移入系统 Trash / Recycle Bin，
 不会把永久删除能力加入 WebCodex 内建工具面；
 [`plugins/repo-info`](../plugins/repo-info/README.zh-CN.md) 是只读 authoring 示例，它唯一的
-`git_summary` 只观察 provider 配置的 repository `cwd`。
+`git_summary` 只观察 provider 配置的 repository `cwd`；
+[`plugins/campus-application`](../plugins/campus-application/README.zh-CN.md) 把 bounded
+Browser semantic snapshot 转换成结构化简历填写计划，支持重复 section 和多步骤网申，
+并有意在最终提交之前停止；
+[`plugins/agent-browser`](../plugins/agent-browser/README.zh-CN.md) 则调用 operator 已安装的
+本机 Agent Browser，继承 native profile/config 或连接用户明确授权的当前 Chrome，同时把
+opaque page/snapshot identity、tab ownership 和不确定 effect 的处理限制在 Plugin 边界内。
+
+可选的标准库 Python
+[`Project Knowledge 插件`](../plugins/project-knowledge/README.zh-CN.md) 将配置的单个仓库根目录内
+有界的 Git 已跟踪文本/代码索引到 Project 外的私有 SQLite FTS5 缓存。`index`、`status`、
+`search`、`read` 使用相同原生协议和 `plugin_tool` binding 路径；检索核验当前来源哈希并
+报告索引覆盖范围。它需要 Python 3.10+、FTS5、Git 及相对于目录描述符的 no-follow 文件访问，
+不会写入核心 Memory/指导文件，也不调用 embedding/模型服务。
+
+## 社区原生插件（非官方）
+
+下列插件由社区在 WebCodex 仓库外独立维护，**不代表 WebCodex 官方维护或安全审计**。
+Native Plugin 是受信任的本地可执行程序，安装前应自行检查源码和 Runner 权限。
+
+- [WebCodex × Orca Native Plugin](https://github.com/LonelyHerbivore/webcodex-orca-plugin)
+  （Node.js 18+，集成验证版）：通过 Orca CLI 提供多 Agent Run 编排、Worker 生命周期、
+  Agent 消息传递、不确定结果下的防重复执行恢复及带来源完整性标记的对话分页读取。
+  v0.3.1 自动化测试已通过，但 Claude Code + 两个 Antigravity 的完整协作完成与资源回收
+  尚未通过真实端到端验收。配置方式和已知限制请查阅第三方仓库。
 
 ## 调用与失败语义
 

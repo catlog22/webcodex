@@ -4,17 +4,23 @@
 //! sources and lifecycles. This module only unifies their cross-process request
 //! family, source identity, and bounded read/list/resolve responses.
 
+use crate::runner_protocol::{
+    PROCESS_ARGV_MAX_BYTES, PROCESS_ARG_MAX_BYTES, PROCESS_ARG_MAX_COUNT,
+};
 use crate::runtime_contract::{MAX_SKILL_READ_LINES, MAX_SKILL_RESOURCE_PATH_CHARS};
 use crate::skill_metadata::{MAX_SKILL_DESCRIPTION_CHARS, MAX_SKILL_NAME_CHARS};
 use crate::skill_store::{
     valid_lower_sha256, valid_package_revision, valid_skill_key, MAX_SKILL_STORE_VERSIONS_LIMIT,
 };
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 pub const RUNNER_SKILL_REQUEST_KIND: &str = "skill";
 pub const RUNNER_SKILL_RESPONSE_FORMAT: &str = "webcodex.runner_skill.v1";
 pub const RUNNER_SKILL_REQUEST_MAX_BYTES: usize = 32 * 1024;
 pub const RUNNER_SKILL_RESPONSE_MAX_BYTES: usize = 512 * 1024;
+pub const RUNNER_SKILL_EXECUTION_REQUEST_KIND: &str = "skill_resource_execution";
+pub const RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES: usize = 128 * 1024;
 pub const MAX_RUNNER_SKILLS: usize = 512;
 pub const MAX_RUNNER_SKILL_DIAGNOSTICS: usize = 8;
 pub const MAX_RUNNER_SKILL_READ_TEXT_BYTES: usize = 48 * 1024;
@@ -118,6 +124,68 @@ impl RunnerSkillDescriptor {
             if !valid_skill_key(skill_key) || !valid_package_revision(package_revision) {
                 return Err("invalid managed Runner Skill descriptor");
             }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunnerSkillExecutionRequest {
+    pub skill_id: String,
+    pub expected_source: RunnerSkillSource,
+    pub path: String,
+    pub expected_definition_revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_package_revision: Option<String>,
+    pub expected_resource_sha256: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+impl RunnerSkillExecutionRequest {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !valid_runner_skill_id(&self.skill_id)
+            || !valid_lower_sha256(&self.expected_definition_revision)
+            || !valid_lower_sha256(&self.expected_resource_sha256)
+        {
+            return Err("invalid Runner Skill execution request");
+        }
+        let path = normalize_runner_skill_resource_path(&self.path)?;
+        let extension = Path::new(&path)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        if !path.starts_with("scripts/") || !matches!(extension.as_str(), "py" | "sh") {
+            return Err("invalid Runner Skill executable resource");
+        }
+        match self.expected_source {
+            RunnerSkillSource::Configured if self.expected_package_revision.is_some() => {
+                return Err("configured Runner Skill cannot pin package revision");
+            }
+            RunnerSkillSource::Managed => {
+                let Some(revision) = self.expected_package_revision.as_deref() else {
+                    return Err("managed Runner Skill execution requires package revision");
+                };
+                if !valid_package_revision(revision) {
+                    return Err("invalid Runner Skill package revision");
+                }
+            }
+            RunnerSkillSource::Configured => {}
+        }
+        if self.args.len() > PROCESS_ARG_MAX_COUNT {
+            return Err("too many Runner Skill execution arguments");
+        }
+        let mut total = 0usize;
+        for arg in &self.args {
+            if arg.len() > PROCESS_ARG_MAX_BYTES || arg.contains('\0') {
+                return Err("invalid Runner Skill execution argument");
+            }
+            total = total.saturating_add(1).saturating_add(arg.len());
+        }
+        if total > PROCESS_ARGV_MAX_BYTES {
+            return Err("Runner Skill execution arguments are too large");
         }
         Ok(())
     }
@@ -362,11 +430,9 @@ impl RunnerSkillReadResponse {
 }
 
 pub fn valid_runner_skill_id(value: &str) -> bool {
-    value.len() == "wc_skill_".len() + 32
-        && value.starts_with("wc_skill_")
-        && value["wc_skill_".len()..]
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    value
+        .strip_prefix("wc_skill_")
+        .is_some_and(|suffix| crate::compact::decode::<16>(suffix).is_some())
 }
 
 pub fn normalize_runner_skill_resource_path(path: &str) -> Result<String, &'static str> {
@@ -400,7 +466,7 @@ mod tests {
 
     fn configured() -> RunnerSkillDescriptor {
         RunnerSkillDescriptor::Configured {
-            skill_id: format!("wc_skill_{}", "a".repeat(32)),
+            skill_id: "wc_skill_qqqqqqqqqqqqqqqqqqqqqg".to_string(),
             name: "configured".to_string(),
             description: "configured guidance".to_string(),
             definition_revision: "b".repeat(64),
@@ -409,11 +475,11 @@ mod tests {
 
     fn managed() -> RunnerSkillDescriptor {
         RunnerSkillDescriptor::Managed {
-            skill_id: format!("wc_skill_{}", "c".repeat(32)),
+            skill_id: "wc_skill_zMzMzMzMzMzMzMzMzMzMzA".to_string(),
             skill_key: "managed".to_string(),
             name: "managed".to_string(),
             description: "managed guidance".to_string(),
-            package_revision: format!("wc_skillpkg_{}", "d".repeat(64)),
+            package_revision: "wc_skillpkg_3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d0".to_string(),
             definition_revision: "e".repeat(64),
         }
     }
@@ -422,8 +488,10 @@ mod tests {
     fn request_family_round_trips_all_runtime_and_management_operations() {
         let configured_id = configured().skill_id().to_string();
         let managed_id = managed().skill_id().to_string();
-        let package_revision = format!("wc_skillpkg_{}", "f".repeat(64));
-        let state_revision = format!("wc_skillstate_{}", "a".repeat(64));
+        let package_revision =
+            "wc_skillpkg___________________________________________8".to_string();
+        let state_revision =
+            "wc_skillstate_qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo".to_string();
         let requests = vec![
             RunnerSkillRequest::List,
             RunnerSkillRequest::Resolve {
@@ -511,7 +579,9 @@ mod tests {
             path: "SKILL.md".to_string(),
             start_line: 1,
             limit: 1,
-            expected_package_revision: Some(format!("wc_skillpkg_{}", "f".repeat(64))),
+            expected_package_revision: Some(
+                "wc_skillpkg___________________________________________8".to_string(),
+            ),
             expected_definition_revision: None,
         };
         assert!(request.validate().is_err());
@@ -526,6 +596,57 @@ mod tests {
             expected_definition_revision: None,
         };
         managed_request.validate().unwrap();
+    }
+
+    #[test]
+    fn execution_request_pins_source_package_and_supported_script_shape() {
+        let configured_request = RunnerSkillExecutionRequest {
+            skill_id: configured().skill_id().to_string(),
+            expected_source: RunnerSkillSource::Configured,
+            path: "scripts/probe.py".to_string(),
+            expected_definition_revision: "b".repeat(64),
+            expected_package_revision: None,
+            expected_resource_sha256: "c".repeat(64),
+            args: vec!["literal argument".to_string()],
+        };
+        configured_request.validate().unwrap();
+        let mut uppercase_configured = configured_request.clone();
+        uppercase_configured.path = "scripts/probe.PY".to_string();
+        uppercase_configured.validate().unwrap();
+        let encoded = serde_json::to_string(&configured_request).unwrap();
+        assert!(encoded.len() <= RUNNER_SKILL_EXECUTION_REQUEST_MAX_BYTES);
+        assert_eq!(
+            serde_json::from_str::<RunnerSkillExecutionRequest>(&encoded).unwrap(),
+            configured_request
+        );
+
+        let mut invalid_configured = configured_request.clone();
+        invalid_configured.expected_package_revision =
+            managed().package_revision().map(str::to_string);
+        assert!(invalid_configured.validate().is_err());
+
+        let mut invalid_path = configured_request.clone();
+        invalid_path.path = "scripts/probe.rb".to_string();
+        assert!(invalid_path.validate().is_err());
+
+        let mut invalid_arg = configured_request.clone();
+        invalid_arg.args = vec!["bad\0arg".to_string()];
+        assert!(invalid_arg.validate().is_err());
+
+        let managed_descriptor = managed();
+        let managed_request = RunnerSkillExecutionRequest {
+            skill_id: managed_descriptor.skill_id().to_string(),
+            expected_source: RunnerSkillSource::Managed,
+            path: "scripts/probe.sh".to_string(),
+            expected_definition_revision: managed_descriptor.definition_revision().to_string(),
+            expected_package_revision: managed_descriptor.package_revision().map(str::to_string),
+            expected_resource_sha256: "d".repeat(64),
+            args: Vec::new(),
+        };
+        managed_request.validate().unwrap();
+        let mut missing_package = managed_request;
+        missing_package.expected_package_revision = None;
+        assert!(missing_package.validate().is_err());
     }
 
     #[test]
