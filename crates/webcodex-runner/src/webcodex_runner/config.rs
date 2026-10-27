@@ -59,7 +59,7 @@ pub(crate) struct SkillsConfig {
     #[serde(default)]
     pub(crate) roots: Vec<PathBuf>,
     /// Operator whitelist of additional directories whose files Skills may
-    /// read via `skill_read_file` beyond their own package. Read authority
+    /// read via `read_skill_file` beyond their own package. Read authority
     /// still requires the caller's Skill/Project grants; the sensitive-path
     /// blacklist and symlink rejection still apply.
     #[serde(default)]
@@ -1015,6 +1015,10 @@ fn reload_error_diagnostic(
         ),
         (
             "skills.resource_roots may contain at most ",
+            RunnerConfigErrorField::SkillsResourceRoots,
+        ),
+        (
+            "skills.resource_roots entries must be non-empty paths of at most ",
             RunnerConfigErrorField::SkillsResourceRoots,
         ),
         (
@@ -2360,6 +2364,36 @@ mod skills_config_tests {
             format!("/webcodex-skill-test/{text}")
         };
         std::path::PathBuf::from(path)
+    }
+
+    #[test]
+    fn resource_root_diagnostics_preserve_typed_config_contract() {
+        for (error, reason) in [
+            (
+                "skills.resource_roots entries must be absolute paths without parent traversal",
+                RunnerConfigErrorReason::InvalidPath,
+            ),
+            (
+                "skills.resource_roots contains duplicate path identities",
+                RunnerConfigErrorReason::InvalidPath,
+            ),
+            (
+                "skills.resource_roots may contain at most 16 entries",
+                RunnerConfigErrorReason::OutOfRange,
+            ),
+            (
+                "skills.resource_roots entries must be non-empty paths of at most 4096 bytes",
+                RunnerConfigErrorReason::OutOfRange,
+            ),
+        ] {
+            let response = config_candidate_error_response(RunnerConfigAction::Check, 1, error);
+            assert_eq!(
+                response.error_field,
+                Some(RunnerConfigErrorField::SkillsResourceRoots)
+            );
+            assert_eq!(response.error_reason, Some(reason));
+            response.validate().unwrap();
+        }
     }
 
     #[test]

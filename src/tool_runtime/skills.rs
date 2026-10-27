@@ -959,7 +959,7 @@ impl ToolRuntime {
         if !valid_skill_id(&skill_id) {
             return skill_execution_error("skill_id_invalid", Some(json!({"skill_id": skill_id})));
         }
-        let resource_path = match validate_resource_path(&path) {
+        let resource_path = match validate_package_resource_path(&path) {
             Ok(path) => path,
             Err(kind) => return skill_execution_error(kind, Some(json!({"skill_id": skill_id}))),
         };
@@ -1360,6 +1360,15 @@ impl ToolRuntime {
                         );
                     }
                 }
+                if resolved.source() == RunnerSkillSource::Managed
+                    && validate_package_resource_path(&resource_path).is_err()
+                {
+                    return skill_error(
+                        "skill_resource_path_invalid",
+                        &project.resolved_id,
+                        Some(json!({"skill_id": skill_id})),
+                    );
+                }
                 // Managed Resolve revisions prove membership/source identity only. The final
                 // Read receives only the caller's explicit managed revision expectations.
                 return self
@@ -1400,6 +1409,13 @@ impl ToolRuntime {
                     "skill_id": skill_id,
                     "definition_revision": definition_revision,
                 })),
+            );
+        }
+        if validate_package_resource_path(&resource_path).is_err() {
+            return skill_error(
+                "skill_resource_path_invalid",
+                &project.resolved_id,
+                Some(json!({"skill_id": skill_id})),
             );
         }
         let package_root = format!("{}/{}", SKILL_ROOT, package_name);
@@ -2628,6 +2644,11 @@ fn validate_resource_path(path: &str) -> Result<String, &'static str> {
     // package or an operator-configured resource root and applies the
     // sensitive-path blacklist there.
     webcodex_core::runner_skill::normalize_runner_skill_resource_path(path)
+        .map_err(|_| "skill_resource_path_invalid")
+}
+
+fn validate_package_resource_path(path: &str) -> Result<String, &'static str> {
+    webcodex_core::runner_skill::normalize_runner_skill_package_resource_path(path)
         .map_err(|_| "skill_resource_path_invalid")
 }
 

@@ -1810,19 +1810,19 @@ async fn skill_read_file_is_bounded_project_scoped_and_revision_guarded() {
     );
     assert!(definition_stale.output.get("text").is_none());
 
-    // Traversal and absolute-looking paths are syntactically valid now. The
-    // project-source read rides the legacy file-protocol Runner, which keeps
-    // package confinement runner-side: these resolve as not-found on the
-    // local shim (a strict Runner answers path-invalid for the empty
-    // component instead). Only true syntax violations fail before the Runner.
+    // 先识别 Skill 来源；Project Skill 仍拒绝包外路径，白名单只适用于 configured Skill。
     for (path, kind, reaches_runner) in [
-        ("../outside.txt", "skill_resource_not_found", true),
+        ("../outside.txt", "skill_resource_path_invalid", true),
         (
             "/definitely/missing/webcodex-skill.txt",
-            "skill_resource_not_found",
+            "skill_resource_path_invalid",
             true,
         ),
-        ("references/../guide.md", "skill_resource_not_found", true),
+        (
+            "references/../guide.md",
+            "skill_resource_path_invalid",
+            true,
+        ),
         (
             "references/\u{1}guide.md",
             "skill_resource_path_invalid",

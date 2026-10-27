@@ -13,7 +13,7 @@ use crate::skill_store::{
     valid_lower_sha256, valid_package_revision, valid_skill_key, MAX_SKILL_STORE_VERSIONS_LIMIT,
 };
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Component, Path};
 
 pub const RUNNER_SKILL_REQUEST_KIND: &str = "skill";
 pub const RUNNER_SKILL_RESPONSE_FORMAT: &str = "webcodex.runner_skill.v1";
@@ -151,7 +151,7 @@ impl RunnerSkillExecutionRequest {
         {
             return Err("invalid Runner Skill execution request");
         }
-        let path = normalize_runner_skill_resource_path(&self.path)?;
+        let path = normalize_runner_skill_package_resource_path(&self.path)?;
         let extension = Path::new(&path)
             .extension()
             .and_then(|value| value.to_str())
@@ -452,6 +452,27 @@ pub fn normalize_runner_skill_resource_path(path: &str) -> Result<String, &'stat
     Ok(trimmed.replace('\\', "/"))
 }
 
+/// 保持 Project、managed Skill 和脚本执行的包内路径边界。
+pub fn normalize_runner_skill_package_resource_path(path: &str) -> Result<String, &'static str> {
+    let normalized = normalize_runner_skill_resource_path(path)?;
+    if normalized.starts_with('/')
+        || normalized.as_bytes().get(1) == Some(&b':')
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        || Path::new(&normalized)
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err("invalid Runner Skill resource path");
+    }
+    #[cfg(windows)]
+    if normalized.contains(':') {
+        return Err("invalid Runner Skill resource path");
+    }
+    Ok(normalized)
+}
+
 fn valid_diagnostic_reason(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 80
@@ -629,6 +650,16 @@ mod tests {
         invalid_path.path = "scripts/probe.rb".to_string();
         assert!(invalid_path.validate().is_err());
 
+        for path in [
+            "scripts/../probe.py",
+            "scripts//probe.py",
+            "scripts/./probe.py",
+        ] {
+            let mut escaped = configured_request.clone();
+            escaped.path = path.to_string();
+            assert!(escaped.validate().is_err(), "{path}");
+        }
+
         let mut invalid_arg = configured_request.clone();
         invalid_arg.args = vec!["bad\0arg".to_string()];
         assert!(invalid_arg.validate().is_err());
@@ -695,6 +726,24 @@ mod tests {
         assert_eq!(
             normalize_runner_skill_resource_path("C:\\secret").unwrap(),
             "C:/secret"
+        );
+        // 外部资源读取不能扩大 Project/managed Skill 或脚本执行的包内路径权限。
+        for invalid in [
+            "../secret",
+            "references/../secret",
+            "/etc/passwd",
+            "C:/secret",
+            "a//b",
+            "./x",
+        ] {
+            assert!(
+                normalize_runner_skill_package_resource_path(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        assert_eq!(
+            normalize_runner_skill_package_resource_path("references/guide.md").unwrap(),
+            "references/guide.md"
         );
         for invalid in [
             "",

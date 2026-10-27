@@ -190,7 +190,11 @@ fn configured_root_symlink_is_rejected() {
         let holder = tempfile::tempdir().unwrap();
         let link = holder.path().join("skills-link");
         symlink(target.path(), &link).unwrap();
-        let discovery = discover(&SkillsConfig { roots: vec![link] }).unwrap();
+        let discovery = discover(&SkillsConfig {
+            roots: vec![link],
+            ..Default::default()
+        })
+        .unwrap();
         assert!(discovery.skills.is_empty());
         assert!(discovery
             .diagnostics

@@ -104,6 +104,17 @@ fn runner_config_registered_output_schema_accepts_canonical_runtime_states() {
             vec![],
         ),
         runner_config_response(
+            RunnerConfigAction::Check,
+            RunnerConfigExecutionState::Completed,
+            Some(false),
+            Some(7),
+            Some(RunnerConfigErrorCode::ConfigValidationFailed),
+            Some(RunnerConfigErrorField::SkillsResourceRoots),
+            Some(RunnerConfigErrorReason::InvalidPath),
+            false,
+            vec![],
+        ),
+        runner_config_response(
             RunnerConfigAction::Reload,
             RunnerConfigExecutionState::NotStarted,
             None,

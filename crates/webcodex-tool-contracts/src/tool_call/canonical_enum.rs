@@ -1793,6 +1793,8 @@ pub enum ToolCall {
         project: String,
         #[schemars(regex(pattern = "^wc_skill_[A-Za-z0-9_-]{21}[AQgw]$"))]
         skill_id: String,
+        /// Project/managed Skill 仅接受包内相对路径；configured Skill 还可读取
+        /// skills.resource_roots 白名单内的绝对路径或含父目录跳转的路径。
         #[schemars(length(min = 1, max = 512))]
         #[serde(default)]
         path: Option<String>,

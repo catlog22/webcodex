@@ -352,6 +352,7 @@ package 时默认将其设为 private；维护者
 | `project_registry_dir` | 项目注册文件目录。 |
 | `[policy]` | 本地执行边界（`allowed_roots` 等）。 |
 | `[skills].roots` | **自 v0.4.2 起可用。** 可选的 Runner 本机绝对 live Skill roots；WebCodex 不修改其中内容，受支持脚本可经 `run_skill_resource` 执行，也不会复制进 managed Skill Store。 |
+| `[skills].resource_roots` | 可选的 Runner 本机绝对目录白名单，仅允许 configured Skill 经 `read_skill_file` 读取包外文档；不扩大 Project/managed Skill 的读取范围或脚本执行范围，敏感路径与符号链接仍被拒绝。 |
 | `[instructions].files` | 可选 Runner 本机绝对 instruction 文件；应用于该 Runner 上每个 Project。无隐式默认路径；路径列表可 hot reload，文件内容本身 live。 |
 | `[shell]` | 可选 shell profile 定义与有界 persistent-shell 限制。 |
 | `[ssh.resources.<name>]` | 可选命名 SSH 目标，用于 Session 绑定的 `run_shell` / `run_job`。 |
