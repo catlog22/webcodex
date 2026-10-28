@@ -315,7 +315,7 @@ makes a FAIL report exit with status 2.
 
 ### Review and runtime activity
 
-The legacy `webcodex task` namespace has been removed with the separate Connector Task/Result/Approval lifecycle. Local `webcodex run` prints the Runtime Console URL (`/runtime`). Runtime review uses the canonical Workflow Session, Job, Git/diff, `read_workspace_changes`, and `finish_coding_task` paths rather than a host-side result accept/reject queue.
+The separate Connector Task/Result/Approval lifecycle has been removed. The current `webcodex task` namespace manages workspace todos; see **Workspace tasks** below. Local `webcodex run` prints the Runtime Console URL (`/runtime`). Runtime review uses the canonical Workflow Session, Job, Git/diff, `read_workspace_changes`, and `finish_coding_task` paths rather than a host-side result accept/reject queue.
 
 ### Credentials and accounts
 

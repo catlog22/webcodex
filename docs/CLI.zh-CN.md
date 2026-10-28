@@ -255,7 +255,7 @@ Runner 配置术语中，`project_registry_dir` 是 Project registry TOML 文件
 
 ### 审查与 runtime activity
 
-旧 `webcodex task` namespace 已随独立 Connector Task/Result/Approval lifecycle 删除。`webcodex run` 会输出 Runtime Console 地址（`/runtime`）。现在的 review 使用 canonical Workflow Session、Job、Git/diff、`read_workspace_changes` 与 `finish_coding_task`，不再有 host-side result accept/reject queue。
+独立 Connector Task/Result/Approval lifecycle 已删除。当前 `webcodex task` namespace 用于管理工作区待办，见下方工作区任务说明。`webcodex run` 会输出 Runtime Console 地址（`/runtime`）。现在的 review 使用 canonical Workflow Session、Job、Git/diff、`read_workspace_changes` 与 `finish_coding_task`，不再有 host-side result accept/reject queue。
 
 ### 凭据与账号
 

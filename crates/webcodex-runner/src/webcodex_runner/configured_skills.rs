@@ -471,34 +471,67 @@ pub(super) fn read_resource(
         .package_root
         .parent()
         .ok_or_else(|| "skill_resource_path_invalid".to_string())?;
-    // Package-relative paths may traverse; absolute paths read directly. Every
-    // resolution stays symlink-free per component, and the final target must
-    // land inside the Skill package or an operator-configured resource root.
+    #[cfg(windows)]
+    let package_root = PathBuf::from(webcodex_runner_config::paths::normalize_path_identity(
+        &skill.package_root,
+    ));
+    #[cfg(not(windows))]
+    let package_root = skill.package_root.clone();
     let requested = std::path::Path::new(&path);
-    let target = if requested.is_absolute() {
-        resolve_open_regular_file(
-            requested,
-            "skill_resource_not_found",
-            "skill_resource_path_invalid",
-        )
-        .map_err(str::to_string)?
+    let requested = if requested.is_absolute() {
+        requested.to_path_buf()
     } else {
-        resolve_regular_resource_file(
-            &skill.package_root,
-            &path,
-            "skill_resource_not_found",
-            "skill_resource_path_invalid",
-        )
-        .map_err(str::to_string)?
+        package_root.join(requested)
     };
-    let within_package =
-        webcodex_runner_config::paths::path_is_within(&target, &skill.package_root);
-    let within_resource_root = config.resource_roots.iter().any(|root| {
-        root.canonicalize()
-            .map(|root| webcodex_runner_config::paths::path_is_within(&target, &root))
-            .unwrap_or(false)
-    });
-    if !within_package && !within_resource_root {
+    // 只探测配置授予的根目录；目标路径须先通过词法边界校验，避免泄露根外文件是否存在。
+    let mut roots = vec![(skill.package_root.clone(), skill.package_root.clone())];
+    for root in &config.resource_roots {
+        if fs::symlink_metadata(root)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata_is_link_like(&metadata))
+        {
+            if let Ok(canonical) = root.canonicalize() {
+                roots.push((root.clone(), canonical.clone()));
+                roots.push((canonical.clone(), canonical));
+            }
+        }
+    }
+    let lexical_target = lexical_resource_path(&requested).map_err(str::to_string)?;
+    if !roots.iter().any(|(root, _)| {
+        lexical_resource_path(root)
+            .is_ok_and(|root| webcodex_runner_config::paths::path_is_within(&lexical_target, &root))
+    }) {
+        return Err("skill_resource_not_allowed".to_string());
+    }
+    // 从授权根的规范路径开始检查，不拒绝 macOS /var 等系统祖先别名。
+    // 保留请求中的 ..，让逐组件检查仍能发现 symlink/../ 逃逸。
+    #[cfg(windows)]
+    let requested = PathBuf::from(webcodex_runner_config::paths::normalize_path_identity(
+        &requested,
+    ));
+    let (root, relative) = roots
+        .iter()
+        .find_map(|(alias, canonical)| {
+            #[cfg(windows)]
+            let alias = PathBuf::from(webcodex_runner_config::paths::normalize_path_identity(
+                alias,
+            ));
+            requested
+                .strip_prefix(alias)
+                .ok()
+                .map(|relative| (canonical, relative))
+        })
+        .ok_or_else(|| "skill_resource_not_allowed".to_string())?;
+    let target = resolve_regular_resource_file(
+        root,
+        relative,
+        "skill_resource_not_found",
+        "skill_resource_path_invalid",
+    )
+    .map_err(str::to_string)?;
+    if !roots
+        .iter()
+        .any(|(_, root)| webcodex_runner_config::paths::path_is_within(&target, root))
+    {
         return Err("skill_resource_not_allowed".to_string());
     }
     let max_file_bytes = if path == SKILL_DEFINITION_FILE {
@@ -603,16 +636,19 @@ fn resolve_regular_package_file(
 
 fn resolve_regular_resource_file(
     package_root: &Path,
-    relative: &str,
+    relative: &Path,
     missing_code: &'static str,
     invalid_code: &'static str,
 ) -> Result<PathBuf, &'static str> {
     // `relative` may traverse with `..`; callers enforce the authority boundary
     // (Skill package or configured resource root) on the canonicalized target.
+    if relative.as_os_str().is_empty() {
+        return Err(invalid_code);
+    }
     let mut current = package_root.to_path_buf();
-    let components = relative.split('/').collect::<Vec<_>>();
+    let components = relative.components().collect::<Vec<_>>();
     for (index, component) in components.iter().enumerate() {
-        current.push(component);
+        current.push(component.as_os_str());
         let metadata = fs::symlink_metadata(&current).map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 missing_code
@@ -631,33 +667,23 @@ fn resolve_regular_resource_file(
     current.canonicalize().map_err(|_| invalid_code)
 }
 
-fn resolve_open_regular_file(
-    path: &Path,
-    missing_code: &'static str,
-    invalid_code: &'static str,
-) -> Result<PathBuf, &'static str> {
-    // Symlink-free component walk for absolute paths; callers enforce the
-    // authority boundary on the canonicalized target.
-    let mut current = PathBuf::new();
-    let count = path.components().count();
-    for (index, component) in path.components().enumerate() {
-        current.push(component.as_os_str());
-        let metadata = fs::symlink_metadata(&current).map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                missing_code
-            } else {
-                invalid_code
+fn lexical_resource_path(path: &Path) -> Result<PathBuf, &'static str> {
+    #[cfg(windows)]
+    let path = PathBuf::from(webcodex_runner_config::paths::normalize_path_identity(path));
+    if !path.is_absolute() {
+        return Err("skill_resource_path_invalid");
+    }
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
             }
-        })?;
-        let last = index + 1 == count;
-        if metadata_is_link_like(&metadata)
-            || (last && !metadata.is_file())
-            || (!last && !metadata.is_dir())
-        {
-            return Err(invalid_code);
+            component => result.push(component.as_os_str()),
         }
     }
-    current.canonicalize().map_err(|_| invalid_code)
+    Ok(result)
 }
 
 pub(super) fn metadata_is_link_like(metadata: &fs::Metadata) -> bool {

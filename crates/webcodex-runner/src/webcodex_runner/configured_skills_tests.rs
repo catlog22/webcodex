@@ -234,7 +234,7 @@ fn traversal_and_symlink_escape_are_rejected() {
         read_resource(&config, skill.descriptor.skill_id(), &absolute, 1, 20, None).unwrap_err(),
         "skill_resource_not_allowed"
     );
-    // A missing external file fails as not-found before the authority check.
+    // 根外文件不存在时也返回相同拒绝，不能通过错误类型探测其是否存在。
     assert_eq!(
         read_resource(
             &config,
@@ -245,7 +245,7 @@ fn traversal_and_symlink_escape_are_rejected() {
             None
         )
         .unwrap_err(),
-        "skill_resource_not_found"
+        "skill_resource_not_allowed"
     );
 
     #[cfg(unix)]
@@ -326,6 +326,84 @@ fn resource_roots_whitelist_permits_external_reads() {
         .unwrap_err(),
         "skill_resource_not_allowed"
     );
+}
+
+#[test]
+fn forbidden_resource_paths_do_not_reveal_file_type_or_existence() {
+    let temp = tempfile::tempdir().unwrap();
+    write_skill(temp.path(), "demo", "demo", "body");
+    fs::write(temp.path().join("outside.md"), "private").unwrap();
+    fs::create_dir(temp.path().join("outside-dir")).unwrap();
+    let config = SkillsConfig {
+        roots: vec![temp.path().to_path_buf()],
+        ..Default::default()
+    };
+    let skill = discover(&config).unwrap().skills.remove(0);
+    for path in [
+        "../outside.md",
+        "../missing.md",
+        "../outside-dir",
+        "../demo-other/file.md",
+    ] {
+        assert_eq!(
+            read_resource(&config, skill.descriptor.skill_id(), path, 1, 20, None).unwrap_err(),
+            "skill_resource_not_allowed",
+            "{path}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn resource_root_ancestor_alias_is_allowed_but_descendant_symlinks_are_not() {
+    use std::os::unix::fs::symlink;
+    let temp = tempfile::tempdir().unwrap();
+    let actual = temp.path().join("actual");
+    fs::create_dir_all(actual.join("docs")).unwrap();
+    fs::write(actual.join("docs/guide.md"), "guide").unwrap();
+    let alias = temp.path().join("alias");
+    symlink(&actual, &alias).unwrap();
+    write_skill(temp.path(), "demo", "demo", "body");
+    let config = SkillsConfig {
+        roots: vec![temp.path().to_path_buf()],
+        resource_roots: vec![alias.join("docs")],
+    };
+    let skill = discover(&config)
+        .unwrap()
+        .skills
+        .into_iter()
+        .find(|skill| skill.package_root.ends_with("demo"))
+        .unwrap();
+    for root in [alias.join("docs"), actual.join("docs")] {
+        assert_eq!(
+            read_resource(
+                &config,
+                skill.descriptor.skill_id(),
+                root.join("guide.md").to_str().unwrap(),
+                1,
+                20,
+                None
+            )
+            .unwrap()
+            .text,
+            "guide"
+        );
+    }
+    symlink(&actual, actual.join("docs/link")).unwrap();
+    for path in ["link/docs/guide.md", "link/../guide.md"] {
+        assert_eq!(
+            read_resource(
+                &config,
+                skill.descriptor.skill_id(),
+                alias.join("docs").join(path).to_str().unwrap(),
+                1,
+                20,
+                None
+            )
+            .unwrap_err(),
+            "skill_resource_path_invalid"
+        );
+    }
 }
 
 #[test]
