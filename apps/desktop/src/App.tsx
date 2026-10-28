@@ -19,6 +19,7 @@ import type {
 import { FirstRunCompletion } from "./features/onboarding/FirstRunCompletion";
 import { FirstRun } from "./features/onboarding/FirstRun";
 import { Dashboard } from "./features/dashboard/Dashboard";
+import { WorkspaceTasksPanel } from "./features/tasks/WorkspaceTasksPanel";
 import { ProjectsPanel } from "./features/projects/ProjectsPanel";
 import { ConnectionPanel } from "./features/connection/ConnectionPanel";
 import { ActivityPanel } from "./features/activity/ActivityPanel";
@@ -144,6 +145,7 @@ function DesktopApp() {
           <ProjectsPanel onComputerSettings={() => openSettings("access")} onState={commitState} />
         )}
         {navigation === "connection" && <ConnectionPanel state={state} onState={commitState} onSettings={openSettings} />}
+        {navigation === "tasks" && <WorkspaceTasksPanel />}
         {navigation === "activity" && <ActivityPanel activity={activity} />}
         {navigation === "extensions" && <ExtensionsPanel state={state} onState={commitState} initialTab={extensionTab} />}
         {navigation === "console" && <RuntimeConsolePanel state={state} onSettings={() => openSettings("runtime")} />}

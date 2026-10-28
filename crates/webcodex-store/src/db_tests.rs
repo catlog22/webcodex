@@ -122,6 +122,7 @@ fn store_connection_domains_and_metric_names_are_closed_and_stable() {
             "schema",
             "window_activity",
             "workbench",
+            "workspace_task",
         ]
     );
     assert_eq!(

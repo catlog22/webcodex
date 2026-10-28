@@ -111,6 +111,10 @@ pub(crate) fn routes() -> Router {
         .push(Router::with_path(api_path(RouteId::RuntimeConsoleGoals)).post(goals_handler))
         .push(Router::with_path(api_path(RouteId::RuntimeConsoleGoal)).post(goal_handler))
         .push(
+            Router::with_path(api_path(RouteId::RuntimeConsoleWorkspaceTasks))
+                .post(workspace::workspace_tasks),
+        )
+        .push(
             Router::with_path(api_path(RouteId::RuntimeConsoleExtensions))
                 .post(workspace::extensions),
         )

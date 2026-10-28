@@ -131,3 +131,11 @@ Full Runtime 由 Server、Runner 和 Runner 已观察到的 Project 清单组成
 Desktop 重启会恢复已保存的 Server/Runner 身份和 Connections，不会预先注册 Project。只有模型驱动的工作解析了具体目录时，才会出现对应 Runtime Project。在线且完整的 Runner inventory 是这些注册状态的权威来源；Desktop 可以清理过期的展示历史，但正常 Desktop UI 不负责修改 Project 注册状态。
 
 项目目录、Git 文件和 Runner policy 是彼此独立的边界：按需注册 Project 只是为已经获得授权的路径创建或复用 runtime identity，不会扩大 `allowed_roots`。
+
+## 工作区任务
+
+在侧栏打开“工作区任务”，明确选择一个已注册工作区。可以新增任务、填写标题与说明，
+或打开已有任务编辑内容和状态。标记完成时必须填写完成总结。保存使用已观察的 revision；
+如果其他客户端已修改任务，会保留当前输入，需要重新打开最新任务后再保存。任务与有权限
+的 CLI/MCP 调用方共享，不会自动执行。命令示例与远程总结写回见
+[CLI 工作区任务](CLI.zh-CN.md#工作区任务)。

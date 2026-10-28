@@ -4,6 +4,34 @@ use crate::ToolCallAuditProjection;
 use serde_json::json;
 use webcodex_tool_contracts::{ObserveJobsWakeOn, ToolCall};
 
+#[test]
+fn workspace_task_completion_audit_omits_report_content() {
+    let call = ToolCall::from_tool_name(
+        "complete_workspace_task",
+        json!({
+            "project": "agent:runner:demo",
+            "task_id": "wc_wtask_0123456789abcdef0123456789abcdef",
+            "expected_revision": 3,
+            "expected_root_fingerprint": "root",
+            "completion_summary": "PRIVATE_COMPLETION_REPORT"
+        }),
+    )
+    .unwrap();
+    let audit = call.session_log_arguments();
+    assert_eq!(audit["expected_revision"], 3);
+    assert_eq!(audit["summary_bytes"], "PRIVATE_COMPLETION_REPORT".len());
+    assert!(!audit.to_string().contains("PRIVATE_COMPLETION_REPORT"));
+    let result = crate::tool_audit::session_log_result_for_tool(
+        "complete_workspace_task",
+        &json!({
+            "task": { "task_id": "task", "revision": 4, "completion_summary": "PRIVATE_COMPLETION_REPORT" },
+            "root_fingerprint": "root"
+        }),
+    );
+    assert_eq!(result["revision"], 4);
+    assert!(!result.to_string().contains("PRIVATE_COMPLETION_REPORT"));
+}
+
 #[cfg(feature = "experimental-code-mode")]
 #[test]
 fn code_mode_exec_parses_outer_authority_and_omits_source_from_audit() {

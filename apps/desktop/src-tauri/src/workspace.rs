@@ -14,6 +14,9 @@ const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WorkspaceRequest {
     Overview {},
+    WorkspaceTasks {
+        request: webcodex_core::workspace_task::WorkspaceTaskRequest,
+    },
     Projects {},
     RunnerDetails {},
     BrowserStatus {},
@@ -94,6 +97,10 @@ fn request_body(
         runner.is_some_and(|runner| valid(value) && value.starts_with(&format!("agent:{runner}:")))
     };
     Ok(match request {
+        WorkspaceRequest::WorkspaceTasks { request } if valid(&request.project) => (
+            "workspace-tasks",
+            serde_json::to_value(request).map_err(|_| unavailable())?,
+        ),
         WorkspaceRequest::Overview {} => ("overview", json!({})),
         WorkspaceRequest::Projects {} => ("projects", json!({"limit": 200})),
         WorkspaceRequest::RunnerDetails {} if runner.is_some() => {
@@ -247,6 +254,16 @@ mod tests {
             "workspace_unavailable"
         );
     }
+    #[test]
+    fn task_requests_keep_fixed_endpoint_and_completion_fences() {
+        let request = serde_json::from_value::<WorkspaceRequest>(json!({"kind":"workspace_tasks","request":{"project":"agent:r:p","operation":{"action":"complete","task_id":"wc_wtask_test","expected_revision":2,"expected_root_fingerprint":"root","completion_summary":"Verified"}}})).unwrap();
+        let (route, body) = request_body(request, Some("r")).unwrap();
+        assert_eq!(route, "workspace-tasks");
+        assert_eq!(body["operation"]["expected_revision"], 2);
+        assert_eq!(body["operation"]["completion_summary"], "Verified");
+        assert!(serde_json::from_value::<WorkspaceRequest>(json!({"kind":"workspace_tasks","request":{"project":"agent:r:p","operation":{"action":"complete","task_id":"t","completion_summary":"x"}}})).is_err());
+    }
+
     #[test]
     fn request_vocabulary_is_closed_and_selectors_are_bounded() {
         assert!(serde_json::from_value::<WorkspaceRequest>(

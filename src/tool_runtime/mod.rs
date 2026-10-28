@@ -150,6 +150,7 @@ mod work_result;
 mod work_result_workspace;
 mod workbench_execution;
 mod workbench_state;
+mod workspace_tasks;
 pub(crate) use window_activity::{ActiveWindowRequest, MAX_ACTIVE_REQUESTS_PER_WINDOW};
 
 #[cfg(test)]

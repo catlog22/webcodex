@@ -167,17 +167,26 @@ impl State {
             return false;
         };
         let size = text.len();
-        if size > MAX_RESPONSE
-            || self
-                .queued
-                .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                    current
-                        .checked_add(size)
-                        .filter(|next| *next <= MAX_QUEUED_BYTES)
-                })
-                .is_err()
-        {
+        if size > MAX_RESPONSE {
             return false;
+        }
+        let mut current = self.queued.load(Ordering::Acquire);
+        loop {
+            let Some(next) = current
+                .checked_add(size)
+                .filter(|next| *next <= MAX_QUEUED_BYTES)
+            else {
+                return false;
+            };
+            match self.queued.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
         }
         route
             .tx
@@ -580,12 +589,10 @@ impl ExternalLease {
         if registry.routes.len() >= MAX_ROUTES {
             return Err(capacity());
         }
-        let id = self
-            .0
-            .state
-            .next_channel
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
-            .map_err(|_| capacity())?;
+        // 上面的 registry 锁保证通道编号分配串行执行。
+        let id = self.0.state.next_channel.load(Ordering::Acquire);
+        let next = id.checked_add(1).ok_or_else(capacity)?;
+        self.0.state.next_channel.store(next, Ordering::Release);
         let (tx, rx) = mpsc::sync_channel(128);
         registry.routes.insert(
             id,

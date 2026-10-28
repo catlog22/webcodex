@@ -255,7 +255,7 @@ Runner 配置术语中，`project_registry_dir` 是 Project registry TOML 文件
 
 ### 审查与 runtime activity
 
-旧 `webcodex task` namespace 已随独立 Connector Task/Result/Approval lifecycle 删除。`webcodex run` 会输出 Runtime Console 地址（`/runtime`）。现在的 review 使用 canonical Workflow Session、Job、Git/diff、`read_workspace_changes` 与 `finish_coding_task`，不再有 host-side result accept/reject queue。
+独立 Connector Task/Result/Approval lifecycle 已删除。当前 `webcodex task` namespace 用于管理工作区待办，见下方工作区任务说明。`webcodex run` 会输出 Runtime Console 地址（`/runtime`）。现在的 review 使用 canonical Workflow Session、Job、Git/diff、`read_workspace_changes` 与 `finish_coding_task`，不再有 host-side result accept/reject queue。
 
 ### 凭据与账号
 
@@ -408,3 +408,37 @@ Tunnel 和本地 MCP readiness。重复旧请求不会再次归档新 run 或重
 新 run 使用含 PID 和 run ID 的 v2 标记；旧二进制仍受同名 `.active` 文件阻挡。
 旧 v1 标记没有 owner 证据，保留原样并返回 `tunnel_legacy_owner_unverifiable`。即使确认风险，也不能证明旧执行者
 已经结束，因此仍需单独人工核对，命令不会自动迁移或删除。没有新增凭据或模型执行权限。
+
+## 工作区任务
+
+`webcodex task` 在选定的 Server 登记工作区待办，不自动执行，不创建 Agent Task，
+也不结束 Workflow Session。任务由同一精确 Project/root 身份下有访问权限的调用方
+共享；新增、编辑和完成还要求 Project 写权限。Desktop 的“工作区任务”页面复用同一
+记录，支持查看、新增、编辑与填写完成总结。
+
+```bash
+webcodex task add --workspace . --title "排查构建问题" --description-file task.txt --idempotency-key build-investigation-1 --json
+webcodex task list --workspace . --json
+webcodex task show --workspace . --task-id <task-id> --json
+webcodex task update --workspace . --task-id <task-id> --expected-revision 1 --status in_progress
+webcodex task complete --workspace . --task-id <task-id> --expected-revision 2 --summary-file summary.txt
+```
+
+连接默认读取选定的 Runner `--profile`（默认 `default`），也可指定 `--config`、
+`--server-url`、`--client-id` 和 `--token-file`。`--workspace` 默认当前本地目录，
+只定位已有注册；不会自动注册项目或开始执行。操作精确远程工作区时，改用
+`--project agent:<runner>:<project>`。凭据从文件读取，不接受命令行 token 明文。
+说明和总结的文件参数支持 `-`，从标准输入读取有界 UTF-8 文本。
+
+状态为 `open`、`in_progress`、`done`、`cancelled`。完成时必须填写非空
+`completion_summary`，最多 2,000 个字符、8,000 个 UTF-8 字节；`task show` 和 JSON
+输出可查看已保存总结。说明最多 8,000 个字符、32,000 个 UTF-8 字节。列表支持
+`--query`、`--status`、`--offset`、`--limit`（上限 50），返回 `next_offset`；每个工作区
+最多保留 1,000 项任务。新增结果不确定时复用相同幂等键和内容。编辑和完成必须携带
+已观察的 revision，冲突后重新读取；工作区根身份变更不会将旧请求重定向到新工作区。
+
+MCP 复用 `search_webcodex_resources(kind="workspace_task", project=...)` 检索，
+通过 `read_webcodex_resource(uri=...)` 读取正文、状态、总结及根身份。
+远程完成后用 `complete_workspace_task` 传入精确 Project、任务 ID、revision、根身份
+和总结写回结果；通过 `read_tool_manifest` 查询契约，通常经 `call_runtime_tool` 调用。
+完成总结是工作报告，不等于执行或验证成功的证据。

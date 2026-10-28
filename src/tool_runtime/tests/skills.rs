@@ -1810,7 +1810,25 @@ async fn skill_read_file_is_bounded_project_scoped_and_revision_guarded() {
     );
     assert!(definition_stale.output.get("text").is_none());
 
-    for path in ["../outside.txt", "/etc/passwd", "references/../guide.md"] {
+    // 先识别 Skill 来源；Project Skill 仍拒绝包外路径，白名单只适用于 configured Skill。
+    for (path, kind, reaches_runner) in [
+        ("../outside.txt", "skill_resource_path_invalid", true),
+        (
+            "/definitely/missing/webcodex-skill.txt",
+            "skill_resource_path_invalid",
+            true,
+        ),
+        (
+            "references/../guide.md",
+            "skill_resource_path_invalid",
+            true,
+        ),
+        (
+            "references/\u{1}guide.md",
+            "skill_resource_path_invalid",
+            false,
+        ),
+    ] {
         let (rejected, kinds) = call_kernel_with_local_agent(
             &runtime,
             "skill-read-a",
@@ -1820,10 +1838,11 @@ async fn skill_read_file_is_bounded_project_scoped_and_revision_guarded() {
         )
         .await;
         assert!(!rejected.success, "{path}");
-        assert_eq!(rejected.output["error_kind"], "skill_resource_path_invalid");
-        assert!(
+        assert_eq!(rejected.output["error_kind"], kind, "{path}");
+        assert_eq!(
             kinds.is_empty(),
-            "lexically invalid path must fail before Runner"
+            !reaches_runner,
+            "unexpected Runner contact for {path}: {kinds:?}"
         );
     }
 
@@ -3045,5 +3064,7 @@ async fn skill_safe_continuation_preserves_hash_project_and_path_admission() {
     .await;
     assert!(!rejected.success);
     assert_eq!(rejected.output["error_kind"], "skill_resource_path_invalid");
-    assert!(kinds.is_empty());
+    // 资源白名单由 Runner 校验，Server 不能提前拒绝相对包目录的路径。
+    assert!(kinds.iter().any(|kind| kind == "file_skill_read_file"));
+    assert!(rejected.output.get("text").is_none());
 }

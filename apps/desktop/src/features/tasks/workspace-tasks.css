@@ -1,0 +1,9 @@
+.workspace-task-toolbar { display: flex; align-items: end; flex-wrap: wrap; gap: var(--ui-space-3); margin-block: var(--ui-space-5); }
+.workspace-task-toolbar > :first-child { flex: 1 1 260px; }
+.workspace-task-list { list-style: none; margin: var(--ui-space-3) 0; padding: 0; border: 1px solid var(--ui-border-subtle); border-radius: var(--ui-radius-md); overflow: hidden; }
+.workspace-task-list li + li { border-top: 1px solid var(--ui-border-subtle); }
+.workspace-task-list button { width: 100%; display: flex; align-items: center; justify-content: space-between; gap: var(--ui-space-3); padding: var(--ui-space-4); text-align: left; border: 0; background: transparent; color: var(--ui-text-primary); cursor: pointer; }
+.workspace-task-list button:hover { background: var(--ui-glass-hover); }
+.workspace-task-list button > span:first-child { display: grid; gap: var(--ui-space-1); min-width: 0; overflow-wrap: anywhere; }
+.workspace-task-list time { color: var(--ui-text-secondary); font-size: 13px; }
+.workspace-task-form { display: grid; gap: var(--ui-space-4); }

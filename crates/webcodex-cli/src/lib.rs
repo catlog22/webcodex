@@ -109,6 +109,7 @@ fn default_runner_service_scope(effective_root: bool) -> ServiceScope {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CliAction {
     Environment(Vec<String>),
+    Task(webcodex_cli::tasks::TaskCommand),
     Project(Vec<String>),
     Controller(ControllerCommand),
     ProjectRegister(ProjectRegisterOptions),
@@ -391,6 +392,8 @@ where
     }
     match args[0].as_str() {
         "environment" => CliAction::Environment(args[1..].to_vec()),
+        "task" if args.iter().any(|arg| arg == "--help" || arg == "-h") => CliAction::Exit { code: 0, stdout: webcodex_cli::tasks::USAGE.into(), stderr: String::new() },
+        "task" => match webcodex_cli::tasks::parse(&args[1..]) { Ok(command) => CliAction::Task(command), Err(error) => cli_parse_error(error) },
         "--help" | "-h" => CliAction::Exit {
             code: 0,
             stdout: usage().to_string(),
@@ -2805,6 +2808,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     eprintln!("{error}");
                 }
+                std::process::exit(1);
+            }
+        },
+        CliAction::Task(command) => match webcodex_cli::tasks::run(command).await {
+            Ok(output) => {
+                println!("{output}");
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!("{error}");
                 std::process::exit(1);
             }
         },

@@ -67,6 +67,10 @@ mod server_instance;
 mod window_activity;
 mod window_inventory;
 mod workbench_preferences;
+mod workspace_tasks;
+pub use workspace_tasks::WorkspaceTaskError;
+#[cfg(test)]
+mod workspace_tasks_tests;
 pub use window_inventory::{WindowInventoryPage, WindowInventoryQuery, WindowInventoryRow};
 
 pub use self::admin_project_lifecycle::{AdminProjectAudit, AdminProjectIdempotencyRecord};

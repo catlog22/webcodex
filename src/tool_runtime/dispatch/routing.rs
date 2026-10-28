@@ -36,6 +36,30 @@ impl AuthorizedDispatch<'_, '_> {
             .then_some(recorder.recording_session_project.as_deref())
             .flatten();
         match call {
+            ToolCall::CompleteWorkspaceTask {
+                project,
+                task_id,
+                expected_revision,
+                expected_root_fingerprint,
+                completion_summary,
+            } => {
+                runtime
+                    .workspace_task_request_after_governance(
+                        webcodex_core::workspace_task::WorkspaceTaskRequest {
+                            project,
+                            operation:
+                                webcodex_core::workspace_task::WorkspaceTaskOperation::Complete {
+                                    task_id,
+                                    expected_revision,
+                                    expected_root_fingerprint,
+                                    completion_summary,
+                                },
+                        },
+                        auth,
+                    )
+                    .await
+            }
+
             ToolCall::OpenWebcodexWorkbench {
                 client_id,
                 project,

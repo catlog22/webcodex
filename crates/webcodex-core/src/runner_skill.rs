@@ -151,7 +151,7 @@ impl RunnerSkillExecutionRequest {
         {
             return Err("invalid Runner Skill execution request");
         }
-        let path = normalize_runner_skill_resource_path(&self.path)?;
+        let path = normalize_runner_skill_package_resource_path(&self.path)?;
         let extension = Path::new(&path)
             .extension()
             .and_then(|value| value.to_str())
@@ -437,27 +437,37 @@ pub fn valid_runner_skill_id(value: &str) -> bool {
 
 pub fn normalize_runner_skill_resource_path(path: &str) -> Result<String, &'static str> {
     let trimmed = path.trim();
-    #[cfg(windows)]
-    if trimmed.contains(':') {
-        return Err("invalid Runner Skill resource path");
-    }
     if trimmed.is_empty()
         || trimmed.chars().count() > MAX_SKILL_RESOURCE_PATH_CHARS
         || trimmed.chars().any(char::is_control)
-        || trimmed.starts_with('/')
-        || trimmed.starts_with('\\')
-        || trimmed.as_bytes().get(1) == Some(&b':')
     {
         return Err("invalid Runner Skill resource path");
     }
-    let normalized = trimmed.replace('\\', "/");
-    if normalized
-        .split('/')
-        .any(|component| component.is_empty() || component == "." || component == "..")
+    // Syntactic check only. Absolute paths and parent traversal are accepted on
+    // the wire so Skills can reference documents outside their package; the
+    // Runner confines the resolved file to the Skill package or an
+    // operator-configured `skills.resource_roots` entry, and still applies the
+    // sensitive-path blacklist, per-component symlink rejection, and the file
+    // type/size limits at read time.
+    Ok(trimmed.replace('\\', "/"))
+}
+
+/// 保持 Project、managed Skill 和脚本执行的包内路径边界。
+pub fn normalize_runner_skill_package_resource_path(path: &str) -> Result<String, &'static str> {
+    let normalized = normalize_runner_skill_resource_path(path)?;
+    if normalized.starts_with('/')
+        || normalized.as_bytes().get(1) == Some(&b':')
+        || normalized
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
         || Path::new(&normalized)
             .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
+            .any(|part| !matches!(part, Component::Normal(_)))
     {
+        return Err("invalid Runner Skill resource path");
+    }
+    #[cfg(windows)]
+    if normalized.contains(':') {
         return Err("invalid Runner Skill resource path");
     }
     Ok(normalized)
@@ -640,6 +650,16 @@ mod tests {
         invalid_path.path = "scripts/probe.rb".to_string();
         assert!(invalid_path.validate().is_err());
 
+        for path in [
+            "scripts/../probe.py",
+            "scripts//probe.py",
+            "scripts/./probe.py",
+        ] {
+            let mut escaped = configured_request.clone();
+            escaped.path = path.to_string();
+            assert!(escaped.validate().is_err(), "{path}");
+        }
+
         let mut invalid_arg = configured_request.clone();
         invalid_arg.args = vec!["bad\0arg".to_string()];
         assert!(invalid_arg.validate().is_err());
@@ -682,16 +702,54 @@ mod tests {
     }
 
     #[test]
-    fn resource_paths_are_relative_and_normalized() {
+    fn resource_paths_are_normalized_and_only_syntactically_validated() {
         assert_eq!(
             normalize_runner_skill_resource_path("references\\guide.md").unwrap(),
             "references/guide.md"
         );
+        // Whitelist adaptation: traversal and absolute paths are accepted on
+        // the wire; the Runner confines resolution to the Skill package or an
+        // operator-configured resource root.
+        assert_eq!(
+            normalize_runner_skill_resource_path("../secret").unwrap(),
+            "../secret"
+        );
+        assert_eq!(
+            normalize_runner_skill_resource_path("references/../secret").unwrap(),
+            "references/../secret"
+        );
+        assert_eq!(
+            normalize_runner_skill_resource_path("/etc/passwd").unwrap(),
+            "/etc/passwd"
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            normalize_runner_skill_resource_path("C:\\secret").unwrap(),
+            "C:/secret"
+        );
+        // 外部资源读取不能扩大 Project/managed Skill 或脚本执行的包内路径权限。
         for invalid in [
             "../secret",
             "references/../secret",
             "/etc/passwd",
-            "C:\\secret",
+            "C:/secret",
+            "a//b",
+            "./x",
+        ] {
+            assert!(
+                normalize_runner_skill_package_resource_path(invalid).is_err(),
+                "{invalid}"
+            );
+        }
+        assert_eq!(
+            normalize_runner_skill_package_resource_path("references/guide.md").unwrap(),
+            "references/guide.md"
+        );
+        for invalid in [
+            "",
+            "   ",
+            "references/\u{1}secret",
+            &"x".repeat(MAX_SKILL_RESOURCE_PATH_CHARS + 1),
         ] {
             assert!(normalize_runner_skill_resource_path(invalid).is_err());
         }

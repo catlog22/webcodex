@@ -15,6 +15,7 @@ pub(crate) mod runner_service;
 pub(crate) mod server;
 pub(crate) mod service;
 pub(crate) mod system;
+pub(crate) mod tasks;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub(crate) mod token_commands;

@@ -20,6 +20,11 @@ enum ResourceIdentity {
         path: String,
     },
     Goal(String),
+    WorkspaceTask {
+        id: String,
+        root: String,
+        task_id: String,
+    },
 }
 
 fn encode(value: &str) -> String {
@@ -39,6 +44,14 @@ fn file_uri(id: &str, root: &str, path: &str) -> String {
         encode(id),
         encode(root),
         encode(path)
+    )
+}
+fn workspace_task_uri(id: &str, root: &str, task_id: &str) -> String {
+    format!(
+        "{RESOURCE_PREFIX}workspace-task/{}/{}/{}",
+        encode(id),
+        encode(root),
+        encode(task_id)
     )
 }
 fn goal_uri(id: &str) -> String {
@@ -64,6 +77,18 @@ fn parse_uri(uri: &str) -> Option<ResourceIdentity> {
                 id: decode(id)?,
                 root: decode(root)?,
                 path,
+            })
+        }
+        ["workspace-task", id, root, task_id] => {
+            let task_id = decode(task_id)?;
+            let suffix = task_id.strip_prefix("wc_wtask_")?;
+            if suffix.len() != 32 || !suffix.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            Some(ResourceIdentity::WorkspaceTask {
+                id: decode(id)?,
+                root: decode(root)?,
+                task_id,
             })
         }
         ["goal", id] => {
@@ -378,6 +403,53 @@ impl ToolRuntime {
                     incomplete,
                 )
             }
+            WebcodexResourceKind::WorkspaceTask => {
+                let Some(project) = project else {
+                    return error("resource_project_required");
+                };
+                let limit = limit.min(50);
+                let result = self
+                    .workspace_task_request(
+                        webcodex_core::workspace_task::WorkspaceTaskRequest {
+                            project,
+                            operation:
+                                webcodex_core::workspace_task::WorkspaceTaskOperation::List {
+                                    query: webcodex_core::workspace_task::WorkspaceTaskListQuery {
+                                        query,
+                                        offset,
+                                        limit: Some(limit),
+                                        status: None,
+                                    },
+                                },
+                        },
+                        auth,
+                    )
+                    .await;
+                if !result.success {
+                    return result;
+                }
+                let Some(project) = result.output["project"].as_str() else {
+                    return error("resource_unavailable");
+                };
+                let Some(root) = result.output["root_fingerprint"].as_str() else {
+                    return error("resource_identity_unavailable");
+                };
+                let rows = result.output["tasks"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                let items = rows.iter().filter_map(|task| {
+                    let id = task["task_id"].as_str()?;
+                    Some(link(workspace_task_uri(project, root, id), task["title"].as_str()?, "Workspace todo; registration does not execute work", json!({"kind":"workspace_task","task_id":id,"project":project,"status":task["status"],"revision":task["revision"]})))
+                }).collect();
+                page(
+                    items,
+                    result.output["total"].as_u64().unwrap_or(0) as usize,
+                    offset,
+                    limit,
+                    false,
+                )
+            }
             WebcodexResourceKind::Goal => {
                 let result = self
                     .resource_observation(
@@ -508,6 +580,26 @@ impl ToolRuntime {
             return error("invalid_resource_uri");
         };
         let (kind, mut observed) = match identity {
+            ResourceIdentity::WorkspaceTask { id, root, task_id } => {
+                let selector = match self.pinned_project(&id, &root, auth).await {
+                    Ok(selector) => selector,
+                    Err(result) => return result,
+                };
+                (
+                    "workspace_task",
+                    self.workspace_task_request(
+                        webcodex_core::workspace_task::WorkspaceTaskRequest {
+                            project: selector,
+                            operation:
+                                webcodex_core::workspace_task::WorkspaceTaskOperation::Read {
+                                    task_id,
+                                },
+                        },
+                        auth,
+                    )
+                    .await,
+                )
+            }
             ResourceIdentity::Goal(id) => (
                 "goal",
                 self.resource_observation("get_goal", json!({"goal_id":id}), auth)
@@ -610,6 +702,7 @@ impl ToolRuntime {
             .get("revision")
             .cloned()
             .or_else(|| observed.output.pointer("/goal/summary/revision").cloned())
+            .or_else(|| observed.output.pointer("/task/revision").cloned())
             .or_else(|| observed.output.get("read_revision").cloned())
             .or_else(|| observed.output.get("sha256").cloned());
         let mut budget_truncated = false;

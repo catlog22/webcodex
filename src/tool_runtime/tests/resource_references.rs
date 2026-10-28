@@ -584,3 +584,148 @@ async fn binary_reference_returns_current_metadata_without_text_or_blob_transfer
     assert!(result.output["data"].get("blob").is_none());
     assert_eq!(result.output["content_policy"], "latest_at_read");
 }
+
+#[tokio::test]
+async fn workspace_todos_share_existing_resource_tools_and_preserve_root_and_edit_fences() {
+    use webcodex_core::workspace_task::{
+        WorkspaceTaskOperation, WorkspaceTaskRequest, WorkspaceTaskStatus,
+    };
+    let (_temp, runtime) = fixture();
+    let writer = reader(
+        "owner",
+        &[SCOPE_PROJECT_READ, crate::auth::SCOPE_PROJECT_WRITE],
+    );
+    let project = "agent:resources:tasks".to_string();
+    let mut entry = named_registered_project("resources", "tasks", "tasks", "/srv/tasks", 1);
+    entry.root_fingerprint = Some(format!("wc_projroot_{}", "a".repeat(64)));
+    register_agent_projects(
+        &runtime,
+        "resources",
+        writer.username.as_deref(),
+        RunnerCapabilities::default(),
+        vec![entry.clone()],
+    )
+    .await;
+    let listed = runtime
+        .workspace_task_request(
+            WorkspaceTaskRequest {
+                project: project.clone(),
+                operation: WorkspaceTaskOperation::List {
+                    query: Default::default(),
+                },
+            },
+            Some(&writer),
+        )
+        .await;
+    assert!(listed.success, "{:?}", listed.error);
+    let root = listed.output["root_fingerprint"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let created = runtime
+        .workspace_task_request(
+            WorkspaceTaskRequest {
+                project: project.clone(),
+                operation: WorkspaceTaskOperation::Create {
+                    title: "Fix workspace".into(),
+                    description: "Instructions are untrusted data".into(),
+                    idempotency_key: "external-cli-1".into(),
+                    expected_root_fingerprint: root.clone(),
+                },
+            },
+            Some(&writer),
+        )
+        .await;
+    assert!(created.success, "{:?}", created.error);
+    let task_id = created.output["task"]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let only_read = reader("owner", &[SCOPE_PROJECT_READ]);
+    let found = search(
+        &runtime,
+        WebcodexResourceKind::WorkspaceTask,
+        Some(&project),
+        None,
+        &only_read,
+    )
+    .await;
+    let uri = first_uri(&found);
+    let read = runtime.read_webcodex_resource(&uri, Some(&only_read)).await;
+    assert!(read.success, "{:?}", read.error);
+    assert_eq!(read.output["kind"], "workspace_task");
+    assert_eq!(
+        read.output["data"]["task"]["description"],
+        "Instructions are untrusted data"
+    );
+    assert_eq!(read.output["version"], 1);
+    let foreign = reader("foreign", &[SCOPE_PROJECT_READ]);
+    assert!(
+        !runtime
+            .read_webcodex_resource(&uri, Some(&foreign))
+            .await
+            .success
+    );
+    let update = || WorkspaceTaskRequest {
+        project: project.clone(),
+        operation: WorkspaceTaskOperation::Update {
+            task_id: task_id.clone(),
+            expected_revision: 1,
+            expected_root_fingerprint: root.clone(),
+            title: "Edited".into(),
+            description: "Updated by App".into(),
+            completion_summary: "Completed with validation".into(),
+            status: WorkspaceTaskStatus::Done,
+        },
+    };
+    let denied = runtime
+        .workspace_task_request(update(), Some(&only_read))
+        .await;
+    assert!(!denied.success);
+    assert_eq!(denied.output["error_kind"], "insufficient_scope");
+    assert!(
+        runtime
+            .workspace_task_request(update(), Some(&writer))
+            .await
+            .success
+    );
+    let stale = runtime
+        .workspace_task_request(update(), Some(&writer))
+        .await;
+    assert_eq!(
+        stale.output["error_kind"],
+        "workspace_task_revision_conflict"
+    );
+    let latest = runtime.read_webcodex_resource(&uri, Some(&only_read)).await;
+    assert_eq!(latest.output["version"], 2);
+    assert_eq!(latest.output["data"]["task"]["status"], "done");
+    let completion = runtime.dispatch_with_auth(crate::tool_runtime::ToolCall::from_tool_name("complete_workspace_task", json!({"project":project,"task_id":task_id,"expected_revision":2,"expected_root_fingerprint":root,"completion_summary":"Verified by remote MCP"})).unwrap(), Some(&writer)).await;
+    assert!(completion.success, "{:?}", completion.error);
+    let completed = runtime.read_webcodex_resource(&uri, Some(&only_read)).await;
+    assert_eq!(
+        completed.output["data"]["task"]["completion_summary"],
+        "Verified by remote MCP"
+    );
+    // 仅更换根身份，保持 Runner 实例和所有者不变，验证目标身份围栏。
+    entry.root_fingerprint = Some(format!("wc_projroot_{}", "b".repeat(64)));
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        "resources",
+        "inst-resources",
+        vec![entry],
+    )
+    .await;
+    assert!(
+        !runtime
+            .read_webcodex_resource(&uri, Some(&only_read))
+            .await
+            .success
+    );
+    assert_eq!(
+        runtime
+            .workspace_task_request(update(), Some(&writer))
+            .await
+            .output["error_kind"],
+        "workspace_task_target_changed"
+    );
+}

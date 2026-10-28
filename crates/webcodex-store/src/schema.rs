@@ -79,6 +79,7 @@ impl Database {
 
     fn init_tables(&self) -> anyhow::Result<()> {
         let mut conn = self.lock_connection(crate::StoreDomain::Schema);
+        conn.execute_batch(include_str!("workspace_tasks.sql"))?;
         conn.execute_batch(
             "
             CREATE TABLE IF NOT EXISTS wc_external_observations (

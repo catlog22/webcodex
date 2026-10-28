@@ -69,7 +69,21 @@ export interface ExtensionsSnapshot {
   skills: { available: boolean; catalog?: { skills: SkillSummary[]; truncated?: boolean } };
   plugins: { available: boolean; catalog?: { plugins: PluginSummary[]; truncated?: boolean } };
 }
+export interface WorkspaceTask {
+  task_id: string; project: string; title: string; description: string; completion_summary: string;
+  status: WorkspaceTaskStatus; revision: number; created_at: number; updated_at: number;
+}
+export type WorkspaceTaskStatus = "open" | "in_progress" | "done" | "cancelled";
+export interface WorkspaceTaskPage {
+  project: string; root_fingerprint: string; tasks: Omit<WorkspaceTask, "description" | "completion_summary">[]; total: number; next_offset: number | null;
+}
+export type WorkspaceTaskOperation =
+  | { action: "list"; query: { status?: WorkspaceTaskStatus; query?: string; offset?: number; limit?: number } }
+  | { action: "read"; task_id: string }
+  | { action: "create"; title: string; description: string; idempotency_key: string; expected_root_fingerprint: string }
+  | { action: "update"; task_id: string; title: string; description: string; completion_summary: string; status: WorkspaceTaskStatus; expected_revision: number; expected_root_fingerprint: string };
 export type WorkspaceRequest =
+  | { kind: "workspace_tasks"; request: { project: string; operation: WorkspaceTaskOperation } }
   | { kind: "overview" | "projects" | "runner_details" | "browser_status" | "windows" }
   | { kind: "sessions" | "extensions" | "project_git"; project: string }
   | { kind: "session"; project: string; session_id: string }

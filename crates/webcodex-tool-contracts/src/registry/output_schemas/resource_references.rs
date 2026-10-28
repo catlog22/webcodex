@@ -1,8 +1,12 @@
 use super::common::wrapped_output_schema;
+use super::common::wrapped_typed_output_schema;
 use serde_json::{json, Value};
 
 pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
     match name {
+        "complete_workspace_task" => Some(wrapped_typed_output_schema::<
+            webcodex_core::workspace_task::WorkspaceTaskDetail,
+        >(Vec::new())),
         "open_webcodex_workbench" => Some(wrapped_output_schema(vec![
             ("client_id", json!({"type":["string","null"]})),
             ("runners", json!({"type":"object"})),
@@ -37,7 +41,10 @@ pub(super) fn output_schema_for_tool(name: &str) -> Option<Value> {
         ])),
         "read_webcodex_resource" => Some(wrapped_output_schema(vec![
             ("uri", json!({"type":"string"})),
-            ("kind", json!({"enum":["project","file","goal"]})),
+            (
+                "kind",
+                json!({"enum":["project","file","goal","workspace_task"]}),
+            ),
             ("version", json!({"type":["string","integer","null"]})),
             (
                 "data",

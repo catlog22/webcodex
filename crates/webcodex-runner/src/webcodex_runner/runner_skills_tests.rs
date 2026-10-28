@@ -41,6 +41,7 @@ fn configured_fixture() -> (TempDir, SkillsConfig, RunnerSkillDescriptor) {
     write_configured_skill(root.path());
     let config = SkillsConfig {
         roots: vec![root.path().to_path_buf()],
+        ..Default::default()
     };
     let descriptor = configured_skills::discover(&config)
         .unwrap()

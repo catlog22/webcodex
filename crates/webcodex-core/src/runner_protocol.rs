@@ -1235,6 +1235,8 @@ pub enum RunnerConfigErrorField {
     MaxConcurrentJobs,
     #[serde(rename = "skills.roots")]
     SkillsRoots,
+    #[serde(rename = "skills.resource_roots")]
+    SkillsResourceRoots,
     #[serde(rename = "instructions.files")]
     InstructionsFiles,
     #[serde(rename = "shell.max_persistent_shells")]
@@ -1345,7 +1347,10 @@ impl RunnerConfigOperationResponse {
             (None, None) => {}
             (Some(_), Some(RunnerConfigErrorReason::OutOfRange)) => {}
             (
-                Some(RunnerConfigErrorField::SkillsRoots),
+                Some(
+                    RunnerConfigErrorField::SkillsRoots
+                    | RunnerConfigErrorField::SkillsResourceRoots,
+                ),
                 Some(RunnerConfigErrorReason::InvalidPath),
             )
             | (

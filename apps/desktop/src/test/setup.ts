@@ -31,6 +31,11 @@ if (!globalThis.ResizeObserver) {
 }
 if (!HTMLElement.prototype.scrollIntoView) HTMLElement.prototype.scrollIntoView = () => {};
 
+// jsdom 不提供 FontFaceSet；Mantine 的自适应文本框订阅其字体加载事件。
+if (!document.fonts) {
+  Object.defineProperty(document, "fonts", { configurable: true, value: new EventTarget() });
+}
+
 afterEach(() => {
   cleanup();
   window.localStorage.clear();
