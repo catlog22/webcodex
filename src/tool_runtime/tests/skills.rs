@@ -3064,5 +3064,7 @@ async fn skill_safe_continuation_preserves_hash_project_and_path_admission() {
     .await;
     assert!(!rejected.success);
     assert_eq!(rejected.output["error_kind"], "skill_resource_path_invalid");
-    assert!(kinds.is_empty());
+    // 资源白名单由 Runner 校验，Server 不能提前拒绝相对包目录的路径。
+    assert!(kinds.iter().any(|kind| kind == "file_skill_read_file"));
+    assert!(rejected.output.get("text").is_none());
 }
