@@ -2,7 +2,16 @@ use super::*;
 
 #[tokio::test]
 async fn cli_and_app_task_endpoint_shares_mcp_reads_and_completion_summaries() {
-    let (_temp, _db, runtime) = test_runtime_with_goal_db();
+    let temp = tempfile::tempdir().unwrap();
+    let db = Arc::new(crate::Database::open(&temp.path().join("tasks-console.db")).unwrap());
+    let runtime = Arc::new(
+        ToolRuntime::new(
+            Arc::new(crate::RunnerRegistry::default()),
+            Arc::new(RuntimeInfo::default()),
+        )
+        .with_communication_database(db.clone())
+        .with_project_reference_database(db),
+    );
     let auth = scoped_oauth(&[SCOPE_PROJECT_READ, crate::auth::SCOPE_PROJECT_WRITE]);
     register_project(&runtime, "tasks", "demo", "/srv/tasks", Some(&auth)).await;
     let root = format!("wc_projroot_{}", "a".repeat(64));
@@ -43,6 +52,7 @@ async fn cli_and_app_task_endpoint_shares_mcp_reads_and_completion_summaries() {
     assert!(found.success);
     let uri = found.output["items"][0]["uri"].as_str().unwrap();
     let read = runtime.read_webcodex_resource(uri, Some(&auth)).await;
+    assert!(read.success, "{:?} {:?}", read.error, read.output);
     assert_eq!(read.output["data"]["task"]["title"], "CLI task");
     let complete = runtime.dispatch_with_auth(ToolCall::from_tool_name("complete_workspace_task", json!({"project":project,"task_id":id,"expected_revision":1,"expected_root_fingerprint":root,"completion_summary":"Implemented and checked remotely"})).unwrap(), Some(&auth)).await;
     assert!(complete.success, "{:?}", complete.error);

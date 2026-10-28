@@ -591,11 +591,21 @@ async fn workspace_todos_share_existing_resource_tools_and_preserve_root_and_edi
         WorkspaceTaskOperation, WorkspaceTaskRequest, WorkspaceTaskStatus,
     };
     let (_temp, runtime) = fixture();
-    let project = register(&runtime, "tasks", 'a').await;
     let writer = reader(
         "owner",
         &[SCOPE_PROJECT_READ, crate::auth::SCOPE_PROJECT_WRITE],
     );
+    let project = "agent:resources:tasks".to_string();
+    let mut entry = named_registered_project("resources", "tasks", "tasks", "/srv/tasks", 1);
+    entry.root_fingerprint = Some(format!("wc_projroot_{}", "a".repeat(64)));
+    register_agent_projects(
+        &runtime,
+        "resources",
+        writer.username.as_deref(),
+        RunnerCapabilities::default(),
+        vec![entry.clone()],
+    )
+    .await;
     let listed = runtime
         .workspace_task_request(
             WorkspaceTaskRequest {
@@ -649,6 +659,13 @@ async fn workspace_todos_share_existing_resource_tools_and_preserve_root_and_edi
         "Instructions are untrusted data"
     );
     assert_eq!(read.output["version"], 1);
+    let foreign = reader("foreign", &[SCOPE_PROJECT_READ]);
+    assert!(
+        !runtime
+            .read_webcodex_resource(&uri, Some(&foreign))
+            .await
+            .success
+    );
     let update = || WorkspaceTaskRequest {
         project: project.clone(),
         operation: WorkspaceTaskOperation::Update {
@@ -689,7 +706,15 @@ async fn workspace_todos_share_existing_resource_tools_and_preserve_root_and_edi
         completed.output["data"]["task"]["completion_summary"],
         "Verified by remote MCP"
     );
-    register(&runtime, "tasks", 'b').await;
+    // 仅更换根身份，保持 Runner 实例和所有者不变，验证目标身份围栏。
+    entry.root_fingerprint = Some(format!("wc_projroot_{}", "b".repeat(64)));
+    crate::test_support::apply_project_inventory_snapshot(
+        &runtime.runner_registry,
+        "resources",
+        "inst-resources",
+        vec![entry],
+    )
+    .await;
     assert!(
         !runtime
             .read_webcodex_resource(&uri, Some(&only_read))
