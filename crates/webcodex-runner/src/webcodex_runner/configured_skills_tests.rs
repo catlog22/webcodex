@@ -374,7 +374,8 @@ fn resource_root_ancestor_alias_is_allowed_but_descendant_symlinks_are_not() {
         .into_iter()
         .find(|skill| skill.package_root.ends_with("demo"))
         .unwrap();
-    for root in [alias.join("docs"), actual.join("docs")] {
+    // 只承认明确配置的路径及其规范路径，不探测其他未配置别名。
+    for root in [alias.join("docs"), actual.join("docs").canonicalize().unwrap()] {
         assert_eq!(
             read_resource(
                 &config,
