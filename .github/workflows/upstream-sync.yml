@@ -1,0 +1,34 @@
+name: Upstream sync PR
+
+on:
+  schedule:
+    - cron: '17 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: upstream-sync-pr
+  cancel-in-progress: false
+
+jobs:
+  upstream-pr:
+    if: github.repository == 'catlog22/webcodex' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Test upstream PR safety boundaries
+        run: python3 -B -m unittest scripts.tests.test_upstream_sync_pr
+      - name: Open or reuse upstream review PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B scripts/upstream_sync_pr.py

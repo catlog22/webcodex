@@ -85,6 +85,16 @@ Desktop 贡献者还应查看 [docs/DESKTOP_DEVELOPMENT.zh-CN.md](docs/DESKTOP_D
 
 开发机上的普通 Cargo `dev` / `test` profile 会有意关闭源码行号 debuginfo，以减小大型测试二进制和链接开销。Linux 开发者可按需使用 `bash scripts/cargo_fast.sh <cargo-args>`；只有在 Linux 且检测到 mold 时才通过 `mold -run` 启动 Cargo。缺少 mold 时会透明回退到普通 Cargo，且不会修改 macOS 或 Windows 的链接器。
 
+## Fork 上游同步
+
+`catlog22/webcodex` 的 `Upstream sync PR` 工作流每天在 UTC 02:17（北京时间 10:17）
+检查 `yyjeqhc/webcodex:main`，也可从 `main` 手动触发。它只创建或复用一个指向 `main`
+的跨 fork PR，不合并、不批准、不写分支引用，也不自动解决冲突。请人工审核 diff 和 CI，
+保留本 fork 的工作区任务与 Skill 资源白名单改动；有冲突时在另行维护的集成分支中处理，
+不要覆盖本地工作。仓库 Actions 设置需要允许创建 PR；工作流 job 仅授予 contents read
+和 pull requests write。GitHub 可能要求人工批准 token 创建的 PR 的 CI。
+安装并登录 GitHub CLI 后，可运行 `python3 scripts/upstream_sync_pr.py --dry-run` 只读预览。
+
 ## Pull requests
 
 Pull request 应说明改了什么、为什么需要这项改动，以及执行了哪些验证。有相关 issue 时请进行关联。

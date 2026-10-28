@@ -133,6 +133,20 @@ may optionally run Cargo through `bash scripts/cargo_fast.sh <cargo-args>`; the 
 runs Cargo under `mold -run` only when mold is available. Missing mold falls back to
 normal Cargo, and the wrapper never changes the macOS or Windows linker.
 
+## Fork upstream synchronization
+
+In `catlog22/webcodex`, the `Upstream sync PR` workflow checks
+`yyjeqhc/webcodex:main` daily at 02:17 UTC (10:17 China time), or on manual
+dispatch from `main`. It opens or reuses one cross-fork PR into `main`; it never
+merges, approves, writes branch refs, or resolves conflicts. Review the diff and
+CI manually, preserving this fork's workspace tasks and Skill resource whitelist.
+Resolve conflicts in a separately maintained integration branch without
+overwriting local work. The workflow requires the repository's Actions setting
+to allow PR creation; its job grants only contents read and pull requests write.
+GitHub may require manual approval of CI for token-created PRs. For a read-only
+preview with an authenticated GitHub CLI, run
+`python3 scripts/upstream_sync_pr.py --dry-run`.
+
 ## Pull requests
 
 A pull request should explain what changed, why the change is needed, and what
