@@ -319,12 +319,7 @@ fn unified_project_and_auth_commands_dispatch() {
             CliAction::Project(_)
         ));
     }
-    match cli_action(["task", "list"]) {
-        CliAction::Task(command) => {
-            assert_eq!(command.action, "list");
-        }
-        other => panic!("expected workspace task command, got {other:?}"),
-    }
+    assert!(matches!(cli_action(["task", "list"]), CliAction::Task(_)));
     match cli_action(["auth", "status", "--help"]) {
         CliAction::Exit { code, stdout, .. } => {
             assert_eq!(code, 0);

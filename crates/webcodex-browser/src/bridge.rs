@@ -589,7 +589,7 @@ impl ExternalLease {
         if registry.routes.len() >= MAX_ROUTES {
             return Err(capacity());
         }
-        // Channel allocation is serialized by the registry lock above.
+        // 上面的 registry 锁保证通道编号分配串行执行。
         let id = self.0.state.next_channel.load(Ordering::Acquire);
         let next = id.checked_add(1).ok_or_else(capacity)?;
         self.0.state.next_channel.store(next, Ordering::Release);
