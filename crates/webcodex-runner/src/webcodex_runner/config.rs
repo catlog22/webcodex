@@ -26,7 +26,7 @@ use webcodex_runner_config::{
 const DEFAULT_SYSTEM_CONFIG_DIR: &str = "/etc/webcodex";
 pub(crate) const CLIENT_PROFILE_ERROR: &str =
     "--profile must be a safe path component using only ASCII letters, digits, '.', '_' or '-'";
-pub(crate) const DEFAULT_MAX_CONCURRENT_JOBS: usize = 4;
+pub(crate) const DEFAULT_MAX_CONCURRENT_JOBS: usize = 32;
 pub(crate) const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_SECS: u64 = 5;
 
 const DEFAULT_ACP_MAX_CONCURRENT_RUNS: usize = 1;
@@ -135,8 +135,10 @@ pub(crate) struct RunnerConfig {
     pub(crate) acp: AcpConfig,
 }
 
-const ACP_MAX_ENV_MAPPINGS: usize = 64;
-const ACP_MAX_ENV_NAME_BYTES: usize = 256;
+// Shared with the CodingAgent Diagnose projection so its output schema can
+// never disagree with what this validation admits.
+const ACP_MAX_ENV_MAPPINGS: usize = webcodex_core::coding_agent::CODING_AGENT_MAX_ENV_MAPPINGS;
+const ACP_MAX_ENV_NAME_BYTES: usize = webcodex_core::coding_agent::CODING_AGENT_MAX_ENV_NAME_BYTES;
 const ACP_MAX_ARGS: usize = 64;
 const ACP_MAX_ARG_BYTES: usize = 4096;
 const ACP_MAX_ARGS_BYTES: usize = 16 * 1024;
@@ -540,6 +542,7 @@ pub(crate) struct ShellProfileConfig {
 
 pub(crate) struct HotRunnerConfig {
     pub(crate) generation: u64,
+    pub(crate) max_concurrent_jobs: usize,
     pub(crate) policy: RunnerPolicy,
     pub(crate) shell: ShellConfig,
     pub(crate) skills: SkillsConfig,
@@ -563,6 +566,7 @@ impl HotRunnerConfig {
         let ssh = ManagedSshResourceStore::merge_active(&cfg.ssh, startup_managed_ssh)?;
         Ok(Self {
             generation,
+            max_concurrent_jobs: max_concurrent_jobs(cfg),
             policy: cfg.policy.clone(),
             shell: cfg.shell.clone(),
             skills: cfg.skills.clone(),
@@ -580,6 +584,7 @@ impl HotRunnerConfig {
 }
 
 pub(crate) struct ReloadableRunnerConfig {
+    pub(crate) jobs: super::job_manager::JobManager,
     startup: RunnerConfig,
     startup_managed_ssh: SshConfig,
     managed_ssh: Arc<ManagedSshResourceStore>,
@@ -623,6 +628,8 @@ impl ReloadableRunnerConfig {
             }
         };
         Self {
+            jobs: super::job_manager::JobManager::new(max_concurrent_jobs(&startup))
+                .with_detached_profile_identity(&startup.server_url),
             mcp_gateway: Arc::new(McpGatewayManager::new(&startup.mcp_gateway)),
             plugins: Arc::new(PluginManager::new(&startup, path.clone())),
             coding_agents,
@@ -651,6 +658,7 @@ impl ReloadableRunnerConfig {
         // after their managers have entered stopping state.
         let _reload_guard = lock_unpoison(&self.reload_lock);
         self.stopping.store(true, Ordering::SeqCst);
+        self.jobs.stop_accepting_work();
         self.mcp_gateway.shutdown();
         self.plugins.shutdown();
         if let Some(manager) = &self.coding_agents {
@@ -894,6 +902,8 @@ impl ReloadableRunnerConfig {
                 // through this Hot config swap, so a specialized Plugin reload
                 // cannot interleave and create contradictory active truths.
                 let mut current = self.current.write().unwrap();
+                self.jobs
+                    .commit_concurrency_limit(next_for_commit.max_concurrent_jobs);
                 *current = next_for_commit;
             }) {
             Ok(()) => {}
@@ -958,6 +968,10 @@ impl ReloadableRunnerConfig {
                 );
             }
         }
+        // Activation is committed. Spawn/I/O must run outside configuration and
+        // provider gates. Concurrent reload/shutdown is rechecked by admission.
+        drop(_reload_guard);
+        self.jobs.start_available_queued();
         eprintln!(
             "webcodex-runner config reload {}",
             status.last_reload_result
@@ -1135,7 +1149,7 @@ pub(crate) fn restart_required_fields(
     macro_rules! classify {
         ($($field:ident),+ $(,)?) => {{
             let RunnerConfig {
-                server_url_override: _, policy: _, shell: _, skills: _, instructions: _, ssh: _, plugins: _, tool_providers: _, mcp_gateway: _,
+                server_url_override: _, max_concurrent_jobs: _, policy: _, shell: _, skills: _, instructions: _, ssh: _, plugins: _, tool_providers: _, mcp_gateway: _,
                 $($field: _),+
             } = candidate;
             [$((stringify!($field), startup.$field != candidate.$field)),+]
@@ -1150,7 +1164,6 @@ pub(crate) fn restart_required_fields(
         display_name,
         hostname,
         host_context,
-        max_concurrent_jobs,
         acp,
         owner,
         poll_interval_ms,

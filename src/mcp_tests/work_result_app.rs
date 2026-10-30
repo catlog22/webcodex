@@ -1,5 +1,26 @@
 use super::*;
 
+#[test]
+fn work_result_null_session_input_has_no_explicit_runtime_selection() {
+    for project in ["agent:demo:project", "~p1"] {
+        for arguments in [
+            json!({"project": project}),
+            json!({"project": project, "session_id": null}),
+        ] {
+            let call =
+                crate::tool_runtime::ToolCall::from_tool_name("present_work_result", arguments)
+                    .expect("optional Session input");
+            assert!(matches!(
+                call,
+                crate::tool_runtime::ToolCall::PresentWorkResult {
+                    project: selected_project,
+                    session_id: None,
+                } if selected_project == project
+            ));
+        }
+    }
+}
+
 fn tool<'a>(payload: &'a Value, name: &str) -> Option<&'a Value> {
     payload["tools"]
         .as_array()?
@@ -40,7 +61,7 @@ fn work_result_pdf_bytes_are_private_and_do_not_enter_structured_or_text_content
 async fn work_result_descriptor_keeps_renderers_public_and_bridge_tools_app_only() {
     assert_eq!(
         MCP_WORK_RESULT_UI_RESOURCE_URI,
-        "ui://webcodex/work-result/v37"
+        "ui://webcodex/work-result/v38"
     );
     let runtime = workflow_runtime();
 

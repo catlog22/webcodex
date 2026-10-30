@@ -30,6 +30,13 @@ static EXACT_ANCHORS: LazyLock<String> =
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowInventoryRow {
     pub client_window_key: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Principal of the newest visible historical cell: the owner whose label
+    /// this row projects and the only principal a Console rename may target.
+    /// Server-internal; never serialized into live rows or API responses.
+    #[serde(skip)]
+    pub label_owner: Option<(String, String)>,
     pub source: String,
     pub last_project: Option<String>,
     pub first_seen_at_ms: i64,
@@ -142,6 +149,10 @@ fn repair_selected(conn: &Connection, window: Option<&str>) -> anyhow::Result<us
     let predicate = format!("e.client_window_key IN ({dirty})");
     conn.execute(&CELLS.replace("__SELECTION__", &predicate), [window])?;
     conn.execute(&LINKS.replace("__SELECTION__", &predicate), [window])?;
+    // Repair only affected Windows, retaining annotations of other principals.
+    conn.execute(&format!("DELETE FROM window_labels WHERE window_key IN ({dirty})
+        AND NOT EXISTS (SELECT 1 FROM window_inventory_cells c WHERE c.window_key=window_labels.window_key
+            AND c.principal_kind=window_labels.principal_kind AND c.principal_id=window_labels.principal_id)"), [window])?;
     Ok(conn.execute(
         &format!("DELETE FROM window_inventory_dirty WHERE {selection}"),
         [window],
@@ -285,9 +296,13 @@ impl Database {
             let mut stmt = tx.prepare_cached(sql)?;
             let mut rows = stmt.query(params)?;
             while let Some(r) = rows.next()? {
-                page.total = usize::try_from(r.get::<_, i64>(13)?).unwrap_or(usize::MAX);
+                page.total = usize::try_from(r.get::<_, i64>(16)?).unwrap_or(usize::MAX);
+                let owner_kind: Option<String> = r.get(14)?;
+                let owner_id: Option<String> = r.get(15)?;
                 page.rows.push(WindowInventoryRow {
                     client_window_key: r.get(0)?,
+                    label: r.get(13)?,
+                    label_owner: owner_kind.zip(owner_id),
                     source: r.get(1)?,
                     last_project: r.get(2)?,
                     first_seen_at_ms: r.get(3)?,
@@ -354,6 +369,7 @@ mod tests {
             plan.contains("SEARCH c USING PRIMARY KEY (window_key=?)"),
             "{plan}"
         );
+        assert!(plan.contains("SEARCH labels USING PRIMARY KEY (principal_kind=? AND principal_id=? AND window_key=?)"), "{plan}");
         assert!(
             !plan.contains("action_events") && !plan.contains("action_event_workflow_links"),
             "{plan}"

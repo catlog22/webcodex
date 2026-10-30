@@ -1057,6 +1057,12 @@ runner_capabilities! {
         #[serde(default, skip_serializing_if = "is_false")]
         pub computer_control: bool = false;
     }
+    /// Native Windows replacement selection; never inferred from general control.
+    ComputerSelection => RUNNER_CAPABILITY_COMPUTER_SELECTION("computer_selection"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub computer_selection: bool = false;
+    }
     /// Native semantic scroll-to-visible on one exact observed Accessibility element.
     /// Missing on older Runners is false and is never inferred from computer_control.
     ComputerScrollToElement => RUNNER_CAPABILITY_COMPUTER_SCROLL_TO_ELEMENT("computer_scroll_to_element"),
@@ -1081,6 +1087,13 @@ runner_capabilities! {
     v2_baseline = false {
         #[serde(default, skip_serializing_if = "is_false")]
         pub computer_letter_shortcuts: bool = false;
+    }
+    /// General Windows single-key chords; neither navigation nor the legacy
+    /// Ctrl+J/Ctrl+P capability implies this larger vocabulary or chord set.
+    ComputerKeyChords => RUNNER_CAPABILITY_COMPUTER_KEY_CHORDS("computer_key_chords"),
+    v2_baseline = false {
+        #[serde(default, skip_serializing_if = "is_false")]
+        pub computer_key_chords: bool = false;
     }
     /// Native exact-window activation/raise. Missing on older Runners is false and
     /// is never inferred from accessibility control, observation, or platform.
@@ -1714,7 +1727,7 @@ pub struct RunnerRegisterRequest {
     /// for mixed-version diagnostics; never carries paths or environment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<RunnerBuildInfo>,
-    /// Effective static Job execution concurrency configured for this Runner
+    /// Effective Job execution concurrency configured for this Runner
     /// process. Older Runners omit it, so the Server must preserve `None`
     /// rather than infer a value from capabilities or observed Jobs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1922,7 +1935,7 @@ pub struct RunnerView {
     /// Runner-reported build identity, when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build: Option<RunnerBuildInfo>,
-    /// Runner-reported effective static Job execution concurrency. `None` for
+    /// Runner-reported effective Job execution concurrency. `None` for
     /// older Runners; the Server never infers this value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_concurrency_limit: Option<usize>,
@@ -2272,8 +2285,17 @@ pub struct RunnerPollRequest {
 
 /// Polling transport wrapper. Current Runners may attach changed-only sanitized
 /// runtime metadata and one bounded project-inventory page.
+/// Applied scheduler capacity, fenced by the process-local config generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunnerJobCapacity {
+    pub generation: u64,
+    pub limit: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunnerPollPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_capacity: Option<RunnerJobCapacity>,
     #[serde(flatten)]
     pub request: RunnerPollRequest,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2982,7 +3004,9 @@ mod envelope_tests {
                 computer_control: false,
                 computer_scroll_to_element: false,
                 computer_key_input: false,
+                computer_selection: false,
                 computer_letter_shortcuts: false,
+                computer_key_chords: false,
                 computer_window_activate: false,
                 computer_text_input: false,
                 job_state_reconciliation: false,
@@ -3341,6 +3365,24 @@ mod envelope_tests {
         assert_eq!(
             RunnerCapabilityId::from_wire_name("computer_letter_shortcuts"),
             Some(RunnerCapabilityId::ComputerLetterShortcuts)
+        );
+    }
+
+    #[test]
+    fn computer_key_chords_capability_is_not_implied_by_legacy_keys() {
+        let legacy: RunnerCapabilities =
+            serde_json::from_str(r#"{"computer_key_input":true,"computer_letter_shortcuts":true}"#)
+                .unwrap();
+        assert!(!legacy.computer_key_chords);
+        let chords: RunnerCapabilities =
+            serde_json::from_str(r#"{"computer_key_chords":true}"#).unwrap();
+        assert!(chords.supports(RunnerCapabilityId::ComputerKeyChords));
+        assert!(!chords.computer_key_input);
+        assert!(!chords.computer_letter_shortcuts);
+        assert!(!RunnerCapabilities::default().computer_key_chords);
+        assert_eq!(
+            RunnerCapabilityId::from_wire_name("computer_key_chords"),
+            Some(RunnerCapabilityId::ComputerKeyChords)
         );
     }
 
@@ -4199,6 +4241,7 @@ mod envelope_tests {
     #[test]
     fn runtime_metadata_and_legacy_poll_payloads_round_trip() {
         let env = RunnerEnvelope::RuntimeMetadata {
+            job_capacity: None,
             tool_providers: sample_tool_providers(),
             computer_session_availability: None,
             mcp_gateway_providers: Some(vec![crate::mcp_gateway::McpGatewayProvider {
@@ -4218,8 +4261,63 @@ mod envelope_tests {
         let legacy = r#"{"client_id":"oe","agent_instance_id":"inst","projects":null}"#;
         let payload: RunnerPollPayload = serde_json::from_str(legacy).unwrap();
         assert_eq!(payload.request.client_id, "oe");
+        assert!(payload.job_capacity.is_none());
         assert!(payload.tool_providers.is_none());
         assert!(payload.mcp_gateway_providers.is_none());
+    }
+
+    #[test]
+    fn capacity_metadata_is_optional_and_legacy_decoders_ignore_it() {
+        #[derive(Deserialize)]
+        struct LegacyMetadata {
+            tool_providers: ToolProvidersStatus,
+        }
+        let envelope = RunnerEnvelope::RuntimeMetadata {
+            job_capacity: Some(RunnerJobCapacity {
+                generation: 7,
+                limit: 32,
+            }),
+            tool_providers: sample_tool_providers(),
+            mcp_gateway_providers: None,
+            computer_session_availability: None,
+        };
+        let mut json = serde_json::to_value(&envelope).unwrap();
+        let old: LegacyMetadata = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            old.tool_providers.config_reload.generation,
+            sample_tool_providers().config_reload.generation
+        );
+        json.as_object_mut().unwrap().remove("job_capacity");
+        assert!(matches!(
+            serde_json::from_value::<RunnerEnvelope>(json).unwrap(),
+            RunnerEnvelope::RuntimeMetadata {
+                job_capacity: None,
+                ..
+            }
+        ));
+        let poll = RunnerPollPayload {
+            job_capacity: Some(RunnerJobCapacity {
+                generation: 7,
+                limit: 32,
+            }),
+            request: RunnerPollRequest {
+                client_id: "runner".into(),
+                runner_instance_id: "instance".into(),
+            },
+            tool_providers: None,
+            mcp_gateway_providers: None,
+            computer_session_availability: None,
+            project_inventory_page: None,
+        };
+        let json = serde_json::to_value(&poll).unwrap();
+        let old: RunnerPollRequest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(old.client_id, "runner");
+        assert_eq!(
+            serde_json::from_value::<RunnerPollPayload>(json)
+                .unwrap()
+                .job_capacity,
+            poll.job_capacity
+        );
     }
 
     #[test]

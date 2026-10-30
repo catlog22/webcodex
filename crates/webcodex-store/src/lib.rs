@@ -22,6 +22,7 @@ mod trace_query;
 pub use trace_query::{ToolTraceCallRecord, ToolTraceQueryFilter};
 mod communication;
 mod connection_observation;
+pub use connection_observation::with_connection_trace;
 mod history_budget;
 pub use history_budget::{HistoryReadBudget, HistoryReadDiagnostics};
 
@@ -66,6 +67,8 @@ mod schema;
 mod server_instance;
 mod window_activity;
 mod window_inventory;
+mod window_labels;
+pub use window_labels::normalize_window_label;
 mod workbench_preferences;
 mod workspace_tasks;
 pub use workspace_tasks::WorkspaceTaskError;

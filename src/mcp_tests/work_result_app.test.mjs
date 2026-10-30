@@ -74,6 +74,78 @@ function selectorResult(selectors, state = baseState) {
   return result;
 }
 
+for (const selectedProject of [project, "~p1"]) for (const first of ["input", "result"])
+for (const channel of ["structured", "private", "text"]) for (const linked of [false, true]) {
+  test(`null Session matches omission without selecting linked evidence (${selectedProject}, ${first}, ${channel}, linked=${linked})`, async () => {
+    for (const optionalSession of [{}, { session_id: null }]) {
+      const view = app("mcp_work_result_app.html");
+      const args = { project: selectedProject, ...optionalSession };
+      const state = { ...baseState, jobs: { available: false } };
+      if (!linked) {
+        for (const key of ["session_id", "session", "validation", "review"]) delete state[key];
+      }
+      const original = toolResult({ work_result: state });
+      const result = channel === "private" ? privateOnly(original)
+        : channel === "text" ? contentOnly(original) : original;
+      if (selectedProject === "~p1") {
+        result._meta = { ...result._meta, "webcodex/workResultInput": { project: "~p1" } };
+      }
+      if (first === "input") {
+        view.toolInput(args);
+        // Equivalent repeated inputs can arrive while private selector proof is pending.
+        view.toolInput({ project: selectedProject });
+      }
+      view.notification("ui/notifications/tool-result", result);
+      view.toolInput(args);
+      await view.initialize();
+      assert.equal(view.nodes.refresh.disabled, false);
+      assert.equal(view.nodes.projectIdentity.textContent, "Project · " + project);
+      assert.equal(view.nodes.sessionIdentity.textContent, linked ? "Session · " + session_id : "Session · not linked yet");
+      view.nodes.refresh.onclick();
+      await flush();
+      const call = view.calls("get_work_result_state")[0];
+      assert.deepEqual({ ...call.params.arguments }, { project });
+      await view.reply(call, toolResult({ work_result: state }));
+      await view.fireTimers(10000);
+      assert.deepEqual({ ...view.calls("get_work_result_state")[1].params.arguments }, { project, automatic: true });
+    }
+  });
+}
+
+for (const selectedProject of [project, "~p1"]) for (const invalidSession of ["", "null", false, 0, {}, []]) {
+  test(`invalid Session still fails closed (${selectedProject}, ${JSON.stringify(invalidSession)})`, async () => {
+    const view = app("mcp_work_result_app.html");
+    view.toolInput({ project: selectedProject, session_id: invalidSession });
+    await view.initialize();
+    assert.equal(view.nodes.refresh.disabled, true);
+    assert.match(view.nodes.status.textContent, /WR-(SESSION-CONFLICT|INPUT-UNRESOLVED)/);
+    assert.equal(view.calls("get_work_result_state").length, 0);
+  });
+}
+
+test("null Session input cannot clear an existing explicit selection", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput(input);
+  view.toolResult({ work_result: baseState });
+  view.toolInput({ project, session_id: null });
+  await view.initialize();
+  view.nodes.refresh.onclick();
+  await flush();
+  assert.deepEqual({ ...view.calls("get_work_result_state")[0].params.arguments }, input);
+  view.toolInput({ project, session_id: `wc_sess_${"2".repeat(32)}` });
+  assert.match(view.nodes.status.textContent, /WR-SESSION-CONFLICT/);
+  assert.equal(view.nodes.refresh.disabled, true);
+});
+
+test("null Session without a Project does not become a thread entrypoint", async () => {
+  const view = app("mcp_work_result_app.html");
+  view.toolInput({ session_id: null });
+  await view.initialize();
+  assert.match(view.nodes.status.textContent, /WR-IDENTITY-INVALID/);
+  assert.equal(view.nodes.refresh.disabled, true);
+  assert.equal(view.calls("get_work_result_state").length, 0);
+});
+
 for (const selectors of [
   { project: "~p1" },
   { session_id: "~s2" },

@@ -135,7 +135,7 @@ async fn result_app_descriptor_and_resource_exposure_require_ui_operator_capabil
     assert_eq!(MCP_RESULT_UI_RESOURCE_URI, "ui://webcodex/changes/v4");
     assert_eq!(
         MCP_WORK_RESULT_UI_RESOURCE_URI,
-        "ui://webcodex/work-result/v37"
+        "ui://webcodex/work-result/v38"
     );
     assert!(super::super::app_registry::resource_meta(None)["ui"]
         .get("domain")
@@ -1725,6 +1725,8 @@ fn result_app_auth() -> crate::auth::AuthContext {
         allowed_client_id: None,
         shared_key_hash: None,
         project_grant_id: None,
+
+        project_root_scopes: Vec::new(),
     }
 }
 

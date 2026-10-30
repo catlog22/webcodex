@@ -223,6 +223,7 @@ impl AuthorizedDispatch<'_, '_> {
             call @ (ToolCall::CodingAgentStart { .. }
             | ToolCall::CodingAgentObserve { .. }
             | ToolCall::CodingAgentCancel { .. }
+            | ToolCall::CodingAgentDiagnose { .. }
             | ToolCall::RunProcess { .. }
             | ToolCall::JobWriteInput { .. }
             | ToolCall::RunDetachedProcess { .. }

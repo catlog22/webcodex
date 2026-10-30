@@ -93,6 +93,7 @@ pub(crate) enum RouteId {
     RuntimeConsoleTrace,
     RuntimeConsoleWindowCollaboration,
     RuntimeConsoleWindowCollaborationPost,
+    RuntimeConsoleWindowLabel,
     RuntimeConsoleProjects,
     RuntimeConsoleGoals,
     RuntimeConsoleGoal,
@@ -604,6 +605,8 @@ mod tests {
     #[test]
     fn runtime_console_mutations_are_never_runtime_read_routes() {
         let mutations = [
+            RuntimeConsoleWindowLabel,
+            RuntimeConsoleWindowCollaborationPost,
             RuntimeConsoleWorkflowSessionPostMessage,
             RuntimeConsoleWorkflowSessionWithdrawMessage,
             RuntimeConsoleWorkflowSessionReplaceMessage,
