@@ -58,12 +58,6 @@ impl TokenVerifier for PatVerifier {
         db: Option<&Arc<Database>>,
         token: &str,
     ) -> Result<Option<AuthContext>, String> {
-        // Auth disabled in development -> bootstrap (full access), identical to
-        // AuthMiddleware's `!config.is_auth_enabled()` branch.
-        if !config.is_auth_enabled() {
-            return Ok(Some(bootstrap_context()));
-        }
-
         // Bootstrap token check (constant-time comparison).
         if config.validate_token(token) {
             return Ok(Some(bootstrap_context()));
@@ -375,6 +369,7 @@ impl OAuth2Verifier {
                     token_kind: Some(crate::auth::PROJECT_SHARE_OAUTH_TOKEN_KIND.to_string()),
                     allowed_client_id: Some(at_record.client_id.clone()),
                     project_grant_id: Some(grant_id.to_string()),
+                    project_root_scopes: crate::auth::project_share_root_scopes_from_config(config),
                     ..AuthContext::new(AuthKind::OAuth2Token)
                 }
             }

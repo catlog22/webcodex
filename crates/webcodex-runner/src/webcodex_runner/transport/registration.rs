@@ -5,8 +5,7 @@ use super::http_client::{
 };
 use crate::webcodex_runner;
 use crate::webcodex_runner::config::{
-    hostname, max_concurrent_jobs, HotRunnerConfig, ReloadableRunnerConfig, RunnerConfig,
-    ShellConfig,
+    hostname, HotRunnerConfig, ReloadableRunnerConfig, RunnerConfig, ShellConfig,
 };
 use crate::webcodex_runner::job_manager::JobManager;
 use crate::webcodex_runner::projects::RunnerProjectCache;
@@ -457,6 +456,9 @@ pub(crate) fn runner_register_capabilities(cfg: &RunnerConfig) -> RunnerCapabili
         cfg!(any(target_os = "macos", windows)),
     );
     capabilities.set(RunnerCapabilityId::ComputerLetterShortcuts, cfg!(windows));
+    capabilities.set(RunnerCapabilityId::ComputerSelection, cfg!(windows));
+    capabilities.set(RunnerCapabilityId::ComputerScroll, cfg!(windows));
+    capabilities.set(RunnerCapabilityId::ComputerKeyChords, cfg!(windows));
     // Exact window activation is a separate effect/wire capability. It is
     // independently advertised by native macOS and Windows implementations.
     capabilities.set(
@@ -517,6 +519,7 @@ pub(crate) fn build_register_request_with_provider_status(
     webcodex_runner::computer_session::set_server_availability_contract(false);
     let hot = runtime.snapshot();
     let mut capabilities = runner_register_capabilities(cfg);
+    capabilities.set(RunnerCapabilityId::ComputerLocalControl, cfg!(windows));
     let coding_agent_providers = runtime
         .coding_agents()
         .map(|manager| manager.providers())
@@ -539,6 +542,7 @@ pub(crate) fn build_register_request_with_provider_status(
             host_context: cfg.host_context.clone(),
             capabilities,
             computer_session_availability: webcodex_runner::computer_session::availability(),
+            computer_control_epoch: webcodex_runner::computer_session::control_epoch(),
             policy: Some(register_policy_summary(
                 &hot,
                 prepared_cache_count,
@@ -547,7 +551,7 @@ pub(crate) fn build_register_request_with_provider_status(
             )),
             process_started_at: Some(process_started_at()),
             build: Some(runner_build_info()),
-            job_concurrency_limit: Some(max_concurrent_jobs(cfg)),
+            job_concurrency_limit: Some(hot.max_concurrent_jobs),
             // A Runner with reconciliation disabled for E2E must not send a job
             // inventory: the server rejects inventory without the capability and
             // vice-versa.

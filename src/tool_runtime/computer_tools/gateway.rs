@@ -74,8 +74,10 @@ pub(super) fn computer_control_policy(
         ),
         ActivateWindow { .. }
         | Press { .. }
+        | Select { .. }
         | Focus { .. }
         | ScrollToElement { .. }
+        | Scroll { .. }
         | Key { .. }
         | InputText { .. } => SpecializedOperationPolicy::consequential(
             SpecializedSource::Computer,

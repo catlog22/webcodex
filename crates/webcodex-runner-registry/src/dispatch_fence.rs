@@ -91,7 +91,11 @@ impl PendingDispatchFence {
             ) => {
                 use webcodex_core::runner_operation::RunnerComputerOperationKind::*;
                 !runner_instance_id.is_empty()
-                    && matches!(op.kind, Control | InputText | AccessibilityTree | KeyInput)
+                    && (op.control_epoch.is_some()
+                        || matches!(
+                            op.kind,
+                            Control | InputText | AccessibilityTree | KeyInput | Scroll
+                        ))
             }
             _ => false,
         };
@@ -147,6 +151,29 @@ impl PendingDispatchFence {
                 }
                 use webcodex_core::runner_operation::RunnerComputerOperationKind;
                 if let RunnerOperation::Computer(op) = operation {
+                    if op.control_epoch != runner.computer_control_epoch && op.kind.is_effect() {
+                        return Some("computer_control_changed: local control changed before dispatch; reobserve before another request".into());
+                    }
+                    if op.kind == RunnerComputerOperationKind::Control {
+                        let Ok(payload) = serde_json::from_str::<serde_json::Value>(&op.payload)
+                        else {
+                            return Some(
+                                "invalid_request: invalid computer control payload".into(),
+                            );
+                        };
+                        if payload.get("action").and_then(serde_json::Value::as_str)
+                            == Some("select")
+                        {
+                            return webcodex_core::computer_input_contract::computer_control_capabilities("select")
+                                .iter().any(|feature| !runner.supports(*feature))
+                                .then(|| "capability_unavailable: Computer selection capability changed before dispatch".into());
+                        }
+                    }
+                    if op.kind == RunnerComputerOperationKind::Scroll {
+                        return webcodex_core::computer_scroll_contract::COMPUTER_SCROLL_CAPABILITIES
+                            .iter().any(|feature| !runner.supports(*feature))
+                            .then(|| "capability_unavailable: Computer scroll capability changed before dispatch".into());
+                    }
                     if op.kind == RunnerComputerOperationKind::KeyInput {
                         let Ok(input) = serde_json::from_str::<
                             webcodex_core::computer_input_contract::ComputerKeyInputPayload,
@@ -160,7 +187,7 @@ impl PendingDispatchFence {
                                 "invalid_request: invalid computer key input chord".into(),
                             );
                         }
-                        return webcodex_core::computer_input_contract::computer_key_input_capabilities(&input.key)
+                        return webcodex_core::computer_input_contract::computer_key_input_capabilities(&input.key, &input.modifiers, runner.supports(RunnerFeature::ComputerKeyChords))
                             .iter().any(|feature| !runner.supports(*feature))
                             .then(|| "capability_unavailable: Computer key input capability changed before dispatch".into());
                     }
@@ -169,11 +196,28 @@ impl PendingDispatchFence {
                     RunnerOperation::Computer(op) => match op.kind {
                         RunnerComputerOperationKind::Control => RunnerFeature::ComputerControl,
                         RunnerComputerOperationKind::InputText => RunnerFeature::ComputerTextInput,
+                        RunnerComputerOperationKind::LaunchApplication => {
+                            RunnerFeature::ComputerApplicationLaunch
+                        }
+                        RunnerComputerOperationKind::WriteClipboard => {
+                            RunnerFeature::ComputerClipboardWrite
+                        }
+                        RunnerComputerOperationKind::PointerMove
+                        | RunnerComputerOperationKind::PointerClick => {
+                            RunnerFeature::ComputerPointerControl
+                        }
+                        RunnerComputerOperationKind::ActivateWindow => {
+                            RunnerFeature::ComputerWindowActivate
+                        }
+                        RunnerComputerOperationKind::ScrollToElement => {
+                            RunnerFeature::ComputerScrollToElement
+                        }
                         _ => RunnerFeature::ComputerAccessibilityObserve,
                     },
                     _ => unreachable!("Computer fence validated above"),
                 };
-                (!runner.supports(feature) || !runner.supports(RunnerFeature::ComputerAccessibilityObserve))
+                let needs_observation = matches!(operation, RunnerOperation::Computer(op) if op.control_epoch.is_none());
+                (!runner.supports(feature) || (needs_observation && !runner.supports(RunnerFeature::ComputerAccessibilityObserve)))
                     .then(|| "capability_unavailable: Computer action or post-observation is unavailable before dispatch".into())
             }
             Self::Project(fence) => fence.rejection(operation, runner),

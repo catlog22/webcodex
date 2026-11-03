@@ -34,6 +34,7 @@ async fn oauth_mcp_service_with_plugin_runner(
         .register(crate::test_support::current_runner_registration(
             RunnerRegisterRequest {
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 client_id: "oauth-plugin-runner".to_string(),
                 runner_instance_id: "oauth-plugin-runner-instance".to_string(),
                 runner_protocol_generation: crate::runner_protocol::RUNNER_PROTOCOL_GENERATION_V2,
@@ -1003,6 +1004,7 @@ async fn oauth2_coding_agent_tools_require_independent_scope_in_catalog_and_dire
         "start_coding_agent",
         "observe_coding_agent",
         "cancel_coding_agent",
+        "diagnose_coding_agent",
     ] {
         assert!(!names.contains(name), "insufficient scopes leaked {name}");
     }
@@ -1033,6 +1035,7 @@ async fn oauth2_coding_agent_tools_require_independent_scope_in_catalog_and_dire
         "start_coding_agent",
         "observe_coding_agent",
         "cancel_coding_agent",
+        "diagnose_coding_agent",
     ] {
         assert!(
             !names.contains(name),
@@ -1070,6 +1073,7 @@ async fn oauth2_coding_agent_tools_require_independent_scope_in_catalog_and_dire
         "start_coding_agent",
         "observe_coding_agent",
         "cancel_coding_agent",
+        "diagnose_coding_agent",
     ] {
         assert!(
             !names.contains(name),

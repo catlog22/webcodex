@@ -3409,6 +3409,12 @@ fn fs_main(in : VertexOutput) -> @location(0) vec4<f32> {
       if (lastRenderedState && threadSession === undefined) failClosed("Thread binding unavailable");
       return;
     }
+    // Runtime's optional Session treats null as omission. Normalize before
+    // selector proof/identity checks, without clearing an existing selection.
+    if (args?.session_id === null) {
+      args = { ...args };
+      delete args.session_id;
+    }
     const projectRef = modelSelector(args?.project, "p");
     const sessionRef = modelSelector(args?.session_id, "s");
     if (projectRef || sessionRef) {

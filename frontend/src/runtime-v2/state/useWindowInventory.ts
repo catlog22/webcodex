@@ -19,6 +19,7 @@ export function useWindowInventory(client: RuntimeV2Client, enabled: boolean, on
   }, [key]);
   const authorityRevision = client.authorityRevision ?? 0;
   const owner = useRef({ client, key, authorityRevision });
+  const [updatedAt, setUpdatedAt] = useState<number | null>(null);
   const [history, setHistory] = useState<WindowSummary[]>([]);
   const [recent, setRecent] = useState<WindowSummary[]>([]);
   const [live, setLive] = useState<WindowSummary[] | null>(null);
@@ -31,6 +32,12 @@ export function useWindowInventory(client: RuntimeV2Client, enabled: boolean, on
   const [liveUnavailable, setLiveUnavailable] = useState(false);
   const observationSequence = useRef(0);
   const observedByKey = useRef(new Map<string, number>());
+  // One bounded write receipt also covers a first observation with no cached row.
+  const lastLabelWrite = useRef<{ key: string; label: string | null; sequence: number } | null>(null);
+  const fenceLabel = useCallback(<T extends { client_window_key: string; label?: string | null }>(incoming: T, sequence: number): T => {
+    const write = lastLabelWrite.current;
+    return write?.key === incoming.client_window_key && sequence < write.sequence ? { ...incoming, label: write.label } : incoming;
+  }, []);
   const lastLive = useRef<WindowSummary[]>([]);
   const liveSequence = useRef(0);
   const beginObservation = useCallback(() => ++observationSequence.current, []);
@@ -39,7 +46,7 @@ export function useWindowInventory(client: RuntimeV2Client, enabled: boolean, on
   const liveRequest = useRef<AbortController | null>(null);
   const snapshot = useRef({ history, next }); snapshot.current = { history, next };
   const clear = useCallback(() => {
-    setHistory([]); setRecent([]); setLive(null); setTotal(0); setNext(undefined); setLiveUnavailable(false);
+    setUpdatedAt(null); setHistory([]); setRecent([]); setLive(null); setTotal(0); setNext(undefined); setLiveUnavailable(false);
     lastLive.current = []; liveSequence.current = 0; observedByKey.current.clear();
     completionRequest.current?.abort(); completionRequest.current = null;
   }, []);
@@ -48,12 +55,14 @@ export function useWindowInventory(client: RuntimeV2Client, enabled: boolean, on
     inventoryRequest.current?.abort(); inventoryRequest.current = null;
     liveRequest.current?.abort(); liveRequest.current = null;
     clear(); setAvailability("denied");
+    lastLabelWrite.current = null;
     if (status === 401) onUnauthorized();
     return true;
   }, [clear, onUnauthorized]);
   const failed = useCallback(() => setAvailability(value => value === "available" || value === "stale" ? "stale" : "error"), []);
 
   const updateWindow = useCallback((incoming: WindowObservation, sequence = ++observationSequence.current) => {
+    incoming = fenceLabel(incoming, sequence);
     const preferIncoming = sequence >= (observedByKey.current.get(incoming.client_window_key) || 0);
     observedByKey.current.set(incoming.client_window_key, Math.max(sequence, observedByKey.current.get(incoming.client_window_key) || 0));
     const merge = (current: WindowSummary[]) => {
@@ -63,6 +72,15 @@ export function useWindowInventory(client: RuntimeV2Client, enabled: boolean, on
     // Exact detail refreshes update existing inventory rows; they never insert
     // an omitted/unauthorized Window into a filtered inventory.
     setHistory(merge); setRecent(merge);
+  }, [fenceLabel]);
+
+  const updateLabel = useCallback((key: string, label: string | null) => {
+    const sequence = ++observationSequence.current;
+    lastLabelWrite.current = { key, label, sequence };
+    observedByKey.current.set(key, sequence);
+    const merge = (rows: WindowSummary[]) => rows.map(row => row.client_window_key === key ? { ...row, label } : row);
+    setHistory(merge); setRecent(merge);
+    return sequence;
   }, []);
 
   const load = useCallback((append: boolean) => {
@@ -103,7 +121,8 @@ export function useWindowInventory(client: RuntimeV2Client, enabled: boolean, on
       const rows = data.windows || [];
       setHistory(current => {
         const byKey = new Map(current.map(row => [row.client_window_key, row]));
-        const merged = rows.map(row => {
+        const merged = rows.map(observation => {
+          const row = fenceLabel(observation, sequence);
           const previous = byKey.get(row.client_window_key);
           const preferIncoming = sequence >= (observedByKey.current.get(row.client_window_key) || 0);
           observedByKey.current.set(row.client_window_key, Math.max(sequence, observedByKey.current.get(row.client_window_key) || 0));
@@ -120,12 +139,13 @@ export function useWindowInventory(client: RuntimeV2Client, enabled: boolean, on
       setTotal(data.total || 0);
       setNext(data.next_offset ?? (data.truncated && rows.length ? offset + rows.length : undefined));
       setScope(data.visibility?.scope === "global" ? "global" : "principal");
+      setUpdatedAt(Date.now());
       setAvailability("available");
     }).catch(() => {
       if (controller.signal.aborted || inventoryRequest.current !== controller) return;
       inventoryRequest.current = null; setLoadingMore(false); failed();
     });
-  }, [client, authorityRevision, enabled, selection, denied, failed]);
+  }, [client, authorityRevision, enabled, selection, denied, failed, fenceLabel]);
   const refresh = useCallback(() => load(false), [load]);
   const loadMore = useCallback(() => load(true), [load]);
   const pauseInventory = useCallback(() => { inventoryRequest.current?.abort(); inventoryRequest.current = null; setLoadingMore(false); }, []);
@@ -166,7 +186,7 @@ export function useWindowInventory(client: RuntimeV2Client, enabled: boolean, on
       if (!response) { setLiveUnavailable(true); return; }
       if (denied(response.status)) return;
       if (!response.ok || !response.data) { setLiveUnavailable(true); return; }
-      setLiveUnavailable(false);
+      setLiveUnavailable(false); setUpdatedAt(Date.now());
       const rows = response.data.windows || [];
       const activeKeys = new Set(rows.filter(row => row.active_count > 0).map(row => row.client_window_key));
       const completed = lastLive.current.filter(row => row.active_count > 0 && !activeKeys.has(row.client_window_key) && row.client_window_key !== options.detailWindowKey).map(row => row.client_window_key);
@@ -204,6 +224,7 @@ export function useWindowInventory(client: RuntimeV2Client, enabled: boolean, on
   }, [client, authorityRevision, enabled, selection, denied, options.detailWindowKey, refreshCompleted]);
 
   useEffect(() => {
+    if (!enabled || owner.current.client !== client || owner.current.authorityRevision !== authorityRevision) lastLabelWrite.current = null;
     owner.current = { client, key, authorityRevision }; pauseInventory(); pauseLive(); clear();
     setAvailability(enabled ? "loading" : "idle");
     snapshot.current = { history: [], next: undefined };
@@ -231,5 +252,6 @@ export function useWindowInventory(client: RuntimeV2Client, enabled: boolean, on
   const current = enabled && owner.current.client === client && owner.current.key === key && owner.current.authorityRevision === authorityRevision;
   return { availability: current ? (liveUnavailable && availability === "available" ? "stale" as const : availability) : enabled ? "loading" as const : "idle" as const, windows: current ? windows : [], historicalWindows: current ? historicalWindows : [],
     liveByKey: current ? liveByKey : new Map<string, WindowSummary>(), total: current ? total : 0, truncated: current && next !== undefined,
-    scope: current ? scope : "principal" as const, refresh, loadMore, loadingMore: current && loadingMore, removeWindow, updateWindow, beginObservation };
+    updatedAt: current ? updatedAt : null,
+    scope: current ? scope : "principal" as const, refresh, loadMore, loadingMore: current && loadingMore, removeWindow, updateWindow, updateLabel, fenceLabel, beginObservation };
 }

@@ -28,6 +28,7 @@ mod sessions;
 mod window_activity;
 mod window_collaboration;
 mod window_history_benchmark;
+mod window_labels;
 mod window_visibility;
 mod workspace_tasks;
 
@@ -85,6 +86,7 @@ async fn register_project_with_computer_availability(
         .runner_registry
         .register_with_auth(
             RunnerRegisterRequest {
+                computer_control_epoch: None,
                 computer_session_availability,
                 process_started_at: None,
                 build: None,
@@ -328,7 +330,7 @@ fn start_authorized_session(
 }
 
 fn hosted_service(runtime: Arc<ToolRuntime>) -> (tempfile::TempDir, Service) {
-    let config = crate::test_support::test_config(None);
+    let config = crate::test_support::test_config(Some("console-bootstrap-test"));
     let (tmp, db) = crate::test_support::test_db();
     let router = Router::new()
         .hoop(affix_state::inject(config))
