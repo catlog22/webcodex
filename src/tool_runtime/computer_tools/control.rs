@@ -60,7 +60,8 @@ impl ToolRuntime {
             }
 
             call @ (ComputerControlToolCall::Press { .. }
-            | ComputerControlToolCall::Focus { .. }) => {
+            | ComputerControlToolCall::Focus { .. }
+            | ComputerControlToolCall::Select { .. }) => {
                 let (client_id, surface_id, element_id, action) = match call {
                     ComputerControlToolCall::Press {
                         client_id,
@@ -68,6 +69,11 @@ impl ToolRuntime {
                         element_id,
                         ..
                     } => (client_id, surface_id, element_id, "press"),
+                    ComputerControlToolCall::Select {
+                        client_id,
+                        surface_id,
+                        element_id,
+                    } => (client_id, surface_id, element_id, "select"),
                     ComputerControlToolCall::Focus {
                         client_id,
                         surface_id,
@@ -95,6 +101,40 @@ impl ToolRuntime {
                     auth,
                     None,
                     Some(surface_id.as_str()),
+                    None,
+                    expected_instance,
+                )
+                .await
+            }
+            ComputerControlToolCall::Scroll {
+                client_id,
+                surface_id,
+                element_id,
+                direction,
+                amount,
+                ..
+            } => {
+                if surface_id.is_empty()
+                    || surface_id.len() > MAX_SURFACE_ID_BYTES
+                    || !element_id.starts_with("element_")
+                    || element_id.len() <= "element_".len()
+                    || element_id.len() > MAX_ELEMENT_ID_BYTES
+                {
+                    return computer_effect_not_started("invalid scroll target identity");
+                }
+                let payload = webcodex_core::computer_scroll_contract::ComputerScrollPayload {
+                    surface_id: surface_id.clone(),
+                    element_id,
+                    direction,
+                    amount: amount.unwrap_or_default(),
+                };
+                self.dispatch_computer_request_for_instance(
+                    &client_id,
+                    "computer_scroll",
+                    serde_json::to_value(payload).expect("typed scroll payload"),
+                    auth,
+                    None,
+                    Some(&surface_id),
                     None,
                     expected_instance,
                 )

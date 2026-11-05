@@ -173,7 +173,7 @@ Query may piggyback; control may not. `stop_job` is the explicit canonical
 Mutate/JobRun/Standard/DesiredState primitive, with `confirm=true`, `job:run`,
 and unchanged Project/Session ownership checks. Use its currently advertised MCP
 invocation route. There is no cancel alias, mixed observe/mutate manager, or
-control sidecar. Direct exposure does not admit any Job lifecycle/control orHost carrier tool into nested Code Mode E1/E2a/E2b.
+control sidecar. Direct exposure does not admit any Job lifecycle/control or Host carrier tool into nested Code Mode E1/E2a/E2b.
 
 A Server can preserve authoritative identity in its ToolResult, but cannot prove
 that a remote Host/tool wrapper retained or delivered that result. Diagnose that
@@ -392,9 +392,16 @@ final drain and durable commit of the final retained tails.
 
 ## 4. Runner Job capacity is shared across windows and projects
 
-`max_concurrent_jobs` is a Runner-process execution limit (default 4, valid
+`max_concurrent_jobs` is a Runner-process execution limit (default 32, valid
 range 1..64; out-of-range configuration is rejected). It is not allocated per
 ChatGPT window, Workflow Session, or Project.
+
+Capacity reload commits under the existing config-generation transaction and
+JobManager lifecycle lock. Clone handles share the limit; reservation and dequeue
+use that same lock. Growth drains the original FIFO after releasing config locks.
+Shrink leaves reservations and running processes intact, so running can exceed
+limit until natural completion. Runtime metadata is fenced by instance, connection
+and generation, and reconnect registration uses the active config snapshot.
 
 Opening multiple model windows consumes no Job slot by itself. A slot is consumed
 while a Job-backed execution owns Runner execution capacity. Therefore several
@@ -467,8 +474,8 @@ hit.
 
 ### Job-producing execution tools
 
-For structured validation/process tools (`cargo_*`, `go_test`, `run_process`,
-`run_script`, `run_job`, and future equivalents), the combined model-facing tool
+For structured validation/process tools (`project_validate`, `project_build`,
+`run_process`, `run_script`, `run_job`, and future equivalents), the combined model-facing tool
 description plus lifecycle input/output schema should make clear that:
 
 - a long operation continues as the **same execution / same Job**;
@@ -602,15 +609,17 @@ This contract still does not promise:
 
 The current contract is implemented and tested primarily in:
 
-- `src/shell_client/state.rs` — Server Job record, observation epoch, and Runner
-  concurrency metadata;
-- `src/shell_client/reconciliation.rs` — inventory validation and reconstruction;
-- `src/tool_runtime/observe_jobs.rs` and `src/job_observation.rs` — bounded
-  observation/token behavior;
-- `crates/webcodex-runner/src/main.rs` — Runner `JobManager`, inventory, queue,
-  and slot reservation;
-- `docs/RUNNER.md` — public Job/concurrency behavior;
-- `docs/TESTING.md` — real-process restart/reconciliation acceptance coverage.
+| Responsibility | Source and focused evidence |
+| --- | --- |
+| Server Job identity, visibility and observation epoch | [`runner-registry/state.rs`](../../crates/webcodex-runner-registry/src/state.rs), [`tests/job_lifecycle.rs`](../../crates/webcodex-runner-registry/src/tests/job_lifecycle.rs) |
+| Same-instance inventory and replacement fences | [`reconciliation.rs`](../../crates/webcodex-runner-registry/src/reconciliation.rs), [`tests/disconnect_reconciliation.rs`](../../crates/webcodex-runner-registry/src/tests/disconnect_reconciliation.rs), [`tests/instance_lease.rs`](../../crates/webcodex-runner-registry/src/tests/instance_lease.rs) |
+| Bounded observation and readiness joins | [`tool_runtime/observe_jobs.rs`](../../src/tool_runtime/observe_jobs.rs), [`core/job_observation.rs`](../../crates/webcodex-core/src/job_observation.rs), [`tests/observe_jobs/readiness.rs`](../../src/tool_runtime/tests/observe_jobs/readiness.rs) |
+| Native capacity, queue and process ownership | [`Runner JobManager`](../../crates/webcodex-runner/src/webcodex_runner/job_manager.rs), [`capacity tests`](../../crates/webcodex-runner/src/webcodex_runner/job_manager_tests/capacity.rs) |
+| Terminal receipt retention and restart | [`core/runner_job_receipt.rs`](../../crates/webcodex-core/src/runner_job_receipt.rs), [`store/job_receipts_tests.rs`](../../crates/webcodex-store/src/job_receipts_tests.rs), [`registry receipt tests`](../../crates/webcodex-runner-registry/src/tests/job_receipts.rs) |
+| Detached replacement recovery | [`detached_job`](../../crates/webcodex-runner/src/webcodex_runner/detached_job.rs), [`detached tests`](../../crates/webcodex-runner/src/webcodex_runner/detached_job/tests.rs) |
+
+The public operational guide is [Runner](../RUNNER.md); real-process acceptance
+commands and their scope remain in [Testing](../TESTING.md).
 
 ## Server-only convergence measurement
 

@@ -4,11 +4,27 @@ export { RUNTIME_LANGUAGES, type RuntimeLanguage } from "./runtime_locales.js";
 export const LANGUAGE_STORAGE_KEY = "webcodex.runtime.language.v1";
 
 export const RUNTIME_ZH_TEXT: Record<string, string> = {
-  "First observed": "首次记录",
+  "Named": "已命名",
+  "Window name": "窗口名称",
+  "Rename Window": "重命名窗口",
+  "Clear name": "清除名称",
+  "You do not have permission to rename this Window.": "你没有权限重命名这个窗口。",
+  "This Window is no longer visible.": "这个窗口已不可见。",
+  "This Window has no recorded activity yet. Retry after its next call.": "这个窗口还没有已记录的调用，请在它下一次调用完成后再试。",
+  "Could not save the name. Please retry.": "无法保存名称，请重试。",
+  "Within 10 minutes": "10 分钟内",
+  "Today": "今天",
+  "Earlier": "更早",
+  "All": "全部",
+  "Filter": "筛选",
+  "Synced": "已同步",
+  "Resize window list": "调整窗口列表宽度",
+  "Name": "名称",
+  "Last active": "最近活跃",
+  "IDs": "标识符",
+  "Back": "返回",
   "Last request activity": "最近请求活动",
-  "Last meaningful activity": "最近有效活动",
   "Window ID": "窗口 ID",
-  "Runner ID": "机器 ID",
   "Project ID": "项目 ID",
   "Loading Agents…": "正在加载 Agent…",
   "Agents could not be loaded. Refresh to retry.": "Agent 加载失败，请刷新重试。",
@@ -51,6 +67,8 @@ export const RUNTIME_ZH_TEXT: Record<string, string> = {
   "Machines visible with your current access": "当前权限下可见的执行机器",
   "Not synced yet": "尚未同步",
   "Monitor connected machines, current work, and server settings.": "查看已连接的机器、当前工作与服务器配置。",
+  "Trace is incomplete; captured loss markers report missing events.": "Trace 不完整；丢失标记已确认存在遗漏事件。",
+  "Capture completeness is unverified, even when a Handler finish is present.": "即使存在 Handler 收尾完成记录，也不能证明捕获完整。",
   "Capture health (process-wide)": "捕获状态（本进程累计，不代表单次调用完整性）",
   "Inspect call diagnostics": "查看调用诊断",
   "Hide call diagnostics": "收起调用诊断",
@@ -136,6 +154,8 @@ export const RUNTIME_ZH_TEXT: Record<string, string> = {
   "Could not load Session activity.": "无法加载会话活动。",
   "Choose a Window for this Session": "选择要查看的关联窗口",
   "View Session record": "查看会话记录",
+  "Session record": "会话记录",
+  "Back to Window": "返回窗口",
   "Check branch": "查看分支",
   "Git status unavailable": "无法读取 Git 状态",
   "Detached HEAD": "分离的 HEAD",
@@ -1114,7 +1134,6 @@ Object.assign(RUNTIME_ZH_TEXT, {
 
 Object.assign(RUNTIME_ZH_TEXT, {
   "Activity": "活动",
-  "Live work": "实时工作",
   "Project filter": "项目筛选",
   "All project workspaces": "全部项目",
   "Search Windows": "搜索窗口",
@@ -1187,7 +1206,6 @@ Object.assign(RUNTIME_ZH_TEXT, {
 });
 
 Object.assign(RUNTIME_ZH_TEXT, {
-  "Project information unavailable": "暂无项目信息",
   "Completed": "已完成",
   "Runner unavailable": "执行端信息暂不可用",
   "Search windows or projects…": "搜索窗口或项目…",
@@ -1292,7 +1310,7 @@ Object.assign(RUNTIME_ZH_TEXT, {
   "View new messages": "查看新消息",
   "Context": "上下文",
   "The current access key cannot collaborate (session:collaborate is required). Reconnect with a collaboration-enabled key.": "当前访问密钥没有协作权限（需要 session:collaborate）。请使用支持协作的访问密钥重新连接。",
-  "This Window is not available to the current access key.": "此窗口对当前访问密钥不可用。",
+  "Window collaboration history is unavailable or has changed. Refresh to retry.": "窗口协作记录不可用或已发生变化，请刷新重试。",
   "Messages could not be refreshed.": "暂时无法刷新消息。",
   "No messages yet": "暂无消息",
   "Send a note or instruction to this Window.": "在这里给这个窗口留下消息或指令。",

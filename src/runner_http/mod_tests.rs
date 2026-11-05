@@ -35,6 +35,8 @@ fn auth_context(username: Option<&str>, is_bootstrap: bool) -> crate::auth::Auth
         allowed_client_id: None,
         shared_key_hash: None,
         project_grant_id: None,
+
+        project_root_scopes: Vec::new(),
     }
 }
 
@@ -57,6 +59,8 @@ fn agent_auth_context(
         allowed_client_id: Some(allowed_client_id.to_string()),
         shared_key_hash: None,
         project_grant_id: None,
+
+        project_root_scopes: Vec::new(),
     }
 }
 
@@ -77,6 +81,8 @@ fn oauth_bridge_auth_context(hash: &str, scopes: Vec<&str>) -> crate::auth::Auth
         allowed_client_id: Some("oauth-client".to_string()),
         shared_key_hash: Some(hash.to_string()),
         project_grant_id: None,
+
+        project_root_scopes: Vec::new(),
     }
 }
 
@@ -109,6 +115,7 @@ fn runner_registration(
 ) -> RunnerRegisterRequest {
     RunnerRegisterRequest {
         computer_session_availability: None,
+        computer_control_epoch: None,
         process_started_at: None,
         build: None,
         job_concurrency_limit: None,

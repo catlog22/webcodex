@@ -546,14 +546,20 @@ tails, and can be stopped. Structured execution (`run_process`,
 outlives the synchronous grace period; the same process continues — it is never
 restarted.
 
-The Runner executes up to `max_concurrent_jobs` Jobs at once (default 4, valid
+The Runner executes up to `max_concurrent_jobs` Jobs at once (default 32, valid
 range 1..64). Values outside that range are rejected as configuration errors.
-This is an operational tuning control, not a security boundary, and requires a
-Runner restart to change:
+This operational tuning control supports `check_runner_config` followed by
+`reload_runner_config` (or Unix SIGHUP), without restarting:
 
 ```toml
-max_concurrent_jobs = 4
+max_concurrent_jobs = 32
 ```
+
+Increasing the limit immediately schedules existing queued Jobs. Decreasing it
+leaves running Jobs intact; new starts wait until occupied slots fall below the
+new limit. Running may temporarily exceed the limit. Registration and runtime
+metadata report the applied capacity with a config-generation fence, including
+after reconnect. Older Servers retain startup-only capacity observations.
 
 When all slots are occupied, an accepted Job remains the same queryable Job
 with the same `job_id` and reports `agent_queued`.
@@ -630,9 +636,11 @@ not use proxy settings.
 
 ## Reconnect and recovery
 
-A Runner disconnect is a liveness fact, not a lost-work fact. Accepted active
-Jobs enter a bounded `recovering` state (default grace 120 seconds) and are
-restored from the Runner's inventory when the same Runner instance reconnects.
+A Runner disconnect is a liveness fact, not a lost-work fact. With
+`job_state_reconciliation` support, accepted active Jobs enter a bounded
+`recovering` state (default grace 120 seconds) and can be restored from the
+complete inventory of the same Runner instance. Without that capability, or
+when the recovery deadline expires, ordinary Jobs become `lost`.
 Ordinary Jobs remain owned by that exact Runner process: a replacement instance
 does not inherit their child processes, so they become `lost`. Explicit
 `run_detached_process` Jobs are different: after a one-shot durable ownership
@@ -643,13 +651,15 @@ control state. This does not make ordinary process execution detachable, and it
 does not promise survival across a machine reboot.
 
 Completed caller-visible ordinary Jobs have a separate Server-owned SQLite
-receipt. Within the original 15-minute terminal retention window, up to 64
+receipt. Within the original 24-hour terminal retention window, up to 64
 receipts per logical Runner survive a coordinated Server/Runner restart and
 remain available through `list_jobs`, `observe_jobs`, and bounded log reads.
 Receipts preserve the Job id, terminal result, retained log cursors and tails,
 and original authorization partition/owner; Runner registration is not required
-to observe them. Restarts and receipt replay do not renew their deadlines.
-Storage failure degrades restart observability without changing execution success.
+to observe them. Restarts and receipt replay do not renew their deadlines. Receipts written by
+an older build with a 15-minute deadline retain that shorter deadline; upgrade
+does not extend them. Storage failure degrades restart observability without
+changing ordinary execution success.
 
 These receipts are read-only evidence. They contain no command input, stdin,
 environment, validation argv, replay intent, process handle, or execution lease.
@@ -862,7 +872,7 @@ of finding its PID or sending signals manually:
 
 `reload_runner_config` never writes `runner.toml`; it only activates the candidate
 already on disk. Hot-reloadable policy, shell, configured Skill roots, configured
-instruction files, Native Plugin, and static SSH-resource changes can become active
+instruction files, Job capacity, Native Plugin, and static SSH-resource changes can become active
 immediately, while fields reported in `restart_required_fields`
 remain startup-only until the Runner restarts. Invalid candidates leave the active
 snapshot and generation unchanged. Managed `manage_ssh_resource` mutations are different:

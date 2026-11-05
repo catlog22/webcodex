@@ -813,7 +813,12 @@ mod tests {
 
         ws.send(TungsteniteMessage::Text(
             RunnerEnvelope::RuntimeMetadata {
+                job_capacity: Some(crate::runner_protocol::RunnerJobCapacity {
+                    generation: 2,
+                    limit: 6,
+                }),
                 computer_session_availability: None,
+                computer_control_epoch: None,
                 tool_providers: provider_status(),
                 mcp_gateway_providers: Some(vec![crate::mcp_gateway::McpGatewayProvider {
                     provider_id: "blender".to_string(),
@@ -846,6 +851,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         let view = registry.get_runner_view("ws-roundtrip").await.unwrap();
+        assert_eq!(view.job_concurrency_limit, Some(6));
         let call = view
             .policy
             .unwrap()

@@ -445,12 +445,17 @@ stdout/stderr 尾部，并且可以停止。结构化执行（`run_process`、`r
 校验 Job 会在单个执行超过同步宽限期时把同一执行交给 Job 延续；同一个进程继续
 运行——绝不会被重启。
 
-Runner 同时最多执行 `max_concurrent_jobs` 个 Job（默认 4，合法范围 1..64）。超出范围
-的值会作为配置错误被拒绝。这个参数用于运维调优，不是安全边界，修改需要重启 Runner：
+Runner 同时最多执行 `max_concurrent_jobs` 个 Job（默认 32，合法范围 1..64）。超出范围
+的值会作为配置错误被拒绝。此运维参数支持先 `check_runner_config` 再
+`reload_runner_config`（或 Unix SIGHUP），无需重启：
 
 ```toml
-max_concurrent_jobs = 4
+max_concurrent_jobs = 32
 ```
+
+扩容会立即调度原队列；缩容不会中断正在运行的 Job，只在已占槽位降至新上限以下后
+放行新任务，期间运行数可以高于上限。注册和运行中 Metadata 使用配置 Generation
+上报实际容量，重连后重新同步；旧 Server 仍只能观察注册时的容量。
 
 当所有槽位都被占用时，已接受的 Job 仍是同一个可查询 Job（同一 `job_id`），并
 报告 `agent_queued`。
@@ -514,10 +519,28 @@ QUIC 不使用代理设置。
 
 ## 重连与恢复
 
-Runner 断连是 liveness 事实，不等于工作丢失。已接受的活跃 Job 会进入有界的
-`recovering` 状态（默认宽限 120 秒），并在同一 Runner 实例重连后从其 inventory
-恢复。替换的 Runner 实例不会继承旧实例的 Job；它们会变成 `lost`。Runner 进程重启
-无法恢复其旧的子进程。
+Runner 断连是 liveness 事实，不等于工作丢失。具备 `job_state_reconciliation`
+能力时，已接受的活跃 Job 会进入有界的 `recovering` 状态（默认宽限 120 秒），
+可从同一 Runner 实例的完整 inventory 恢复。不具备该能力或恢复期限已过时，普通
+Job 会变成 `lost`。普通 Job 的子进程归属于准确的 Runner 进程，替换实例不能接管。
+
+显式的 `run_detached_process` 不同：它在 payload 启动前将执行所有权一次性持久化
+交给专用 supervisor。只有准确的 supervisor 和受 fence 保护的执行身份仍然存活，
+替换 Runner 才能重建同一逻辑 Job，并通过持久控制状态路由观察或停止操作。
+这不会使普通进程自动变成 detached，也不保证主机重启后的进程存活。
+
+已完成、调用者可见的普通 Job 另有 Server 持有的 SQLite receipt。每个逻辑 Runner
+最多保留 64 份，期限为首次接受终态观察后的原始 24 小时；在这段期限内，即使
+Server 与 Runner 都重启，仍可通过 `list_jobs`、`observe_jobs` 和有界日志读取
+查看结果。receipt 保留 Job 身份、终态结果、日志游标和尾部、原授权分区及所有者；
+读取不要求 Runner 当前在线。重启或重放 receipt 不会延长期限，旧版本写入的
+15 分钟 receipt 仍按原期限过期。持久化失败降低重启后的可观察性，不改变普通
+执行的成功事实。
+
+receipt 只提供历史证据，不包含命令输入、stdin、环境、验证 argv、重放意图、
+进程句柄或执行 lease。普通活跃 Job 仍归属于 Runner 进程；只有
+`run_detached_process` 有显式的持久执行所有权转移。隐藏的同步结果和 detached
+所有权状态不属于普通 receipt 持久化。
 
 Server 会把稳定的 Runner `client_id` 与当前 live process lease 分开。stale/replacement process 不能继续使用旧 lease 提交结果，普通 child-process Job 也不会被 replacement Runner 接管。精确 lease identifier 属于内部 wire detail。
 
@@ -653,7 +676,7 @@ User scope 使用 `systemctl --user`；system scope 使用 `/etc/systemd/system`
 4. reload 后调用 `get_runtime_status(client_id=...)`（或 `list_runners`）检查当前运行状态。
 
 `reload_runner_config` 不写 `runner.toml`，只激活磁盘上已经存在的 candidate。policy、
-shell、configured Skill roots、configured instruction files、Native Plugin 与静态 SSH resource
+shell、configured Skill roots、configured instruction files、Job 并发、Native Plugin 与静态 SSH resource
 中可热加载的字段可以立即生效；`restart_required_fields`
 报告的字段仍保持 startup-only，重启前不会假装已在线生效。无效 candidate 保留旧 active
 snapshot 与 generation。`ssh_resource` managed mutation 不同：它使用 frozen startup
